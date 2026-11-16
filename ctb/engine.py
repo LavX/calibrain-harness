@@ -53,6 +53,7 @@ class Engine:
         self.budget = RateBudget(s.kairos_max_requests_per_hour)
         self.news_budget = RateBudget(s.kairos_news_max_per_hour)
         self.inflight: set[str] = set()
+        self._tick_checks: dict[str, asyncio.Task] = {}  # stop checks started by a mainnet tick, one per symbol
         self.latest_state: dict[str, dict[str, Any]] = {}
         self.probe_rate = 0.05
         self.started_at = time.time()
@@ -85,6 +86,7 @@ class Engine:
         self.labeler = Labeler(self.db, self.session, self.emit)
         self._build_members()
         self.feed.on_bar_close.append(self.on_bar_close)
+        self.feed.on_tick.append(self._on_mainnet_tick)
         self.testnet_stream = TestnetTickerStream(self.store, self.session, self.s.symbols)
         self.testnet_stream.on_tick.append(self._on_testnet_tick)
         self.context.on_news.append(self.on_news)
@@ -311,8 +313,26 @@ class Engine:
         return {"ok": True, "latency_ms": round(res.latency_ms), "answer_noul": ans.get("noul"),
                 "model": res.metadata.get("model") or client.model, "provider": spec.provider}
 
+    def _on_mainnet_tick(self, symbol: str) -> None:
+        """Check a managed stop as soon as its mainnet price moves (Bybit pushes tickers about every
+        100 ms) instead of waiting for the next _stop_watch pass. At most one check per symbol is in
+        flight; check_stop itself guards against firing twice."""
+        ex = self.executor
+        if not ex or symbol not in ex._managed or symbol in self._tick_checks:
+            return
+        self._tick_checks[symbol] = asyncio.create_task(self._tick_stop(ex, symbol), name=f"tick_stop:{symbol}")
+
+    async def _tick_stop(self, ex: Executor, symbol: str) -> None:
+        try:
+            await ex.check_stop(symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tick stop %s: %s", symbol, exc)
+        finally:
+            self._tick_checks.pop(symbol, None)
+
     async def _stop_watch(self) -> None:
-        """Evaluate managed stops on the mainnet ticker (pushed ~10x/s) twice a second."""
+        """Fallback pass over all managed stops twice a second (ticks normally trigger the check first,
+        see _on_mainnet_tick; this pass also covers stale mainnet data, where check_stop uses testnet)."""
         while True:
             await asyncio.sleep(0.5)
             ex = self.executor

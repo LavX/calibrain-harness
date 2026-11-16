@@ -30,6 +30,7 @@ LARGE_TRADE_USD = {"BTCUSDT": 250_000, "ETHUSDT": 150_000}
 DEFAULT_LARGE_TRADE_USD = 50_000
 
 BarCloseCallback = Callable[[str, str], Awaitable[None]]
+TickCallback = Callable[[str], None]  # called with the symbol after each ticker update
 WS_SHARD = 8  # symbols per public WebSocket connection
 UNIVERSE_SIZE = 100  # top USDT perps by 24h turnover offered in the symbol picker
 
@@ -39,6 +40,7 @@ class BybitPublicFeed:
         self.store = store
         self.session = session
         self.on_bar_close: list[BarCloseCallback] = []
+        self.on_tick: list[TickCallback] = []
         self._stop = asyncio.Event()
 
     # ------------------------------------------------------------------ REST helpers
@@ -209,6 +211,8 @@ class BybitPublicFeed:
             if st:
                 st.ticker.update({k: v for k, v in data.items() if v not in (None, "")})
                 st.last_update = time.time()
+                for cb in self.on_tick:
+                    cb(rest)
         elif kind == "publicTrade":
             st = self.store.state.get(rest)
             if st:
