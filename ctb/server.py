@@ -23,6 +23,7 @@ from .market.store import TIMEFRAMES
 from . import models as models_mod
 from . import runs as runs_mod
 from . import universe as universe_mod
+from . import venue as venue_mod
 
 log = logging.getLogger("ctb.server")
 NEXT_OUT = ROOT / "web-next" / "out"
@@ -275,12 +276,14 @@ def make_app(engine: Engine) -> web.Application:
         enabled = bool(body.get("enabled"))
         if enabled and not engine.executor:
             return j({"error": "no Bybit testnet keys configured"}, 400)
+        if enabled and (why := venue_mod.orders_blocked()):
+            return j({"error": why}, 409)
         if enabled and engine.executor and engine.executor.halted_reason:
             if not body.get("clear_halt"):
                 return j({"error": f"halted: {engine.executor.halted_reason}. Send clear_halt=true to resume."}, 409)
             engine.executor.halted_reason = None
         s.trading_enabled = enabled
-        engine.emit("event", engine.db.event("warn", "trading_toggled", f"testnet trading {'ENABLED' if enabled else 'disabled'} from dashboard"))
+        engine.emit("event", engine.db.event("warn", "trading_toggled", f"{venue_mod.get()['label']} trading {'ENABLED' if enabled else 'disabled'} from dashboard"))
         return j({"trading_enabled": s.trading_enabled})
 
     @routes.post("/api/close")
@@ -436,7 +439,9 @@ def make_app(engine: Engine) -> web.Application:
         try:
             return j(await engine.set_bybit_keys(key, secret))
         except BybitError as exc:
-            hint = " (10003 = key not valid on TESTNET; create it at testnet.bybit.com)" if exc.ret_code in (10003, 10004, 33004) else ""
+            v = venue_mod.get()
+            hint = (f" ({exc.ret_code} = key not valid on {v['label']}; create it at {v['keys_url']}, or set CTB_VENUE: "
+                    "testnet for testnet.bybit.com keys, demo for Demo Trading keys)") if exc.ret_code in (10003, 10004, 33004) else ""
             return j({"error": f"Bybit rejected the keys: {exc.ret_code} {exc.ret_msg}{hint}"}, 400)
         except ValueError as exc:
             return j({"error": str(exc)}, 409)
@@ -650,7 +655,7 @@ def main() -> None:
     if os.environ.pop("CTB_RESUME_TRADING", None) == "1":
         s.trading_enabled = True  # restart requested by the symbol picker while auto-trade was on
     engine = Engine(s)
-    print(f"Calibrain Harness: http://{s.host}:{s.port}  (venue: Bybit TESTNET, "
+    print(f"Calibrain Harness: http://{s.host}:{s.port}  (venue: {venue_mod.get()['label']}, "
           f"model {s.model_spec.label} ({s.model_spec.model}) key {'set' if s.model_spec.api_key else 'NOT set'}, "
           f"trading {'ON' if s.trading_enabled else 'observe-only'})")
     web.run_app(make_app(engine), host=s.host, port=s.port, print=None)

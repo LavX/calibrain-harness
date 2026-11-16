@@ -132,6 +132,9 @@ function KeysModal() {
   const [k, setK] = useState<any>(null);
   const [kMsg, setKMsg] = useState<Msg>(null);
   const [bMsg, setBMsg] = useState<Msg>(null);
+  const venueLabel: string = useStore((s) => s.ov?.settings?.venue_label) || "BYBIT TESTNET";
+  const venueKeys: string = useStore((s) => s.ov?.settings?.venue_keys_url) || "https://testnet.bybit.com/app/user/api-management";
+  const isDemo = venueLabel.includes("DEMO");
   const [busy, setBusy] = useState<string | null>(null);
   const kairosKey = useRef<HTMLInputElement>(null), kairosUrl = useRef<HTMLInputElement>(null);
   const bybitKey = useRef<HTMLInputElement>(null), bybitSecret = useRef<HTMLInputElement>(null);
@@ -181,10 +184,10 @@ function KeysModal() {
         <div className={`keymsg ${jMsg ? (jMsg.ok ? "ok" : "bad") : ""}`}>{jMsg?.text}</div>
       </section>
       <section className="keybox">
-        <div className="keyhead"><b>BYBIT · TESTNET</b>{k && (k.bybit.api_key.set ? <Stat ok={k.bybit.connected} txt={`KEY ${k.bybit.api_key.hint} · ${k.bybit.connected ? "CONNECTED" : "ERROR"}`} /> : <Stat ok={false} txt="NOT SET" />)}</div>
-        <p>Create at <a href="https://testnet.bybit.com/app/user/api-management" target="_blank" rel="noopener noreferrer">testnet.bybit.com → API management</a>. Permissions: <b>Contract → Orders + Positions</b>. Leave <b>withdrawals off</b>. Mainnet keys are rejected.</p>
-        <label>API KEY<input ref={bybitKey} type="password" autoComplete="off" spellCheck={false} placeholder="testnet API key" /></label>
-        <label>API SECRET<input ref={bybitSecret} type="password" autoComplete="off" spellCheck={false} placeholder="testnet API secret" /></label>
+        <div className="keyhead"><b>{venueLabel.replace(" ", " · ")}</b>{k && (k.bybit.api_key.set ? <Stat ok={k.bybit.connected} txt={`KEY ${k.bybit.api_key.hint} · ${k.bybit.connected ? "CONNECTED" : "ERROR"}`} /> : <Stat ok={false} txt="NOT SET" />)}</div>
+        <p>Create at <a href={venueKeys} target="_blank" rel="noopener noreferrer">{isDemo ? "bybit.com in Demo Trading mode → API management" : "testnet.bybit.com → API management"}</a> (venue set by <code>CTB_VENUE</code>). Permissions: <b>Contract → Orders + Positions</b>. Leave <b>withdrawals off</b>. Mainnet keys are rejected.</p>
+        <label>API KEY<input ref={bybitKey} type="password" autoComplete="off" spellCheck={false} placeholder={isDemo ? "demo trading API key" : "testnet API key"} /></label>
+        <label>API SECRET<input ref={bybitSecret} type="password" autoComplete="off" spellCheck={false} placeholder={isDemo ? "demo trading API secret" : "testnet API secret"} /></label>
         <div className="keyactions">
           <button className="kbtn amber" type="button" disabled={!!busy} onClick={() => run("bs", async () => {
             const key = bybitKey.current!.value.trim(), secret = bybitSecret.current!.value.trim();

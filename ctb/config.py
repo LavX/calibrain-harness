@@ -281,7 +281,7 @@ class Settings:
             "kairos_key_configured": bool(self.kairos_api_key),
             "kairos_max_requests_per_hour": self.kairos_max_requests_per_hour,
             "bybit_keys_configured": bool(self.bybit_api_key and self.bybit_api_secret),
-            "venue": "bybit-testnet",
+            "venue": f"bybit-{_venue_name()}", "venue_label": _venue_label(), "venue_keys_url": _venue_keys_url(),
             "strategy": self.strategy_view(),
         }
 
@@ -324,6 +324,21 @@ class Settings:
             setattr(self, k, v)
             env[self.STRATEGY_ENV[k]] = ",".join(v) if isinstance(v, list) else ("1" if v is True else "0" if v is False else str(v))
         return env
+
+
+def _venue_name() -> str:
+    from .venue import name
+    return name()
+
+
+def _venue_label() -> str:
+    from .venue import get
+    return get()["label"]
+
+
+def _venue_keys_url() -> str:
+    from .venue import get
+    return get()["keys_url"]
 
 
 def _models():

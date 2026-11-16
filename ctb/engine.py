@@ -34,6 +34,7 @@ from .market.context import ContextFeed
 from .market.store import MarketStore
 from .market.testnet_ws import TestnetTickerStream
 from .models import get as get_model
+from .venue import get as venue_get
 from .policy import decide, risk_pct_for
 
 log = logging.getLogger("ctb.engine")
@@ -155,7 +156,7 @@ class Engine:
         self.s.bybit_api_key, self.s.bybit_api_secret = api_key, api_secret
         self.s.trading_enabled = False  # new account starts observe-only
         await self._start_executor()
-        self.emit("event", self.db.event("warn", "keys", "Bybit testnet keys updated from dashboard; trading set to observe-only"))
+        self.emit("event", self.db.event("warn", "keys", f"{venue_get()['label']} keys updated from dashboard; trading set to observe-only"))
         return {"ok": True, "equity": wallet.get("equity")}
 
     async def set_kairos_key(self, api_key: str, base_url: str | None = None) -> dict[str, Any]:
