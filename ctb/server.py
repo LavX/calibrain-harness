@@ -23,6 +23,7 @@ from .market.store import TIMEFRAMES
 from . import models as models_mod
 from . import runs as runs_mod
 from . import universe as universe_mod
+from . import venue as venue_mod
 
 log = logging.getLogger("ctb.server")
 NEXT_OUT = ROOT / "web-next" / "out"
@@ -34,6 +35,15 @@ UI_NOT_BUILT = """<!doctype html><meta charset="utf-8"><title>Calibrain Harness<
 <p>then reload this page. No restart is needed.</p></body>"""
 PUSH_MS = 100
 DEV_ORIGINS = {"localhost:3000", "127.0.0.1:3000"}  # `next dev`
+
+
+LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "[::1]"}
+
+
+def _allowed_host(host: str, bind_host: str) -> bool:
+    """Reject DNS-rebinding requests: the Host header must name this machine, not a remote domain."""
+    name = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+    return name in LOCAL_HOSTNAMES or (bind_host not in ("0.0.0.0", "::") and name == bind_host)
 
 
 def _allowed_origin(origin: str, host: str) -> bool:
@@ -67,6 +77,8 @@ async def same_origin_only(request: web.Request, handler):
     """Block cross-site requests: any web page you visit could otherwise POST to this local
     server (toggle trading, swap keys). Require JSON (forces a CORS preflight we never grant)
     and, when the browser sends an Origin, that it is this server."""
+    if not _allowed_host(request.host, os.environ.get("CTB_HOST", "127.0.0.1")) and os.environ.get("CTB_ALLOW_ANY_HOST") != "1":
+        return j({"error": "unexpected Host header (set CTB_ALLOW_ANY_HOST=1 to serve other hostnames)"}, 421)
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         origin = request.headers.get("Origin")
         if origin and not _allowed_origin(origin, request.host):
@@ -105,7 +117,7 @@ def make_app(engine: Engine) -> web.Application:
                        "budget_per_hour": engine.budget.per_hour, "news_requests_last_hour": engine.news_budget.used(),
                        "last_error": engine.last_decision_error, "probe_rate": engine.probe_rate, "inflight": sorted(engine.inflight)},
             "account": ex.account_view() if ex else None,
-            "executor_error": (ex.sync_error if ex else "no Bybit testnet keys configured"),
+            "executor_error": (ex.sync_error if ex else f"no {venue_mod.get()['label']} keys configured (KEYS)"),
             "labelled_total": (engine.db.one("SELECT COUNT(*) n FROM decisions WHERE label_json IS NOT NULL") or {}).get("n", 0),
         })
 
@@ -263,13 +275,15 @@ def make_app(engine: Engine) -> web.Application:
         body = await req.json()
         enabled = bool(body.get("enabled"))
         if enabled and not engine.executor:
-            return j({"error": "no Bybit testnet keys configured"}, 400)
+            return j({"error": f"no {venue_mod.get()['label']} keys configured (KEYS)"}, 400)
+        if enabled and (why := venue_mod.orders_blocked()):
+            return j({"error": why}, 409)
         if enabled and engine.executor and engine.executor.halted_reason:
             if not body.get("clear_halt"):
                 return j({"error": f"halted: {engine.executor.halted_reason}. Send clear_halt=true to resume."}, 409)
             engine.executor.halted_reason = None
         s.trading_enabled = enabled
-        engine.emit("event", engine.db.event("warn", "trading_toggled", f"testnet trading {'ENABLED' if enabled else 'disabled'} from dashboard"))
+        engine.emit("event", engine.db.event("warn", "trading_toggled", f"{venue_mod.get()['label']} trading {'ENABLED' if enabled else 'disabled'} from dashboard"))
         return j({"trading_enabled": s.trading_enabled})
 
     @routes.post("/api/close")
@@ -413,7 +427,10 @@ def make_app(engine: Engine) -> web.Application:
             "active_model": s.model_provider,
             "bybit": {"api_key": key_hint(s.bybit_api_key), "api_secret": key_hint(s.bybit_api_secret),
                       "connected": bool(engine.executor and not engine.executor.sync_error),
-                      "error": engine.executor.sync_error if engine.executor else None},
+                      "error": engine.executor.sync_error if engine.executor else None,
+                      "venue": venue_mod.name(),
+                      "venues": {n: {"label": v["label"], "keys_url": v["keys_url"], "configured": all(venue_mod.keys(n))}
+                                 for n, v in venue_mod.VENUES.items()}},
         })
 
     @routes.post("/api/keys/bybit")
@@ -425,8 +442,19 @@ def make_app(engine: Engine) -> web.Application:
         try:
             return j(await engine.set_bybit_keys(key, secret))
         except BybitError as exc:
-            hint = " (10003 = key not valid on TESTNET; create it at testnet.bybit.com)" if exc.ret_code in (10003, 10004, 33004) else ""
+            v = venue_mod.get()
+            hint = (f" ({exc.ret_code} = key not valid on {v['label']}; create it at {v['keys_url']}, or switch the venue: "
+                    "testnet for testnet.bybit.com keys, demo for Demo Trading keys)") if exc.ret_code in (10003, 10004, 33004) else ""
             return j({"error": f"Bybit rejected the keys: {exc.ret_code} {exc.ret_msg}{hint}"}, 400)
+        except ValueError as exc:
+            return j({"error": str(exc)}, 409)
+
+    @routes.post("/api/venue")
+    async def set_venue(req: web.Request) -> web.Response:
+        """Switch where orders go: testnet or demo (only while flat; trading turns off, a new run starts)."""
+        body = await req.json()
+        try:
+            return j(await engine.set_venue(str(body.get("venue", "")).strip().lower()))
         except ValueError as exc:
             return j({"error": str(exc)}, 409)
 
@@ -639,7 +667,7 @@ def main() -> None:
     if os.environ.pop("CTB_RESUME_TRADING", None) == "1":
         s.trading_enabled = True  # restart requested by the symbol picker while auto-trade was on
     engine = Engine(s)
-    print(f"Calibrain Harness: http://{s.host}:{s.port}  (venue: Bybit TESTNET, "
+    print(f"Calibrain Harness: http://{s.host}:{s.port}  (venue: {venue_mod.get()['label']}, "
           f"model {s.model_spec.label} ({s.model_spec.model}) key {'set' if s.model_spec.api_key else 'NOT set'}, "
           f"trading {'ON' if s.trading_enabled else 'observe-only'})")
     web.run_app(make_app(engine), host=s.host, port=s.port, print=None)
