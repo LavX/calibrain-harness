@@ -1,6 +1,8 @@
 """Where orders go: Bybit TESTNET (default) or Bybit DEMO TRADING. Never mainnet.
 
-CTB_VENUE=testnet | demo
+CTB_VENUE=testnet | demo, switchable from the dashboard (KEYS) while the bot has no open trades.
+Each venue keeps its own keys, so switching never mixes accounts:
+testnet BYBIT_API_KEY / BYBIT_API_SECRET, demo BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET.
 
 - testnet: testnet.bybit.com, its own (thin, drifting) books and prices.
 - demo:    Bybit Demo Trading (keys made on bybit.com in Demo Trading mode). Simulated fills at real
@@ -23,6 +25,8 @@ VENUES: dict[str, dict[str, str]] = {
         "market_rest": "https://api-testnet.bybit.com",
         "label": "BYBIT TESTNET",
         "keys_url": "https://testnet.bybit.com/app/user/api-management",
+        "key_env": "BYBIT_API_KEY",
+        "secret_env": "BYBIT_API_SECRET",
     },
     "demo": {
         "rest": "https://api-demo.bybit.com",
@@ -31,6 +35,8 @@ VENUES: dict[str, dict[str, str]] = {
         "market_rest": "https://api.bybit.com",  # public GETs only, never signed
         "label": "BYBIT DEMO",
         "keys_url": "https://www.bybit.com/en/app/user/api-management",
+        "key_env": "BYBIT_DEMO_API_KEY",
+        "secret_env": "BYBIT_DEMO_API_SECRET",
     },
 }
 # Demo quirks (measured 2026-11-14): /v5/execution/list, /v5/position/closed-pnl and the transaction log
@@ -56,3 +62,9 @@ def name() -> str:
 
 def get() -> dict[str, str]:
     return VENUES[name()]
+
+
+def keys(venue: str | None = None) -> tuple[str, str]:
+    """(api key, api secret) for a venue, default the current one. Empty strings when not set."""
+    v = VENUES[venue or name()]
+    return os.environ.get(v["key_env"], "").strip(), os.environ.get(v["secret_env"], "").strip()

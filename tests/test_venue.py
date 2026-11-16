@@ -51,3 +51,40 @@ def test_demo_closed_rows_rebuilt_from_orders():
     short = {**t, "side": "short"}
     srows = closed_rows_from_orders(short, [{**orders[1], "side": "Buy"}])
     assert srows[0]["closedPnl"] == pytest.approx(0.4 * -2 - 0.055 * 0.4 - 0.0224)
+
+
+def test_each_venue_reads_its_own_keys(monkeypatch):
+    from ctb import venue
+    from ctb.config import Settings
+    monkeypatch.setenv("BYBIT_API_KEY", "tk")
+    monkeypatch.setenv("BYBIT_API_SECRET", "ts")
+    monkeypatch.setenv("BYBIT_DEMO_API_KEY", "dk")
+    monkeypatch.delenv("BYBIT_DEMO_API_SECRET", raising=False)
+    assert venue.keys("testnet") == ("tk", "ts")
+    assert venue.keys("demo") == ("dk", "")
+    s = Settings()
+    assert (s.bybit_api_key, s.bybit_api_secret) == ("tk", "ts")
+    monkeypatch.setenv("CTB_VENUE", "demo")
+    s = Settings()
+    assert (s.bybit_api_key, s.bybit_api_secret) == ("dk", "")
+
+
+class _OneRow:
+    def __init__(self, row):
+        self.row = row
+
+    def one(self, *_):
+        return self.row
+
+
+def test_venue_switch_refuses_unknown_venues_and_open_trades():
+    import asyncio
+    from types import SimpleNamespace
+
+    from ctb.engine import Engine
+    eng = SimpleNamespace(db=_OneRow({"id": 7}))
+    with pytest.raises(ValueError, match="unknown venue"):
+        asyncio.run(Engine.set_venue(eng, "mainnet"))
+    assert asyncio.run(Engine.set_venue(eng, "testnet"))["unchanged"]
+    with pytest.raises(ValueError, match="open bot trades"):
+        asyncio.run(Engine.set_venue(eng, "demo"))

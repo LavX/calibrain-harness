@@ -117,7 +117,7 @@ def make_app(engine: Engine) -> web.Application:
                        "budget_per_hour": engine.budget.per_hour, "news_requests_last_hour": engine.news_budget.used(),
                        "last_error": engine.last_decision_error, "probe_rate": engine.probe_rate, "inflight": sorted(engine.inflight)},
             "account": ex.account_view() if ex else None,
-            "executor_error": (ex.sync_error if ex else "no Bybit testnet keys configured"),
+            "executor_error": (ex.sync_error if ex else f"no {venue_mod.get()['label']} keys configured (KEYS)"),
             "labelled_total": (engine.db.one("SELECT COUNT(*) n FROM decisions WHERE label_json IS NOT NULL") or {}).get("n", 0),
         })
 
@@ -275,7 +275,7 @@ def make_app(engine: Engine) -> web.Application:
         body = await req.json()
         enabled = bool(body.get("enabled"))
         if enabled and not engine.executor:
-            return j({"error": "no Bybit testnet keys configured"}, 400)
+            return j({"error": f"no {venue_mod.get()['label']} keys configured (KEYS)"}, 400)
         if enabled and (why := venue_mod.orders_blocked()):
             return j({"error": why}, 409)
         if enabled and engine.executor and engine.executor.halted_reason:
@@ -427,7 +427,10 @@ def make_app(engine: Engine) -> web.Application:
             "active_model": s.model_provider,
             "bybit": {"api_key": key_hint(s.bybit_api_key), "api_secret": key_hint(s.bybit_api_secret),
                       "connected": bool(engine.executor and not engine.executor.sync_error),
-                      "error": engine.executor.sync_error if engine.executor else None},
+                      "error": engine.executor.sync_error if engine.executor else None,
+                      "venue": venue_mod.name(),
+                      "venues": {n: {"label": v["label"], "keys_url": v["keys_url"], "configured": all(venue_mod.keys(n))}
+                                 for n, v in venue_mod.VENUES.items()}},
         })
 
     @routes.post("/api/keys/bybit")
@@ -440,9 +443,18 @@ def make_app(engine: Engine) -> web.Application:
             return j(await engine.set_bybit_keys(key, secret))
         except BybitError as exc:
             v = venue_mod.get()
-            hint = (f" ({exc.ret_code} = key not valid on {v['label']}; create it at {v['keys_url']}, or set CTB_VENUE: "
+            hint = (f" ({exc.ret_code} = key not valid on {v['label']}; create it at {v['keys_url']}, or switch the venue: "
                     "testnet for testnet.bybit.com keys, demo for Demo Trading keys)") if exc.ret_code in (10003, 10004, 33004) else ""
             return j({"error": f"Bybit rejected the keys: {exc.ret_code} {exc.ret_msg}{hint}"}, 400)
+        except ValueError as exc:
+            return j({"error": str(exc)}, 409)
+
+    @routes.post("/api/venue")
+    async def set_venue(req: web.Request) -> web.Response:
+        """Switch where orders go: testnet or demo (only while flat; trading turns off, a new run starts)."""
+        body = await req.json()
+        try:
+            return j(await engine.set_venue(str(body.get("venue", "")).strip().lower()))
         except ValueError as exc:
             return j({"error": str(exc)}, 409)
 

@@ -1,6 +1,6 @@
 """Runtime configuration. Everything is read from the environment (optionally a local .env).
 
-Secrets (KAIROS_API_KEY, TYPESAFE_API_KEY, BYBIT_API_KEY, BYBIT_API_SECRET) are only ever read here and passed
+Secrets (KAIROS_API_KEY, TYPESAFE_API_KEY, BYBIT_[DEMO_]API_KEY/SECRET) are only ever read here and passed
 to the clients that need them. They are never logged, stored in SQLite, or sent to the browser.
 """
 
@@ -196,8 +196,9 @@ class Settings:
     max_venue_divergence_bp: float = _f("CTB_MAX_VENUE_DIVERGENCE_BP", 150)
 
     # --- bybit (testnet only, enforced in code) ---
-    bybit_api_key: str = os.environ.get("BYBIT_API_KEY", "")
-    bybit_api_secret: str = os.environ.get("BYBIT_API_SECRET", "")
+    # keys of the current venue (testnet: BYBIT_API_*, demo: BYBIT_DEMO_API_*); swapped on a venue switch
+    bybit_api_key: str = field(default_factory=lambda: _venue_keys()[0])
+    bybit_api_secret: str = field(default_factory=lambda: _venue_keys()[1])
 
     # --- server ---
     host: str = os.environ.get("CTB_HOST", "127.0.0.1")
@@ -334,6 +335,11 @@ def _venue_name() -> str:
 def _venue_label() -> str:
     from .venue import get
     return get()["label"]
+
+
+def _venue_keys() -> tuple[str, str]:
+    from .venue import keys
+    return keys()
 
 
 def _venue_keys_url() -> str:
