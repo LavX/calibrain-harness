@@ -54,7 +54,7 @@ async def market():
 
 
 def forecast(made_s, **over):
-    f = {"date": "2026-11-19", "made_ms": int(made_s * 1000),
+    f = {"date": "2026-11-19", "made_ms": int(made_s * 1000), "kappa": 1.0,   # full tilt room: the tests below look at the tilt; kappa 0 has its own tests
          "strategies": {
              "trend": {"sigma_d": SIGMA, "mu": {"base": 0.002, "regime": 0.0002, "ridge": 0.0}, "own_mom": 0.1, "n_days": 900},
              "carry": {"sigma_d": SIGMA, "mu": {"structural": -0.0004, "base": -0.0004, "regime": -0.0004, "ridge": -0.0004}, "own_mom": 0.0, "n_days": 900},
@@ -291,9 +291,38 @@ def test_kappa_in_the_forecast_file_narrows_the_tilt(root):
     f["kappa"] = 7.0   # out of range: clipped to 1
     put(root / "forecast" / "latest.json", f)
     assert decide(make(root), dry_run=True, trigger="cli")["kappa"] == 1.0
-    f["kappa"] = "n/a"  # unreadable: 1
+    f["kappa"] = "n/a"  # unreadable: no room
     put(root / "forecast" / "latest.json", f)
-    assert decide(make(root), dry_run=True, trigger="cli")["kappa"] == 1.0
+    assert decide(make(root), dry_run=True, trigger="cli")["kappa"] == 0.0
+
+
+def test_with_no_kappa_the_live_weight_is_the_core_and_the_tilt_is_a_shadow(root):
+    f = forecast(T0 - 2 * 3600)
+    del f["kappa"]                                    # the start: nothing earned
+    put(root / "forecast" / "latest.json", f)
+    rec = decide(make(root), trigger="decide_now")
+    assert rec["kappa"] == 0.0 and rec["t_eff"] == 0.0 and rec["tau"] == {"trend": 0.0, "carry": 0.0}
+    assert rec["w_target"] == pytest.approx(rec["core"]) and rec["core"]["trend"] == pytest.approx(CORE, abs=1e-6)
+    # the shadow is the tilted target at full T 0.5
+    assert rec["shadow_tau"]["trend"] == pytest.approx(min(0.5, TREND_SR), abs=1e-5) and rec["shadow_tau"]["carry"] == pytest.approx(max(-0.5, CARRY_SR), abs=1e-5)
+    assert rec["shadow_w_target"]["trend"] == pytest.approx(TREND_TARGET, abs=1e-5) and rec["shadow_w_target"]["carry"] == pytest.approx(CARRY_TARGET, abs=1e-5)
+    line = lines(root)[-1]
+    assert line["shadow_tau"] == rec["shadow_tau"] and line["shadow_w_target"] == rec["shadow_w_target"] and line["kappa"] == 0.0
+    # live: the core at the cap, trend prev 0.2 steps up to 0.37 (inside the 0.25 step), carry 0.5 down to 0.37
+    assert rec["steps"][0]["factor"] == pytest.approx(1.0, abs=1e-6)
+    assert rec["w_final"]["trend"] == pytest.approx(CORE, abs=1e-4) and rec["w_final"]["carry"] == pytest.approx(CORE, abs=1e-4)
+    assert rec["reasons"]["trend"].startswith(f"trend: core {CORE:.2f} (tilt in shadow, +50%, earns live control after 90 days ahead of core)")
+    assert "tilt room" not in rec["reasons"]["trend"] and "(regime up_calm 0.62)" in rec["reasons"]["trend"]
+    assert ctl(root, "trend")["reason"] == rec["reasons"]["trend"]
+
+
+def test_the_shadow_does_not_change_with_kappa(root):
+    shadows = []
+    for k in (0.0, 0.5, 1.0):
+        put(root / "forecast" / "latest.json", forecast(T0 - 2 * 3600, kappa=k))
+        r = decide(make(root), dry_run=True, trigger="cli")
+        shadows.append((r["shadow_tau"], r["shadow_w_target"]))
+    assert shadows[0] == shadows[1] == shadows[2]
 
 
 def test_zero_forecast_leaves_the_core_untouched(root):

@@ -10,7 +10,8 @@ model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that answers one JSON allocation dire
 Computed weights (ctb/allocator_math.py): when <root>/forecast/latest.json exists (written daily by the
 prediction layer) the decider is only one forecaster. It is still asked every hour, p is the mean of its
 last 24 answers, and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: core plus tilt (the
-static inverse-volatility mix, tilted by at most +-T by each strategy's forecast Sharpe), then the vol cap,
+static inverse-volatility mix, tilted by at most +-T by each strategy's forecast Sharpe, with the tilt room kappa 0 until
+the shadow tilt has earned it, so live weights start as the core), then the vol cap,
 buffer, step, decider veto, exploration floor, the drawdown floor and owner_lock. A forecast older than 36 h holds the weights and reports the error in
 status.json. Without the file the decider-only mapping above applies and status.json says so.
 
@@ -439,7 +440,8 @@ def regime_text(root: Path) -> str | None:
 def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str, Current], p: dict[str, float | None],
                     calc: Calc, regime: str | None = None, dd_floor_pct: float = 15.0) -> dict[str, Any]:
     """The computed layer for one day, no I/O: forecasts to target weights (core plus tilt, then the rules) with the full
-    breakdown. The tilt room kappa comes from the forecast file (scores.json via forecast/latest.json), 1 when absent.
+    breakdown. The tilt room kappa comes from the forecast file (scores.json via forecast/latest.json), 0 when absent: the live target
+    is the core until the shadow tilt has earned room. The tilted target at full T is returned as the shadow.
     Strategies without a usable forecast (no sigma, or no forecaster with a value) are held at their weight."""
     fstrat = forecast.get("strategies") or {}
     fw = forecast.get("weights_k") if isinstance(forecast.get("weights_k"), dict) else {}
@@ -486,10 +488,11 @@ def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str,
         mu_log.setdefault(sid, {})
     w_prev = {sid: current[sid].weight for sid in ids}
     kappa = _num(forecast.get("kappa"))
-    tilt = replace(calc.tilt, kappa=1.0 if kappa is None else min(1.0, max(0.0, kappa)))
+    tilt = replace(calc.tilt, kappa=0.0 if kappa is None else min(1.0, max(0.0, kappa)))
+    shadow = replace(calc.tilt, kappa=1.0)
     if not opt:
         return {"opt": [], "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "w_target": {},
-                "core": {}, "tau": {}, "sr": {}, "kappa": tilt.kappa, "t_eff": tilt.t_eff,
+                "core": {}, "tau": {}, "sr": {}, "kappa": tilt.kappa, "t_eff": tilt.t_eff, "shadow_tau": {}, "shadow_w_target": {},
                 "w_final": dict(w_prev), "steps": [], "reasons": {sid: f"{sid}: held at {w_prev[sid]:.2f} ({held[sid]})" for sid in ids}}
 
     def cov_ij(a: str, b: str) -> float:
@@ -507,14 +510,16 @@ def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str,
     sr = {sid: M.forecast_sharpe(mu_log[sid]["combined"], sigma_log[sid]) for sid in opt}
     tau = {sid: M.tilt_tau(sr[sid], tilt) for sid in opt}
     w_target = dict(zip(opt, M.tilted_target([core[sid] for sid in opt], [tau[sid] for sid in opt])))
+    shadow_tau = {sid: M.tilt_tau(sr[sid], shadow) for sid in opt}
+    shadow_w = dict(zip(opt, M.tilted_target([core[sid] for sid in opt], [shadow_tau[sid] for sid in opt])))
     final, steps = M.apply_rules(opt, w_target, {sid: w_prev[sid] for sid in opt}, cov, {sid: p.get(sid) for sid in opt}, calc.rules,
                                  floored=[sid for sid in opt if current[sid].drawdown_pct is not None and current[sid].drawdown_pct > dd_floor_pct], locked=[sid for sid in opt if current[sid].owner_lock])
     reasons = {sid: f"{sid}: held at {w_prev[sid]:.2f} ({why})" for sid, why in held.items()}
     for sid in opt:
         binding = [st["step"] for st in steps if sid in st["changed"]]
-        reasons[sid] = M.reason_line(sid, core[sid], tau[sid], sr[sid], w_target[sid], final[sid], binding, regime, tilt.kappa)
+        reasons[sid] = M.reason_line(sid, core[sid], tau[sid], sr[sid], w_target[sid], final[sid], binding, regime, tilt.kappa, shadow_tau[sid])
     return {"opt": opt, "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "core": core, "tau": tau,
-            "sr": sr, "kappa": tilt.kappa, "t_eff": tilt.t_eff, "w_target": w_target,
+            "sr": sr, "kappa": tilt.kappa, "t_eff": tilt.t_eff, "w_target": w_target, "shadow_tau": shadow_tau, "shadow_w_target": shadow_w,
             "w_final": {**{sid: w_prev[sid] for sid in ids}, **final}, "steps": steps, "reasons": reasons}
 
 
@@ -1096,6 +1101,8 @@ class Allocator:
                     "sigma_d": calc_out["sigma_d"], "w_prev": calc_out["w_prev"],
                     "core": {k: round(v, 6) for k, v in calc_out["core"].items()}, "tau": {k: round(v, 6) for k, v in calc_out["tau"].items()},
                     "sr": {k: round(v, 4) for k, v in calc_out["sr"].items()}, "kappa": calc_out["kappa"], "t_eff": calc_out["t_eff"],
+                    "shadow_tau": {k: round(v, 6) for k, v in calc_out["shadow_tau"].items()},
+                    "shadow_w_target": {k: round(v, 6) for k, v in calc_out["shadow_w_target"].items()},
                     "w_target": {k: round(v, 6) for k, v in calc_out["w_target"].items()},
                     "w_final": plan.weights if plan else {}, "steps": calc_out["steps"], "reasons": reasons, "clipped": calc_out["clipped"],
                     "no_forecast": calc_out["held"],
@@ -1346,14 +1353,14 @@ def format_table(rec: dict[str, Any]) -> str:
         rows.append([i, *[("-" if mu.get(k) is None else f"{M.ann_pct(mu[k]):+.1f}") for k in ks], "-" if p is None else f"{p:.2f}",
                      "-" if sd is None else f"{M.sigma_ann_pct(sd):.1f}"])
     out += _grid(rows)
-    out += ["", f"weights: previous, core, forecast Sharpe, tilt (kappa {rec.get('kappa', 1.0)}), target, after each rule in order, final:"]
+    out += ["", f"weights: previous, core, forecast Sharpe, live tilt (kappa {rec.get('kappa', 0.0)}), shadow tilt, target, after each rule in order, final:"]
     steps = {st["step"]: st for st in rec.get("steps") or []}
-    rows = [["id", "prev", "core", "SR", "tilt", "target", *[lab for _, lab in RULE_COLUMNS], "final"]]
+    rows = [["id", "prev", "core", "SR", "tilt", "shadow", "target", *[lab for _, lab in RULE_COLUMNS], "final"]]
     for i in ids:
         ws = (rec.get("w_target") or {}).get(i)
-        co, sr, ta = ((rec.get(k) or {}).get(i) for k in ("core", "sr", "tau"))
+        co, sr, ta, sh = ((rec.get(k) or {}).get(i) for k in ("core", "sr", "tau", "shadow_tau"))
         rows.append([i, f"{rec['w_prev'][i]:.2f}", "-" if co is None else f"{co:.2f}", "-" if sr is None else f"{sr:+.2f}",
-                     "-" if ta is None else f"{ta * 100:+.0f}%", "-" if ws is None else f"{ws:.2f}",
+                     "-" if ta is None else f"{ta * 100:+.0f}%", "-" if sh is None else f"{sh * 100:+.0f}%", "-" if ws is None else f"{ws:.2f}",
                      *[("-" if key not in steps or i not in steps[key]["after"] else f"{steps[key]['after'][i]:.2f}") for key, _ in RULE_COLUMNS],
                      f"{rec['w_final'][i]:.2f}"])
     out += _grid(rows)

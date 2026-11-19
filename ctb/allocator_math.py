@@ -10,6 +10,9 @@ weights. This module turns them, together with the decider's probabilities, into
      the largest scale at which the portfolio volatility is within the cap. The forecast only tilts it:
      SR_s = mu_s 365 / (sigma_d_s sqrt(365)), tau_s = clip(SR_s / SR_full, -T_eff, +T_eff), T_eff = T kappa,
      target_s = clip(core_s (1 + tau_s), 0, 1). With tau = 0 the target is the core exactly.
+     The tilt has to earn its room: kappa is 0 until the shadow tilted book has beaten the core book (see
+     kappa_for_skill), so the live weights are the core. The tilted target at full T is still computed and
+     logged as the shadow.
   4. the rules, in order: vol cap, buffer, step, decider veto, exploration floor, then the drawdown
      floor and owner_lock, which override everything (see apply_rules)
 
@@ -88,10 +91,10 @@ def combine(mu: Mapping[str, float | None], weights: Mapping[str, float]) -> flo
 @dataclass(frozen=True)
 class TiltParams:
     """The tilt constants. t_eff = t_max * kappa; kappa in [0, 1] is the tilt room the forecast has earned
-    (forecast/scores.json `kappa`, forwarded in forecast/latest.json, 1 at the start)."""
+    (forecast/scores.json `kappa`, forwarded in forecast/latest.json; 0 at the start and whenever it is missing)."""
     sr_full: float = 1.0   # a forecast Sharpe of this much gives the full tilt
     t_max: float = 0.5     # T: the largest tilt, as a fraction of the core weight
-    kappa: float = 1.0
+    kappa: float = 0.0
 
     @property
     def t_eff(self) -> float:
@@ -134,19 +137,19 @@ def tilted_target(core: Sequence[float], tau: Sequence[float]) -> list[float]:
     return [min(1.0, max(0.0, c * (1.0 + t))) for c, t in zip(core, tau)]
 
 
-KAPPA_MIN_DAYS = (90, 180)   # the two windows of the tilt skill
-KAPPA_STEPS = (1.0, 0.5, 0.25)
+KAPPA_STEPS = (0.0, 0.5, 1.0)
 
 
 def kappa_for_skill(skill_90: float | None, skill_180: float | None) -> float:
-    """The tilt room from the shadow tilt skill (mean daily return of the tilted book minus the core book):
-    0.25 when the last 180 days and the last 90 days are both negative, 0.5 when the last 90 days are negative,
-    else 1. None (fewer days than the window) counts as not negative."""
-    neg90 = skill_90 is not None and skill_90 < 0
-    neg180 = skill_180 is not None and skill_180 < 0
-    if neg90 and neg180:
+    """The tilt room the shadow tilt skill has earned (mean daily return of the shadow tilted book minus the core book):
+    1.0 when the last 90 days and the last 180 days are both positive, 0.5 when the last 90 days are positive,
+    else 0. None (fewer days than the window) and an exact zero do not count as positive, so kappa is 0 until 90
+    days exist. It goes back down by the same rules when the means turn negative."""
+    pos90 = skill_90 is not None and skill_90 > 0
+    pos180 = skill_180 is not None and skill_180 > 0
+    if pos90 and pos180:
         return KAPPA_STEPS[2]
-    return KAPPA_STEPS[1] if neg90 else KAPPA_STEPS[0]
+    return KAPPA_STEPS[1] if pos90 else KAPPA_STEPS[0]
 
 
 # ---------------------------------------------------------------------------------- optimiser (kept for the comparison)
@@ -233,15 +236,20 @@ def sigma_ann_pct(sigma_d: float) -> float:
 
 
 def reason_line(sid: str, core: float, tau: float, sr: float, w_target: float, w_final: float, binding: Sequence[str],
-                regime: str | None = None, kappa: float = 1.0) -> str:
-    """One plain line for the card, e.g.
-    "trend: core 0.42, tilt +18% (SR +0.36), w 0.50 -> 0.45 after step cap (regime up_calm 0.62)"."""
-    line = f"{sid}: core {core:.2f}, tilt {tau * 100:+.0f}% (SR {sr:+.2f}), w {w_target:.2f}"
+                regime: str | None = None, kappa: float = 0.0, shadow_tau: float | None = None) -> str:
+    """One plain line for the card. With no tilt room (kappa 0) the weight is the core and the tilt is shown as a shadow:
+    "trend: core 0.42 (tilt in shadow, +18%, earns live control after 90 days ahead of core) -> 0.25 after step cap".
+    With room: "trend: core 0.42, tilt +18% (SR +0.36), w 0.50 -> 0.45 after step cap [tilt room 0.50]"."""
+    if kappa <= 0.0:
+        st = tau if shadow_tau is None else shadow_tau
+        line = f"{sid}: core {core:.2f} (tilt in shadow, {st * 100:+.0f}%, earns live control after 90 days ahead of core)"
+    else:
+        line = f"{sid}: core {core:.2f}, tilt {tau * 100:+.0f}% (SR {sr:+.2f}), w {w_target:.2f}"
     if abs(w_final - w_target) > 0.005 or binding:
         line += f" -> {w_final:.2f}"
         names = [STEP_LABELS[b] for b in binding]
         if names:
             line += f" after {', '.join(names)}"
-    if kappa < 1.0:
+    if 0.0 < kappa < 1.0:
         line += f" [tilt room {kappa:.2f}]"
     return line + (f" ({regime})" if regime else "")
