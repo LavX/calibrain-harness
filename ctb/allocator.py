@@ -9,9 +9,9 @@ model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that answers one JSON allocation dire
 
 Computed weights (ctb/allocator_math.py): when <root>/forecast/latest.json exists (written daily by the
 prediction layer) the decider is only one forecaster. It is still asked every hour, p is the mean of its
-last 24 answers, and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: mean-variance
-optimum of the combined forecasts, then the vol cap, buffer, step, decider veto, exploration floor, the
-drawdown floor and owner_lock. A forecast older than 36 h holds the weights and reports the error in
+last 24 answers, and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: core plus tilt (the
+static inverse-volatility mix, tilted by at most +-T by each strategy's forecast Sharpe), then the vol cap,
+buffer, step, decider veto, exploration floor, the drawdown floor and owner_lock. A forecast older than 36 h holds the weights and reports the error in
 status.json. Without the file the decider-only mapping above applies and status.json says so.
 
 Each live strategy (carry, trend, xsmom, ...) has a virtual book and reads <root>/<id>/control.json
@@ -353,6 +353,7 @@ class Calc:
     stale_h: float = 36.0
     weights_utc: tuple[int, int] = (23, 50)
     rules: M.RuleParams = M.RuleParams()
+    tilt: M.TiltParams = M.TiltParams()
     start_weights: Any = None   # {"default": {...}, "<id>": {...}}
 
     @staticmethod
@@ -373,6 +374,7 @@ class Calc:
                     p_window=max(1, s.allocator_p_window), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
                     rules=M.RuleParams(vol_cap=s.allocator_vol_cap, buffer=s.allocator_buffer, step_up=s.allocator_step_up,
                                        veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, explore_floor=floor),
+                    tilt=M.TiltParams(sr_full=s.allocator_tilt_sr_full, t_max=s.allocator_tilt_max),
                     start_weights=s.allocator_start_weights)
 
     def cost(self, sid: str) -> float:
@@ -436,7 +438,8 @@ def regime_text(root: Path) -> str | None:
 
 def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str, Current], p: dict[str, float | None],
                     calc: Calc, regime: str | None = None, dd_floor_pct: float = 15.0) -> dict[str, Any]:
-    """The computed layer for one day, no I/O: forecasts to target weights with the full breakdown.
+    """The computed layer for one day, no I/O: forecasts to target weights (core plus tilt, then the rules) with the full
+    breakdown. The tilt room kappa comes from the forecast file (scores.json via forecast/latest.json), 1 when absent.
     Strategies without a usable forecast (no sigma, or no forecaster with a value) are held at their weight."""
     fstrat = forecast.get("strategies") or {}
     fw = forecast.get("weights_k") if isinstance(forecast.get("weights_k"), dict) else {}
@@ -482,8 +485,11 @@ def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str,
     for sid in ids:
         mu_log.setdefault(sid, {})
     w_prev = {sid: current[sid].weight for sid in ids}
+    kappa = _num(forecast.get("kappa"))
+    tilt = replace(calc.tilt, kappa=1.0 if kappa is None else min(1.0, max(0.0, kappa)))
     if not opt:
-        return {"opt": [], "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "w_star": {},
+        return {"opt": [], "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "w_target": {},
+                "core": {}, "tau": {}, "sr": {}, "kappa": tilt.kappa, "t_eff": tilt.t_eff,
                 "w_final": dict(w_prev), "steps": [], "reasons": {sid: f"{sid}: held at {w_prev[sid]:.2f} ({held[sid]})" for sid in ids}}
 
     def cov_ij(a: str, b: str) -> float:
@@ -497,17 +503,19 @@ def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str,
         return sigma_log[a] ** 2 if a == b else 0.0  # no covariance given: independent
 
     cov = [[cov_ij(a, b) for b in opt] for a in opt]
-    cost = [calc.cost(sid) * (current[sid].gross if current[sid].gross is not None else 1.0) / calc.horizon_days for sid in opt]
-    star = M.solve_weights([mu_log[sid]["combined"] for sid in opt], cov, [w_prev[sid] for sid in opt], cost, gamma=calc.gamma)
-    w_star = dict(zip(opt, star))
-    final, steps = M.apply_rules(opt, w_star, {sid: w_prev[sid] for sid in opt}, cov, {sid: p.get(sid) for sid in opt}, calc.rules,
+    core = dict(zip(opt, M.core_weights([sigma_log[sid] for sid in opt], cov, calc.rules.vol_cap, len(opt))))
+    sr = {sid: M.forecast_sharpe(mu_log[sid]["combined"], sigma_log[sid]) for sid in opt}
+    tau = {sid: M.tilt_tau(sr[sid], tilt) for sid in opt}
+    w_target = dict(zip(opt, M.tilted_target([core[sid] for sid in opt], [tau[sid] for sid in opt])))
+    final, steps = M.apply_rules(opt, w_target, {sid: w_prev[sid] for sid in opt}, cov, {sid: p.get(sid) for sid in opt}, calc.rules,
                                  floored=[sid for sid in opt if current[sid].drawdown_pct is not None and current[sid].drawdown_pct > dd_floor_pct], locked=[sid for sid in opt if current[sid].owner_lock])
     reasons = {sid: f"{sid}: held at {w_prev[sid]:.2f} ({why})" for sid, why in held.items()}
     for sid in opt:
         binding = [st["step"] for st in steps if sid in st["changed"]]
-        reasons[sid] = M.reason_line(sid, mu_log[sid]["combined"], sigma_log[sid], w_star[sid], final[sid], binding, regime)
-    return {"opt": opt, "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "w_star": w_star,
-            "w_final": {**{sid: w_prev[sid] for sid in ids}, **final}, "steps": steps, "cost": dict(zip(opt, cost)), "reasons": reasons}
+        reasons[sid] = M.reason_line(sid, core[sid], tau[sid], sr[sid], w_target[sid], final[sid], binding, regime, tilt.kappa)
+    return {"opt": opt, "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "core": core, "tau": tau,
+            "sr": sr, "kappa": tilt.kappa, "t_eff": tilt.t_eff, "w_target": w_target,
+            "w_final": {**{sid: w_prev[sid] for sid in ids}, **final}, "steps": steps, "reasons": reasons}
 
 
 # ---------------------------------------------------------------------------------- market summary
@@ -1085,9 +1093,12 @@ class Allocator:
             if calc_out:
                 record.update({
                     "mu": calc_out["mu"], "mu_ann_pct": {sid: {k: round(M.ann_pct(v), 2) for k, v in m.items() if v is not None} for sid, m in calc_out["mu"].items()},
-                    "sigma_d": calc_out["sigma_d"], "w_prev": calc_out["w_prev"], "w_star": {k: round(v, 6) for k, v in calc_out["w_star"].items()},
+                    "sigma_d": calc_out["sigma_d"], "w_prev": calc_out["w_prev"],
+                    "core": {k: round(v, 6) for k, v in calc_out["core"].items()}, "tau": {k: round(v, 6) for k, v in calc_out["tau"].items()},
+                    "sr": {k: round(v, 4) for k, v in calc_out["sr"].items()}, "kappa": calc_out["kappa"], "t_eff": calc_out["t_eff"],
+                    "w_target": {k: round(v, 6) for k, v in calc_out["w_target"].items()},
                     "w_final": plan.weights if plan else {}, "steps": calc_out["steps"], "reasons": reasons, "clipped": calc_out["clipped"],
-                    "no_forecast": calc_out["held"], "cost_per_day": calc_out["cost"],
+                    "no_forecast": calc_out["held"],
                 })
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
@@ -1319,7 +1330,7 @@ RULE_COLUMNS = (("vol_cap", "vol"), ("buffer", "buf"), ("step", "step"), ("veto"
 
 def format_table(rec: dict[str, Any]) -> str:
     """The computed weights as plain text tables (python -m ctb.allocator once --dry-run). Needs a record with
-    the breakdown (mu, sigma_d, w_prev, w_star, steps, w_final, p_decider, reasons); other records get one line."""
+    the breakdown (mu, sigma_d, w_prev, core, tau, w_target, steps, w_final, p_decider, reasons); other records get one line."""
     fc = rec.get("forecast") or {}
     head = f"weights_mode {rec.get('weights_mode')}, trigger {rec.get('trigger')}, forecast {fc.get('state')} {fc.get('date') or ''} age {fc.get('age_h')} h"
     if "mu" not in rec:
@@ -1335,12 +1346,14 @@ def format_table(rec: dict[str, Any]) -> str:
         rows.append([i, *[("-" if mu.get(k) is None else f"{M.ann_pct(mu[k]):+.1f}") for k in ks], "-" if p is None else f"{p:.2f}",
                      "-" if sd is None else f"{M.sigma_ann_pct(sd):.1f}"])
     out += _grid(rows)
-    out += ["", "weights: previous, optimum, after each rule in order, final:"]
+    out += ["", f"weights: previous, core, forecast Sharpe, tilt (kappa {rec.get('kappa', 1.0)}), target, after each rule in order, final:"]
     steps = {st["step"]: st for st in rec.get("steps") or []}
-    rows = [["id", "prev", "w*", *[lab for _, lab in RULE_COLUMNS], "final"]]
+    rows = [["id", "prev", "core", "SR", "tilt", "target", *[lab for _, lab in RULE_COLUMNS], "final"]]
     for i in ids:
-        ws = (rec.get("w_star") or {}).get(i)
-        rows.append([i, f"{rec['w_prev'][i]:.2f}", "-" if ws is None else f"{ws:.2f}",
+        ws = (rec.get("w_target") or {}).get(i)
+        co, sr, ta = ((rec.get(k) or {}).get(i) for k in ("core", "sr", "tau"))
+        rows.append([i, f"{rec['w_prev'][i]:.2f}", "-" if co is None else f"{co:.2f}", "-" if sr is None else f"{sr:+.2f}",
+                     "-" if ta is None else f"{ta * 100:+.0f}%", "-" if ws is None else f"{ws:.2f}",
                      *[("-" if key not in steps or i not in steps[key]["after"] else f"{steps[key]['after'][i]:.2f}") for key, _ in RULE_COLUMNS],
                      f"{rec['w_final'][i]:.2f}"])
     out += _grid(rows)

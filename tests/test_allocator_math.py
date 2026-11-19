@@ -134,7 +134,85 @@ def test_drawdown_floor_and_owner_lock_override_everything():
 
 
 def test_reason_line():
-    line = M.reason_line("trend", 0.061 / 365, 0.18 / math.sqrt(365), 0.41, 0.35, ["step"], "regime up_calm 0.62")
-    assert line == "trend: mu +6.1%/yr (regime up_calm 0.62), sigma 18%, w* 0.41 -> 0.35 after step cap"
-    assert M.reason_line("carry", -0.01 / 365, 0.1 / math.sqrt(365), 0.0, 0.0, []) == "carry: mu -1.0%/yr, sigma 10%, w* 0.00 -> 0.00"
-    assert M.reason_line("x", 0.0, 0.01, 0.5, 0.1, ["vol_cap", "veto"]).endswith("after vol cap, decider veto")
+    line = M.reason_line("trend", 0.42, 0.18, 0.36, 0.50, 0.45, ["step"], "regime up_calm 0.62")
+    assert line == "trend: core 0.42, tilt +18% (SR +0.36), w 0.50 -> 0.45 after step cap (regime up_calm 0.62)"
+    assert M.reason_line("trend", 0.42, 0.18, 0.36, 0.50, 0.50, []) == "trend: core 0.42, tilt +18% (SR +0.36), w 0.50"
+    assert M.reason_line("carry", 0.3, -0.5, -1.2, 0.15, 0.10, ["explore_floor"], kappa=0.5) == \
+        "carry: core 0.30, tilt -50% (SR -1.20), w 0.15 -> 0.10 after exploration floor [tilt room 0.50]"
+    assert M.reason_line("x", 0.5, 0.0, 0.0, 0.5, 0.1, ["vol_cap", "veto"]).endswith("after vol cap, decider veto")
+
+
+# ---------------------------------------------------------------------------------- core plus tilt
+def cov_of(sig, corr=0.0):
+    n = len(sig)
+    return [[sig[i] * sig[j] * (1.0 if i == j else corr) for j in range(n)] for i in range(n)]
+
+
+def test_forecast_sharpe_is_the_annual_return_over_the_annual_volatility():
+    sigma_d = 0.01
+    assert M.forecast_sharpe(0.10 / 365, sigma_d) == pytest.approx(0.10 / (sigma_d * math.sqrt(365)))
+    assert M.forecast_sharpe(0.001, 0.0) == 0.0 and M.forecast_sharpe(-0.001, sigma_d) < 0
+
+
+def test_core_is_the_inverse_vol_mix_at_the_cap():
+    sig = [0.01, 0.02, 0.04]
+    cov = cov_of(sig)
+    w = M.core_weights(sig, cov, 0.10)
+    assert M.portfolio_vol_ann(w, cov) == pytest.approx(0.10, rel=1e-6)
+    assert w[1] / w[2] == pytest.approx(2.0) and w[0] / w[1] == pytest.approx(2.0) and max(w) <= 1.0
+    # a quiet book is capped at 1 and the cap is not reached: all at 1
+    assert M.core_weights([1e-4] * 3, cov_of([1e-4] * 3), 0.10) == [1.0, 1.0, 1.0]
+    # one very quiet book is held at 1 while the others are scaled to the cap
+    q = M.core_weights([0.001, 0.02, 0.04], cov_of([0.001, 0.02, 0.04]), 0.10)
+    assert q[0] == 1.0 and q[1] > q[2]
+    assert M.core_weights([], [], 0.10) == []
+
+
+def test_tau_zero_gives_the_core_exactly():
+    core = [0.42, 0.3, 1.0, 0.0]
+    assert M.tilted_target(core, [0.0] * 4) == core
+    p = M.TiltParams()
+    assert M.tilt_tau(0.0, p) == 0.0 and M.tilted_target(core, [M.tilt_tau(0.0, p)] * 4) == core
+
+
+def test_tilt_is_bounded_by_t_and_the_box():
+    p = M.TiltParams()                                     # T 0.5, SR_full 1
+    assert M.tilt_tau(0.36, p) == pytest.approx(0.36)
+    assert M.tilt_tau(3.0, p) == 0.5 and M.tilt_tau(-3.0, p) == -0.5 and M.tilt_tau(-0.2, p) == pytest.approx(-0.2)
+    assert M.tilt_tau(0.8, M.TiltParams(sr_full=2.0, t_max=1.0)) == pytest.approx(0.4)   # SR_full 2: SR 0.8 is 40% of full
+    assert M.tilt_tau(9.0, M.TiltParams(t_max=0.25)) == 0.25 and M.tilt_tau(9.0, M.TiltParams(t_max=1.0)) == 1.0
+    w = M.tilted_target([0.4, 0.9, 0.5, 0.0], [0.5, 0.5, -0.5, 0.5])
+    assert w == pytest.approx([0.6, 1.0, 0.25, 0.0])        # 0.9 x 1.5 is clipped to the box
+    assert all(0.0 <= x <= 1.0 for x in M.tilted_target([1.0, 0.0], [1.0, -1.0]))
+    # a tilt never flips a weight's sign or exceeds core x (1 + T)
+    for core in (0.1, 0.5, 0.8):
+        for sr in (-5.0, -0.3, 0.0, 0.3, 5.0):
+            t = M.tilted_target([core], [M.tilt_tau(sr, p)])[0]
+            assert core * 0.5 - 1e-12 <= t <= min(1.0, core * 1.5) + 1e-12
+
+
+def test_kappa_scales_the_tilt_room():
+    assert M.TiltParams(kappa=1.0).t_eff == 0.5 and M.TiltParams(kappa=0.5).t_eff == 0.25 and M.TiltParams(kappa=0.0).t_eff == 0.0
+    assert M.TiltParams(kappa=3.0).t_eff == 0.5 and M.TiltParams(kappa=-1.0).t_eff == 0.0   # clamped to [0, 1]
+    assert M.tilt_tau(5.0, M.TiltParams(kappa=0.5)) == 0.25 and M.tilt_tau(5.0, M.TiltParams(kappa=0.0)) == 0.0
+
+
+def test_kappa_steps_down_with_a_negative_tilt_skill():
+    assert M.kappa_for_skill(None, None) == 1.0            # not enough days: full room
+    assert M.kappa_for_skill(0.0001, 0.0001) == 1.0
+    assert M.kappa_for_skill(0.0001, -0.0001) == 1.0       # the last 90 days recovered
+    assert M.kappa_for_skill(-0.0001, None) == 0.5         # 90 days negative
+    assert M.kappa_for_skill(-0.0001, 0.0002) == 0.5       # but 180 days are not
+    assert M.kappa_for_skill(-0.0001, -0.0001) == 0.25     # both negative
+    assert M.kappa_for_skill(0.0, 0.0) == 1.0              # a tie is not negative
+
+
+def test_rule_order_is_unchanged_after_the_tilt():
+    cov = cov_of([0.02, 0.02])
+    ids = ["a", "b"]
+    p = M.RuleParams(explore_floor=0.10)
+    w_t = dict(zip(ids, M.tilted_target(M.core_weights([0.02, 0.02], cov, 0.10, 2), [0.5, -0.5])))
+    final, steps = M.apply_rules(ids, w_t, {"a": 0.2, "b": 0.5}, cov, {"a": None, "b": 0.3}, p, floored=[], locked=[])
+    assert [st["step"] for st in steps] == ["vol_cap", "buffer", "step", "veto", "explore_floor", "floor_lock"]
+    assert steps[0]["before"] == {i: round(w_t[i], 6) for i in ids}   # the first rule sees the tilted target
+    assert final["b"] <= 0.5 * 0.5 + 1e-12                          # the decider veto (p 0.3 < 0.4) caps b at half of yesterday's

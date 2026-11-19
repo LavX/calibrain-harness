@@ -7,8 +7,8 @@ deployed, and when. It places no orders: it only writes the allocation fields of
 There are two ways it sets weights:
 
 - **Computed** (when `forecast/latest.json` exists): weights come from the prediction layer's
-  forecasts by a mean-variance optimum plus fixed rules, see "Computed weights" below. The decision
-  model is one forecaster among several and still has a veto.
+  forecasts by a static core (inverse-volatility mix) that the forecasts only tilt, plus fixed rules,
+  see "Computed weights" below. The decision model is one forecaster among several and still has a veto.
 - **Decider only** (no forecast file): the decision model's probabilities map straight to weights,
   see "Model and question set". `status.json` says `weights_mode: "decider-only"`.
 
@@ -44,7 +44,7 @@ Layout under the live root (`CTB_LIVE_ROOT`, default `data/live`; on aurora4
 
 Source of the numbers: `forecast/latest.json` (daily 23:40 UTC): per strategy `sigma_d` and the daily mean
 net return `mu` of each forecaster (`base`, `regime`, `ridge`, carry also `structural`), `cov_d`, and
-`weights_k` (each forecaster's weight, from the daily scoring). The decider is not in the file: the
+`weights_k` (each forecaster's weight, from the daily scoring), and `kappa` (the tilt room, see "Tilt room by skill"). The decider is not in the file: the
 allocator adds it. The math is in `ctb/allocator_math.py` (pure, no I/O); the constants are in
 `ctb/config.py` (`CTB_ALLOCATOR_*`, defaults below).
 
@@ -68,12 +68,19 @@ Per strategy, a weights run does:
    strategy, or no `decider` key, the ledger's starting weights fill in (base 0.30, regime 0.25, ridge 0.20,
    decider 0.25; carry: structural 0.40, base 0.15, regime 0.10, ridge 0.10, decider 0.25). Weights are
    renormalised over the forecasters that have a value, so a decider with no answers just drops out.
-4. `w* = argmax_{0<=w<=1} sum w_s mu_s - (gamma/2) w'Sigma w - sum c_s G_s |w_s - w_prev_s| / H`, gamma 2,
-   H 7 days, c 10 bp per side (carry 16 bp). Projected (proximal) gradient in pure Python, fixed start
-   (`w_prev`), no randomness. Alone and unconstrained, `w = mu / (gamma sigma^2)`. `G_s` is the book's gross
-   exposure per unit of capital: `status.json` positions (qty times mark) over equity, divided by the
-   current weight because the runner scales targets by it; 1 when the book is flat, unreadable, or its
-   weight is under 0.10. `w_prev` is the weight in `control.json` now.
+4. Core plus tilt. Why: in the walk-forward 2023-01-01 to 2026-11-18 the mean-variance optimum of the
+   forecasts returned -0.41%/yr (Sharpe -0.08), the static inverse-volatility mix +2.79%/yr (Sharpe 0.31):
+   the forecasts mostly cut exposure. So the forecasts no longer set the weight, they nudge it.
+   - Core: `core_s = min(1, k / sigma_d_s)`, k the largest scale at which `sqrt(365 w'Sigma w) / N` is at
+     most the vol cap (10%/yr). That is the static inverse-vol book of the walk-forward, before the rules.
+   - Tilt: `SR_s = mu_s * 365 / (sigma_d_s * sqrt(365))`, the combined forecast (all forecasters and the
+     decider) over the annual volatility. `tau_s = clip(SR_s / SR_full, -T_eff, +T_eff)`, `SR_full` 1.0,
+     `T_eff = T * kappa`, `T` 0.5.
+   - Target: `w_target_s = clip(core_s * (1 + tau_s), 0, 1)`. A zero forecast gives the core exactly; the
+     tilt is at most +-50% of the core weight; the target stays in the box, so a core of 1 cannot be raised.
+   The mean-variance optimiser (`solve_weights`) and the cost term (`CTB_ALLOCATOR_GAMMA`, `_HORIZON_DAYS`,
+   `_COST_BP`, `_CARRY_COST_BP`, the gross exposure `G_s`) are kept for the comparison and no longer used.
+   `w_prev` is the weight in `control.json` now.
 5. The rules, in this order (each is logged with before and after):
    `vol_cap` (scale all so `sqrt(365 w'Sigma w) / N <= 10%/yr`, N the number of strategies), `buffer`
    (a change under 0.10 is not made), `step` (up at most 0.25 per run, down unlimited), `veto` (p below 0.40
@@ -83,22 +90,36 @@ Per strategy, a weights run does:
    wins over the floor.
 6. A strategy with no forecast (or no sigma) is held at its weight and listed in `no_forecast`.
 
-Defaults: `CTB_ALLOCATOR_GAMMA` 2, `_HORIZON_DAYS` 7, `_COST_BP` 10, `_CARRY_COST_BP` 16, `_SHARPE_CAP` 1.5,
+### Tilt room by skill
+
+`kappa` in [0, 1] multiplies `T`. It is 1 at the start. The prediction layer (`forecast.py score`, nightly)
+writes `tilt_skill` and `kappa` into `forecast/scores.json`, and `forecast.py run` copies `kappa` into
+`forecast/latest.json`, which is where this module reads it (absent or unreadable: 1; clipped to [0, 1]).
+`tilt_skill` is the shadow difference between the tilted book and the core book, from the archived
+forecasts and the returns files: for each archived day, `d = (1/N) sum_s (target_s - core_s) r_s` for the
+next day's return `r_s` of each strategy's book, at full `T` and kappa 1, without the rules or costs and
+without the decider. The mean of `d` over the last 90 and the last 180 days gives `skill_90` and `skill_180`
+(a window with fewer days than its length is not judged). `kappa` is 1; 0.5 when `skill_90` is negative;
+0.25 when `skill_90` and `skill_180` are both negative. It steps back up when the 90-day mean turns
+non-negative. `decisions.jsonl` carries the `kappa` and `t_eff` used.
+
+Defaults: `CTB_ALLOCATOR_TILT_MAX` 0.5, `_TILT_SR_FULL` 1.0, `CTB_ALLOCATOR_GAMMA` 2, `_HORIZON_DAYS` 7, `_COST_BP` 10, `_CARRY_COST_BP` 16, `_SHARPE_CAP` 1.5,
 `_DECIDER_K` 0.8, `_P_WINDOW` 24, `_VOL_CAP` 0.10, `_BUFFER` 0.10, `_STEP_UP` 0.25, `_VETO_P` 0.40,
 `_VETO_FACTOR` 0.5, `_EXPLORE_FLOOR` 0.10, `_STALE_H` 36, `_WEIGHTS_UTC` 23:50.
 
 A weights run's `decisions.jsonl` line carries the usual fields (`weights` is the final applied weight,
 `applied`, `risk_floor`, `skipped_owner_lock`, `error`, `answers`, `inputs`) plus: `weights_mode`
 (`computed`, `refresh` or `held`), `forecast` (state, date, age), `mu` (per forecaster and `combined`, daily
-net return after the Sharpe clip), `mu_ann_pct`, `sigma_d`, `clipped`, `p_decider`, `w_prev`, `w_star`,
-`w_final`, `steps` (the ordered rules, each with `before`, `after`, `changed`; `vol_cap` also `vol_ann` and
-`factor`), `cost_per_day`, `no_forecast`, and `reasons`, one plain line per strategy that is also the card's
-`reason`, e.g. `trend: mu +6.1%/yr (regime up_calm 0.62), sigma 18%, w* 0.41 -> 0.35 after step cap`. The
+net return after the Sharpe clip), `mu_ann_pct`, `sigma_d`, `clipped`, `p_decider`, `w_prev`, `core`, `sr`,
+`tau`, `kappa`, `t_eff`, `w_target`, `w_final`, `steps` (the ordered rules, each with `before`, `after`,
+`changed`; `vol_cap` also `vol_ann` and `factor`), `no_forecast`, and `reasons`, one plain line per strategy
+that is also the card's `reason`, e.g. `trend: core 0.42, tilt +18% (SR +0.36), w 0.50 -> 0.45 after step
+cap (regime up_calm 0.62)`. (`w_target` replaces the earlier `w_star`; `cost_per_day` is gone.) The
 regime in the line is today's state from `regime/latest.json` and its 7-day probability.
 
 `python -m ctb.allocator once --dry-run` asks the decider (its answer counts toward p but is not stored),
-prints the full table (mu per forecaster in %/yr, p, sigma, previous weight, w*, the weight after each rule,
-final, the reasons) and writes nothing. Without a forecast file it prints the decider-only output as before.
+prints the full table (mu per forecaster in %/yr, p, sigma, previous weight, core, SR, tilt, target, the weight
+after each rule, final, the reasons) and writes nothing. Without a forecast file it prints the decider-only output as before.
 The chat fallback (`CTB_ALLOCATOR_MODEL=llm`) never uses the forecast.
 
 ## Model and question set
