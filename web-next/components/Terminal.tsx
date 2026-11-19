@@ -1,12 +1,13 @@
 "use client";
 import { useEffect } from "react";
-import { connectSocket, loadDecisions, loadMarket, loadMonitor, loadNews, loadOverview, loadPerf } from "@/lib/data";
+import { connectSocket, loadDecisions, loadMarket, loadMonitor, loadNews, loadOverview, loadPerf, loadStrat } from "@/lib/data";
 import { setState, useStore } from "@/lib/store";
 import { Alerts, Clocks, CommandBar, FKeys, StatusLine } from "./TopBar";
 import { MonitorView } from "./Monitor";
 import { EvalView, LogView, NewsView, TradesView } from "./Views";
 import { Modals } from "./Modals";
 import { ValidationView } from "./Validation";
+import { StrategiesView } from "./Strategies";
 import { Tip } from "./Tip";
 
 /** Polls only what has no push channel; everything that moves arrives over /ws. */
@@ -25,9 +26,11 @@ export default function Terminal() {
     let stop: (() => void)[] = [];
     (async () => {
       await loadOverview().catch(() => {});
+      loadStrat().catch(() => {});
       await Promise.all([loadMonitor(), loadMarket(), loadDecisions(), loadPerf(), loadNews()].map((p) => p.catch(() => {})));
       stop = [
         connectSocket(),
+        every(10_000, loadStrat), // live strategies, allocator and the auto-trade mode
         every(10_000, loadOverview), // settings, budgets, labelled count (account itself is pushed)
         every(5_000, loadMonitor), // universe map, macro, tape, headlines, sparklines (ticks are pushed)
         every(10_000, loadMarket), // state preview + derivatives block (candles/book are pushed)
@@ -37,7 +40,7 @@ export default function Terminal() {
       ];
     })();
     const onKey = (e: KeyboardEvent) => {
-      const fk = ({ F1: "mon", F2: "eval", F3: "trades", F4: "news", F5: "log", F6: "valid" } as const)[e.key as "F1"];
+      const fk = ({ F1: "mon", F2: "eval", F3: "trades", F4: "news", F5: "log", F6: "valid", F7: "strat" } as const)[e.key as "F1"];
       if (fk) {
         e.preventDefault();
         setState({ view: fk });
@@ -67,6 +70,7 @@ export default function Terminal() {
           <MonitorView hidden={view !== "mon"} />
           {view === "eval" && <EvalView />}
           {view === "valid" && <ValidationView />}
+          {view === "strat" && <StrategiesView />}
           {view === "trades" && <TradesView />}
           {view === "news" && <NewsView />}
           {view === "log" && <LogView />}

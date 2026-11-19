@@ -11,6 +11,9 @@ export async function loadOverview() {
     tf: s.ov ? s.tf : String(ov.settings.decision_tf_minutes),
   }));
 }
+export async function loadStrat() {
+  setState({ strat: await api("/api/strategies") });
+}
 export async function loadMonitor() {
   setState({ mon: await api("/api/monitor") });
 }

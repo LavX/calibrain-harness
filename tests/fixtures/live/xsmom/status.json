@@ -1,0 +1,26 @@
+{
+ "id": "xsmom",
+ "label": "Cross-sectional momentum",
+ "enabled": true,
+ "state": "latched",
+ "updated_ms": 1799999990000,
+ "last_rebalance_ms": 1799992800000,
+ "next_rebalance_ms": 1800003600000,
+ "last_error": "venue position differs from the book: SOLUSDT",
+ "equity_usdt": null,
+ "start_equity_usdt": 10000.0,
+ "pnl_usdt": 0.0,
+ "pnl_pct": 0.0,
+ "fees_usdt": 0.0,
+ "funding_usdt": 0.0,
+ "positions": [],
+ "targets": [
+  {
+   "symbol": "SOLUSDT",
+   "target_qty": 12.0,
+   "market": "linear"
+  }
+ ],
+ "trades_today": 0,
+ "trades_total": 0
+}

@@ -1,0 +1,20 @@
+{
+ "id": "trend",
+ "label": "Trend (BTC, ETH)",
+ "enabled": false,
+ "state": "paused",
+ "updated_ms": 1799999995000,
+ "last_rebalance_ms": 1799913600000,
+ "next_rebalance_ms": null,
+ "last_error": null,
+ "equity_usdt": 9950.0,
+ "start_equity_usdt": 10000.0,
+ "pnl_usdt": -50.0,
+ "pnl_pct": -0.5,
+ "fees_usdt": 3.0,
+ "funding_usdt": -0.4,
+ "positions": [],
+ "targets": [],
+ "trades_today": 0,
+ "trades_total": 3
+}

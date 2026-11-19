@@ -1,0 +1,8 @@
+{
+ "state": "running",
+ "model": "example-model",
+ "last_decision_ms": 1799998200000,
+ "next_decision_ms": 1800001800000,
+ "last_error": null,
+ "cost_usd_today": 0.0421
+}

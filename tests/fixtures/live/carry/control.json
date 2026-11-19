@@ -1,0 +1,10 @@
+{
+ "enabled": true,
+ "flatten": false,
+ "reset_latch": false,
+ "weight": 0.6,
+ "set_by": "llm",
+ "owner_lock": false,
+ "reason": "funding is positive and basis is calm",
+ "updated_ms": 1799996400000
+}

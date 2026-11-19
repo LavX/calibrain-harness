@@ -1,0 +1,20 @@
+[
+ {
+  "id": "carry",
+  "label": "Funding carry (BTC, ETH)",
+  "unit": "calibrain-live@carry.service",
+  "account": "demo-main"
+ },
+ {
+  "id": "trend",
+  "label": "Trend (BTC, ETH)",
+  "unit": "calibrain-live@trend.service",
+  "account": "demo-main"
+ },
+ {
+  "id": "xsmom",
+  "label": "Cross-sectional momentum",
+  "unit": "calibrain-live@xsmom.service",
+  "account": "demo-main"
+ }
+]

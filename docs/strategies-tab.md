@@ -1,0 +1,113 @@
+# Strategies tab
+
+The STRATEGIES screen (F7, or type `STRATEGIES`) shows and controls the live strategies that trade on the Bybit
+**demo** account. The strategies are not run by this dashboard. A separate live runner (a systemd user unit) trades
+them and writes plain files; the dashboard reads those files and writes only `control.json` files plus start/stop of
+the runner unit. It never reads a credential and never places an order itself.
+
+## Modes (header)
+
+The header has a mode selector next to AUTO-TRADE. Exactly one mode trades the demo account at a time.
+
+| Mode | Who decides | AUTO-TRADE switch |
+| --- | --- | --- |
+| LLM DECIDES | the LLM allocator (`ctb/allocator.py`) picks which strategies trade and their weight | on: allocator on and runner started; off: allocator paused and every strategy off |
+| MANUAL | you, per card (the allocator is paused) | on: the strategies ticked "in header set" are switched on and the runner started; off: all off |
+| PER-SYMBOL BOT | the older per-symbol LLM bot | the existing switch (`/api/trading`) |
+
+With no `strategies.json` and no allocator the selector is hidden and the header behaves as before.
+
+Changing the mode asks for confirmation and pauses the other side first:
+
+* to PER-SYMBOL BOT: allocator and every strategy are paused and the runner unit is stopped. Refused while a strategy
+  holds a position (FLATTEN it first), so the bot never inherits strategy positions on the same account.
+* away from PER-SYMBOL BOT: the bot's AUTO-TRADE is turned off. Refused while the bot has open trades.
+* LLM DECIDES to MANUAL: the allocator is paused, strategies stay as they are.
+
+The guard only applies on the demo venue (the testnet venue is another host and another account). A strategy conflicts
+with the bot when its `account` in `strategies.json` equals `CTB_DASHBOARD_ACCOUNT`, or when that variable is unset.
+A background check every 15 s also turns the bot's AUTO-TRADE off if the runner unit is started behind the dashboard's
+back (for example with `systemctl`). After a dashboard restart the mode is LLM DECIDES if the allocator is switched on,
+MANUAL if strategies are configured, otherwise PER-SYMBOL BOT.
+
+## Card controls
+
+* **AUTO TRADE** switch: `control.json` `enabled`. On: the runner places that strategy's orders. Off: it stops placing
+  new orders and keeps its positions. Turning it on also starts the runner unit if it is not running. Flipping it by hand
+  sets `owner_lock: true` and `set_by: "owner"`; the allocator must not change a locked strategy. **UNLOCK TO LLM** clears
+  the lock (`owner_lock: false`, `set_by: "llm"`). An owner "on" on a strategy with weight 0 sets weight 1.
+* **FLATTEN** (confirm step): `flatten: true`. **RESET LATCH** (confirm step, only when latched): `reset_latch: true`.
+  Both need the runner running, otherwise nobody would act on them and the flag would fire at the next start.
+* The card shows state, equity, P&L (USDT and %), fees, funding, positions with unrealised P&L, targets, recent fills,
+  the last and next rebalance, the LLM's weight and reason, and an equity sparkline. The sparkline lives in the
+  dashboard's memory (one sample a minute, last 12 hours), so it starts empty after a dashboard restart.
+
+## Allocator panel
+
+State, model, last and next decision, interval (change), cost today, a DECIDE NOW button (confirm step) and the feed of
+the last 15 decisions (time, weight per strategy, reasoning, strategies skipped because of an owner lock). It reads
+`<root>/allocator/status.json` and `decisions.jsonl` and writes `<root>/allocator/control.json`
+(`enabled`, `interval_min`, `decide_now`). The decision loop itself is `ctb.allocator.run(engine, root)`; the dashboard
+starts it at startup when the module can be imported (see the marked stub block in `ctb/server.py`, the merge point
+with `feat/llm-allocator`). Until that branch is merged the panel says "not installed" and LLM DECIDES refuses to
+switch on.
+
+## Files (the contract with the runner)
+
+Root: `CTB_LIVE_ROOT`, default `/home/lavx/Documents/calibrain-study/data/live`.
+
+| File | Written by | Read by |
+| --- | --- | --- |
+| `strategies.json` (id, label, unit, account) | runner, at start | dashboard |
+| `<id>/status.json` (at least every 60 s) | runner | dashboard |
+| `<id>/trades.jsonl` | runner | dashboard (last 12 fills) |
+| `<id>/control.json` (enabled, flatten, reset_latch, weight, set_by, owner_lock, reason) | dashboard and allocator | runner |
+| `allocator/status.json`, `allocator/decisions.jsonl` | allocator | dashboard |
+| `allocator/control.json` (enabled, interval_min, decide_now) | dashboard | allocator |
+
+A status older than 3 minutes while the unit is active shows as STALE. `allocator` is reserved and cannot be a
+strategy id. Writes to `control.json` are atomic (temp file and rename) and keep keys the dashboard does not know.
+
+Runner start/stop: only unit names found in `strategies.json` (or listed in `CTB_LIVE_UNITS`, for the very first start
+before the runner has written the file) are accepted, each validated as a plain `.service` name, and run as
+`systemctl --user <action> -- <unit>` with an argument list and no shell. Child processes get a minimal environment
+(`PATH`, `HOME`, `XDG_RUNTIME_DIR`), never the dashboard's own.
+
+## Deploy on aurora4
+
+The dashboard must run where the units live. aurora4 has no Node, so build the UI export on a machine with Node and
+copy it (`web-next/out` is not committed).
+
+```sh
+# on the laptop: build the UI
+cd web-next && npm ci && npm run build && cd ..
+
+# put the code on aurora4 (branch lavx once this PR is merged, or feat/study-tab before)
+ssh lavx@aurora4 'test -d ~/Documents/calibrain-harness || git clone https://github.com/LavX/calibrain-harness.git ~/Documents/calibrain-harness'
+ssh lavx@aurora4 'cd ~/Documents/calibrain-harness && git fetch origin && git checkout lavx && git pull --ff-only'
+rsync -a --delete web-next/out/ lavx@aurora4:Documents/calibrain-harness/web-next/out/
+
+# on aurora4
+ssh lavx@aurora4
+cd ~/Documents/calibrain-harness
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+mkdir -p ~/.config/systemd/user
+cp docs/deploy/calibrain-harness.service ~/.config/systemd/user/
+# edit CTB_HOST (tailnet address), CTB_DASHBOARD_ACCOUNT and CTB_LIVE_UNITS in the copy, then:
+systemctl --user daemon-reload
+systemctl --user enable --now calibrain-harness.service
+systemctl --user status calibrain-harness.service
+```
+
+Open `http://100.96.108.128:8800/` (tailnet) or tunnel with `ssh -L 8800:127.0.0.1:8800 lavx@aurora4` and open
+`http://127.0.0.1:8800/`. aurora4 has `Linger=yes`, so the user unit survives logout. Keys for the per-symbol bot
+go in the repo's `.env` on aurora4 (the STRATEGIES tab itself needs none).
+
+Trading stays off: `CTB_TRADING_ENABLED=0` in the unit and the switch starts off in the UI. `CTB_VENUE` decides which
+account the per-symbol bot would use (`testnet` default); the strategies always use the demo account through the runner.
+
+## Local preview
+
+`scripts/preview_strategies.py` copies the fixture files in `tests/fixtures/live` to a temp directory with fresh
+timestamps and starts the dashboard against them (no keys, no runner, observe-only). Press F7. The runner start/stop
+buttons answer "not installed" there because no such unit exists on the machine; the file-based controls work.
