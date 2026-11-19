@@ -512,7 +512,7 @@ class Allocator:
             self._dirty = True
         dd = self.drawdown_pct(sid, status)
         w = _num(ctl.get("weight"))
-        weight = 1.0 if w is None else min(1.0, max(0.0, w))
+        weight = 0.0 if w is None else min(1.0, max(0.0, w))  # nothing decided yet means off, as in the runner
         enabled = ctl.get("enabled", status.get("enabled", True)) is not False
         lock = ctl.get("owner_lock") is True
         trades = tail_jsonl(self.root / sid / "trades.jsonl", 5000)

@@ -24,6 +24,8 @@ Layout under the live root (`CTB_LIVE_ROOT`, default `data/live`; on aurora4
   never disables it. The peak is tracked from the runner's `equity_usdt` (and
   `start_equity_usdt`, or `peak_equity_usdt` when the runner reports one). After an intentional
   restart of a cut strategy run `python -m ctb.allocator reset-peak <id>`.
+- A `control.json` with no `weight` counts as weight 0 (nothing decided yet means off, the same
+  default the runner uses), so the first decision's step limit starts from 0.
 - Invalid model output (schema, ranges, unknown ids) is retried once with the problem stated, then
   the current allocation is kept and the error is logged.
 - `owner_lock: true` is respected, including a lock set between reading and writing.

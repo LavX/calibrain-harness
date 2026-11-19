@@ -240,3 +240,11 @@ def test_market_summary_and_model_choice():
     with pytest.raises(ValueError):
         A.allocator_spec("ordecide")  # a decision model cannot write an allocation
     assert A.allocator_spec("or:deepseek/deepseek-v4.1-flash-1017").kind == "chat"
+
+
+def test_missing_weight_counts_as_zero(root):
+    put(root / "carry" / "control.json", {"enabled": True})
+    a = make(root, FakeLLM(good()))
+    assert a.strategy_context({"id": "carry"}, int(T0 * 1000))[1].weight == 0.0
+    decide(a)
+    assert ctl(root, "carry")["weight"] == 0.5  # model wanted 0.8, step limit from 0
