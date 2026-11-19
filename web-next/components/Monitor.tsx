@@ -81,16 +81,18 @@ function Watchlist() {
   const ticks = useStore((s) => s.ticks);
   const symbol = useStore((s) => s.symbol);
   const latest = useStore((s) => s.latest);
+  const bot = useBotMode();
+  const venue = useVenueShort();
   if (!mon) return <div className="empty">Loading…</div>;
   return (
     <table className="t">
-      <thead><tr><th>Sym</th><th className="r">Last</th><th className="r">24h</th><th>24h·15m</th><th className="r">Fund%</th><th className="r">KRS</th></tr></thead>
+      <thead><tr><th>Sym</th><th className="r">Last</th><th className="r">24h</th><th>24h·15m</th><th className="r">Fund%</th>{bot && <th className="r">KRS</th>}</tr></thead>
       <tbody>
         {mon.rows.map((r: any) => {
           const t = ticks[r.symbol];
           const last = t?.last ?? r.last, pct = t?.pct24h ?? r.pct24h;
           const d = latest[r.symbol];
-          const tip = `${r.symbol}\nmark ${px(t?.mark ?? r.mark)} · index ${px(r.index)}\n24h H ${px(r.high24h)} L ${px(r.low24h)}\nturnover $${usd(r.turnover24h)} · OI $${usd(r.oi_value)}\ntestnet ${px(t?.testnet_last ?? r.testnet_last)} (${sg(r.divergence_bp, 1)} bp)`;
+          const tip = `${r.symbol}\nmark ${px(t?.mark ?? r.mark)} · index ${px(r.index)}\n24h H ${px(r.high24h)} L ${px(r.low24h)}\nturnover $${usd(r.turnover24h)} · OI $${usd(r.oi_value)}\n${venue.toLowerCase()} ${px(t?.testnet_last ?? r.testnet_last)} (${sg(r.divergence_bp, 1)} bp)`;
           return (
             <tr key={r.symbol} className={`click ${r.symbol === symbol ? "sel" : ""}`} onClick={() => selectSymbol(r.symbol)} data-tip={tip}>
               <td className="sym">{short(r.symbol)}</td>
@@ -98,11 +100,11 @@ function Watchlist() {
               <td className={`r ${ud(pct)}`}>{sg(pct, 2, "%")}</td>
               <td>{spark(r.spark)}</td>
               <td className={`r ${ud(r.funding)}`}>{sg(isNum(r.funding) ? r.funding * 100 : null, 4)}</td>
-              <td className="r">
+              {bot && <td className="r">
                 {!d ? <span className="tag flat">—</span> : d.error_kind ? <span className="tag err" data-tip={d.error_kind}>ERR</span> : (
                   <span className={`tag ${d.action}`} data-tip={`${d.action}${d.exploration ? " (explore)" : ""} · ${age(Date.now() / 1000 - d.ts)} ago\nEV long ${sg(d.ev_long_r, 3)}R · short ${sg(d.ev_short_r, 3)}R`}>{(d.action || "").toUpperCase()}</span>
                 )}
-              </td>
+              </td>}
             </tr>
           );
         })}
@@ -135,6 +137,8 @@ function ChartHeader() {
   const tf = useStore((s) => s.tf);
   const tick = useStore((s) => (symbol ? s.ticks[symbol] : undefined));
   const maxDiv = useStore((s) => s.ov?.settings.max_venue_divergence_bp ?? 150);
+  const bot = useBotMode();
+  const venue = useVenueShort();
   const last = tick?.last ?? mkt?.ticker?.lastPrice;
   const pct = tick?.pct24h ?? (isNum(mkt?.ticker?.price24hPcnt) ? 100 * mkt.ticker.price24hPcnt : null);
   const tn = tick?.testnet_last ?? mkt?.testnet_ticker?.lastPrice;
@@ -146,9 +150,9 @@ function ChartHeader() {
       <span className="seg">
         {Object.entries(TFL).map(([k, l]) => <button key={k} className={k === tf ? "on" : ""} onClick={() => selectTf(k)}>{l}</button>)}
       </span>
-      <span className="legend"><i style={{ ["--c" as any]: "var(--amber)" }} />EMA20 <i style={{ ["--c" as any]: "var(--s1)" }} />EMA50 <i className="tri" /><ModelName /></span>
+      <span className="legend"><i style={{ ["--c" as any]: "var(--amber)" }} />EMA20 <i style={{ ["--c" as any]: "var(--s1)" }} />EMA50 {bot && <><i className="tri" /><ModelName /></>}</span>
       <span className="ph-r">
-        {tn && <>TESTNET {px(tn)} <span className={div !== null && Math.abs(div) > maxDiv ? "dn" : ""} data-tip="Testnet last vs mainnet last. Entries and brackets use the testnet book.">{sg(div, 1)}bp</span></>}
+        {tn && <>{venue} {px(tn)} <span className={div !== null && Math.abs(div) > maxDiv ? "dn" : ""} data-tip={`${venue} last vs mainnet last.${bot ? " Entries and brackets use the " + venue.toLowerCase() + " book." : " Reference only in this mode."}`}>{sg(div, 1)}bp</span></>}
       </span>
     </div>
   );
@@ -170,6 +174,11 @@ function SignalOrStrategies() {
 
 const NOT_YET = "not computed yet";
 
+/** "TESTNET" or "DEMO": the venue the account and the bracket book live on (settings.venue_label without the exchange name). */
+function useVenueShort(): string {
+  return useStore((s) => s.ov?.settings?.venue_label)?.replace("BYBIT ", "") || "TESTNET";
+}
+
 /** Today's P&L (UTC day) of one strategy in USDT: equity now minus equity at the start of the day. status.json only carries the
  * P&L since the book started, so this reads the dashboard's own equity samples: the last one before UTC midnight, or the first
  * one of today when the dashboard started later. Returns the P&L and the time of the baseline sample (seconds). */
@@ -182,6 +191,19 @@ function pnlToday(s: StratDoc["strategies"][number], nowS: number): { v: number;
   const base = before.length ? before[before.length - 1] : h.find((p) => p[0] >= mid);
   return base ? { v: Number(eq) - base[1], since: Math.max(base[0], mid) } : null;
 }
+
+/** Short strategy name for the narrow F1 table; the full label stays in the tooltip. */
+function shortName(id: string, label: string): string {
+  const k = id.toLowerCase().replace(/[^a-z]/g, "");
+  if (k.includes("carry")) return "Carry";
+  if (k.includes("trend")) return "Trend";
+  if (k.includes("xsmom") || k.includes("momentum")) return "Momentum";
+  if (k.includes("basis")) return "Basis";
+  if (k.includes("long")) return "Long-only";
+  return label.split(/[ (]/)[0] || id;
+}
+const SPILL_SHORT: Record<string, string> = { runner_stopped: "STOPPED" };
+const utcHM = (sec: number) => new Date(sec * 1000).toISOString().slice(11, 16);
 
 function StrategiesNow() {
   const doc = useStore((s) => s.strat) as StratDoc | null;
@@ -198,6 +220,14 @@ function StrategiesNow() {
   const pnls = doc.strategies.map((s) => pnlToday(s, nowS));
   const known = pnls.filter((x): x is { v: number; since: number } => !!x);
   const total = known.length ? known.reduce((a, x) => a + x.v, 0) : null;
+  // the baseline of the sum: 00:00 UTC when every strategy has a sample from before midnight, else the dashboard's first sample of today
+  const midS = Math.floor(nowS / 86400) * 86400;
+  const sinceLo = known.length ? Math.min(...known.map((x) => x.since)) : null, sinceHi = known.length ? Math.max(...known.map((x) => x.since)) : null;
+  const sinceTxt = sinceHi === null || sinceLo === null ? "" : sinceHi <= midS + 1 ? "since 00:00 UTC"
+    : sinceHi - sinceLo < 60 ? `since dashboard sample ${utcHM(sinceHi)} UTC` : `since dashboard samples ${utcHM(sinceLo)} to ${utcHM(sinceHi)} UTC`;
+  // core weight: said once in the header when it is 1.00 for every strategy, else per row
+  const cores = doc.strategies.map((s) => byId.get(s.id)?.core);
+  const coreAllOne = cores.length > 0 && cores.every((c) => isNum(c) && Math.abs(Number(c) - 1) < 0.005);
   const lastMs = doc.allocator?.status?.last_decision_ms ?? pred?.allocator?.t_ms ?? null;
   const model = doc.allocator?.status?.model;
 
@@ -208,13 +238,13 @@ function StrategiesNow() {
         <div className="snow-head">
           <div data-tip={rg?.state_help || undefined}><span className="muted">REGIME</span> <b className="amb">{regime}</b></div>
           <div><span className="muted">P&amp;L TODAY</span> <b className={ud(total)}>{total === null ? NOT_YET : `${sg(total, 2)} USDT`}</b>
-            <span className="muted" data-tip="UTC day, from the dashboard's equity samples: the last one before 00:00 UTC, or the first of today when the dashboard started later"> (all strategies)</span></div>
-          <div><span className="muted">ALLOCATOR</span> <b className="w">{MODE_LABEL[doc.mode]}</b>{doc.mode !== "bot" && <> · <b className={doc.auto_on ? "up" : ""}>{doc.auto_on ? "AUTO ON" : "AUTO OFF"}</b></>}{model ? <span className="muted"> · {model}</span> : null}
+            <span className="muted" data-tip="Sum over the strategies, from the dashboard's own equity samples: the last sample before 00:00 UTC, or the first sample of today when the dashboard started later. The ACCOUNT panel's Today PnL is the Bybit account figure and can differ."> (all strategies{sinceTxt ? `, ${sinceTxt}` : ""})</span></div>
+          <div><span className="muted">ALLOCATOR</span> <b className="w">{MODE_LABEL[doc.mode]}</b>{doc.mode !== "bot" && <> · <b className={doc.auto_on ? "up" : ""}>{doc.auto_on ? "AUTO ON" : "AUTO OFF"}</b></>}{model ? <span className="muted"> · {model}</span> : null}{coreAllOne && <span className="muted" data-tip="Core weight: the static inverse-volatility mix the allocator starts from"> · core 1.00 each</span>}
             <span className="muted"> · last decision </span><b className="w">{lastMs ? `${hhmm(lastMs / 1000)} (${age(nowS - lastMs / 1000)} ago)` : "none yet"}</b></div>
         </div>
         {doc.strategies.length ? (
           <table className="t snow">
-            <thead><tr><th>Strategy</th><th>State</th><th className="r">Weight</th><th className="r">P&amp;L today</th><th className="r">Pos</th><th className="r" data-tip="The decider's p, mean over the last 24 h">p 24h</th></tr></thead>
+            <thead><tr><th>Strategy</th><th>State</th><th className="r">Weight</th><th className="r">P&amp;L today</th><th className="r" data-tip="Open positions of this strategy">Pos</th><th className="r" data-tip="The decider's p, mean over the last 24 h">p 24h</th></tr></thead>
             <tbody>{doc.strategies.map((s, i) => {
               const r = byId.get(s.id), c = s.control, p = pnls[i];
               const w = isNum(c.weight) ? Number(c.weight) : isNum(r?.live_weight) ? Number(r!.live_weight) : null;
@@ -222,10 +252,10 @@ function StrategiesNow() {
               const [pl, pc] = PILL[s.pill] || [s.pill.toUpperCase(), "notlive"];
               return (
                 <tr key={s.id}>
-                  <td className="sym lbl" data-tip={`${s.label} (${s.id})`}>{s.label}</td>
-                  <td><span className={`spill ${pc}`}>{pl}</span></td>
-                  <td className="r">{w === null ? <span className="muted">n/a</span> : <b className="w">{fx(w, 2)}</b>}{w !== null && core !== null && Math.abs(w - core) >= 0.005 && <span className="muted" data-tip="Core weight: the static inverse-volatility mix the allocator starts from"> / core {fx(core, 2)}</span>}</td>
-                  <td className={`r ${ud(p?.v)}`} data-tip={p ? `baseline sample at ${hhmm(p.since)}` : undefined}>{p ? sg(p.v, 2) : <span className="muted">n/a</span>}</td>
+                  <td className="sym lbl" data-tip={`${s.label} (${s.id})`}>{shortName(s.id, s.label)}</td>
+                  <td><span className={`spill ${pc}`} data-tip={pl}>{SPILL_SHORT[s.pill] || pl}</span></td>
+                  <td className="r">{w === null ? <span className="muted">n/a</span> : <b className="w">{fx(w, 2)}</b>}{!coreAllOne && w !== null && core !== null && Math.abs(w - core) >= 0.005 && <span className="muted" data-tip="Core weight: the static inverse-volatility mix the allocator starts from"> / core {fx(core, 2)}</span>}</td>
+                  <td className={`r ${ud(p?.v)}`} data-tip={p ? (p.since <= midS + 1 ? "since 00:00 UTC" : `since dashboard sample ${utcHM(p.since)} UTC`) : undefined}>{p ? sg(p.v, 2) : <span className="muted">n/a</span>}</td>
                   <td className="r">{s.status ? s.status.positions.length : <span className="muted">n/a</span>}</td>
                   <td className="r">{isNum(r?.p_decider) ? `${(Number(r!.p_decider) * 100).toFixed(0)}%` : <span className="muted" data-tip={`decider p: ${NOT_YET}`}>n/a</span>}</td>
                 </tr>
@@ -337,6 +367,7 @@ function KairosPanel() {
 /* ---------------------------------------------------------------- account */
 function Account() {
   const ov = useStore((s) => s.ov);
+  const bot = useBotMode();
   const now = useNow();
   const a = ov?.account, w = a?.wallet || {};
   const closePos = async (sym: string) => {
@@ -347,20 +378,20 @@ function Account() {
   };
   if (!a) return <><Ph code="PRTU">Account · {(ov?.settings?.venue_label || "BYBIT TESTNET").replace("BYBIT ", "").toLowerCase()}</Ph><div className="empty">{ov?.executor_error || "No API keys for this venue"}</div></>;
   const st = ov.settings;
-  const cells: [string, React.ReactNode, string][] = [
+  const cells: [string, React.ReactNode, React.ReactNode, string?][] = [
     ["Equity", fx(w.equity), "USDT · UTA"], ["Available", fx(w.available), "USDT"],
     ["Unrealised", <span key="u" className={ud(w.unrealized_pnl)}>{sg(w.unrealized_pnl)}</span>, "USDT"],
-    ["Today PnL", <span key="d" className={ud(a.daily_pnl)}>{sg(a.daily_pnl)}</span>, `halts at −${st.daily_loss_limit_pct}%`],
+    ["Today PnL", <span key="d" className={ud(a.daily_pnl)}>{sg(a.daily_pnl)}</span>, <BotOnly key="h">{`halts at −${st.daily_loss_limit_pct}%`}</BotOnly>, "Bybit account, since 00:00 UTC, includes pre-existing holdings. The F1 strategies panel sums only the strategies, since the dashboard's own equity samples."],
     ["Positions", <span key="p">{a.positions.length}/{st.max_positions} <BotOnly><button className="mini" onClick={() => setPosCap()} data-tip="Change the max number of open positions. Applies to new entries only.">CAP</button></BotOnly></span>, `${a.open_orders} open orders`],
-    ["Risk / trade", <BotOnly key="r">{st.exploration_mode ? Math.min(st.explore_risk_pct, st.risk_per_trade_pct) : st.risk_per_trade_pct}%</BotOnly>, `entry cap ${st.max_entry_slip_bp}bp · ≤${st.max_leverage}x`],
+    ["Risk / trade", <BotOnly key="r">{st.exploration_mode ? Math.min(st.explore_risk_pct, st.risk_per_trade_pct) : st.risk_per_trade_pct}%</BotOnly>, <BotOnly key="c">{`entry cap ${st.max_entry_slip_bp}bp · ≤${st.max_leverage}x`}</BotOnly>],
   ];
   return (
     <>
       <Ph code="PRTU" right={a.last_sync ? `${a.private_stream ? "stream" : "poll"} · sync ${age(now / 1000 - a.last_sync)} ago` : ""}>Account · {(ov?.settings?.venue_label || "BYBIT TESTNET").replace("BYBIT ", "").toLowerCase()}</Ph>
       <div className="pb tight" style={{ flex: "none" }}>
-        <div className="acct-grid">{cells.map(([l, n, s]) => <div className="cell" key={l}><div className="l">{l}</div><div className="n">{n}</div><div className="s">{s}</div></div>)}</div>
+        <div className="acct-grid">{cells.map(([l, n, s, tip]) => <div className="cell" key={l} data-tip={tip}><div className="l">{l}</div><div className="n">{n}</div><div className="s">{s}</div></div>)}</div>
       </div>
-      <div className="ph sub"><span className="code">PST</span>Positions</div>
+      <div className="ph sub"><span className="code">PST</span>Positions{!bot && <span className="ph-r" data-tip="One Bybit position per symbol: the strategies' orders are merged on the demo account, so a row here can belong to several strategies.">netted across strategies</span>}</div>
       <div className="pb tight scroll">
         {a.positions.length ? (
           <table className="t">
@@ -604,6 +635,7 @@ export { KV };
 
 function Stats() {
   const m = useStore((s) => s.mkt);
+  const bot = useBotMode();
   const showState = () => m?.state_preview && setState({ modal: { kind: "state", data: { symbol: m.symbol, preview: m.state_preview } } });
   if (!m) return <><Ph code="DES">Derivatives &amp; flow</Ph><div className="empty">Loading…</div></>;
   const t = m.ticker, st = m.state_preview?.state || {}, dv = st.derivatives || {}, ob = st.order_book || {}, of = st.order_flow || {};
@@ -616,7 +648,8 @@ function Stats() {
   const n = m.state_preview ? JSON.stringify(m.state_preview.state).length : 0;
   return (
     <>
-      <Ph code="DES" right={n ? <a href="#" onClick={(e) => { e.preventDefault(); showState(); }}>KAIROS STATE ≈{Math.round(n / 3.6)} TOK ›</a> : ""}>{m.symbol} · derivatives, flow &amp; trend</Ph>
+      <Ph code="DES" right={n ? <a href="#" className={bot ? undefined : "dim"} onClick={(e) => { e.preventDefault(); showState(); }}
+        data-tip={bot ? undefined : "The text state the per-symbol bot's model reads. The bot is observe-only in this mode."}>{bot ? "KAIROS STATE" : "PER-SYMBOL BOT (INACTIVE) · STATE"} ≈{Math.round(n / 3.6)} TOK ›</a> : ""}>{m.symbol} · derivatives, flow &amp; trend</Ph>
       <div className="pb tight scroll">
         <div className="kvcols">
           <div><div className="colh">DERIVATIVES</div><KV rows={[

@@ -65,12 +65,12 @@ button { font: inherit; cursor: pointer; }
 .arm:has(input:checked) { color: var(--up); border-color: #1d5c3c; }
 
 /* ---------- function keys */
-.fkeys { display: flex; gap: 2px; padding: 3px 10px; background: #000; border-bottom: 1px solid var(--line); overflow-x: auto; align-items: center; }
-.fkeys button { background: var(--bar); color: var(--text-2); border: 0; padding: 3px 10px 3px 4px; font-weight: 500; letter-spacing: .05em; white-space: nowrap; }
+.fkeys { display: flex; flex-wrap: wrap; gap: 3px 2px; padding: 3px 10px; background: #000; border-bottom: 1px solid var(--line); align-items: center; }
+.fkeys button { flex: none; background: var(--bar); color: var(--text-2); border: 0; padding: 3px 10px 3px 4px; font-weight: 500; letter-spacing: .05em; white-space: nowrap; }
 .fkeys button b { background: #2a2a2a; color: var(--amber); padding: 0 4px; margin-right: 6px; font-weight: 600; }
 .fkeys button.on { background: var(--amber); color: #000; } .fkeys button.on b { background: #000; color: var(--amber); }
 .fk-spacer { flex: 1; }
-.venue { color: var(--muted); white-space: nowrap; font-size: 11px; } .venue b { color: var(--text-2); font-weight: 500; }
+.venue { color: var(--muted); white-space: nowrap; font-size: 11px; flex: 0 1 auto; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; } .venue b { color: var(--text-2); font-weight: 500; }
 
 /* ---------- alerts */
 .alert { margin: 6px 10px 0; padding: 5px 10px; border-left: 3px solid var(--warn); background: #161106; color: var(--text); }
@@ -333,7 +333,6 @@ fieldset.botonly.locked * { pointer-events: none; }
 
 /* ---------- F1 strategies-now panel (replaces the KRS signal panel outside mode "bot") */
 .snow-head { display: grid; gap: 2px; padding: 2px 2px 6px; }
-.snow td.lbl { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
 .snow-note { padding: 6px 2px 0; }
 
 /* ---------- strategies: predictions panel and scoreboard */
@@ -358,3 +357,14 @@ fieldset.botonly.locked * { pointer-events: none; }
 .pred-chart { width: 100%; height: 120px; background: #000; border: 1px solid var(--line-2); display: block; }
 .pred-legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 3px 0 4px; }
 .pred-legend .sw { display: inline-block; width: 10px; height: 3px; vertical-align: middle; }
+
+/* ---------- second toolbar row: groups never shrink below their content, so they wrap instead of overlapping */
+.fkeys fieldset.botonly, .fkeys .tradetf-wrap { flex: none; min-width: max-content; }
+.fkeys .tradetf { margin-right: 6px; }
+.fkeys .stratbtn { flex: none; }
+.botchip { flex: none; white-space: nowrap; font: 500 11px var(--mono); letter-spacing: .04em; color: var(--muted); border: 1px dashed var(--line); padding: 1px 8px; opacity: .6; cursor: not-allowed; }
+
+/* ---------- strategies mode: old per-symbol bot elements shown dimmed and relabelled */
+.dim { opacity: .45; }
+.snow th, .snow td { padding-left: 4px; padding-right: 4px; }
+.snow td.lbl { max-width: none; }
