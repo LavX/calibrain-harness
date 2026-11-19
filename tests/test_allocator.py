@@ -65,7 +65,7 @@ def root(tmp_path):
 
 def make(root, llm, **kw):
     return A.Allocator(root, llm, kw.pop("market", fake_market), model="test/model", clock=lambda: T0,
-                       budget=RateBudget(kw.pop("rph", 12)), **kw)
+                       budget=RateBudget(kw.pop("rph", 12)), mode="chat", **kw)
 
 
 def ctl(root, sid):
@@ -237,9 +237,9 @@ def test_market_summary_and_model_choice():
     assert m["major"]["BTC"]["vol_30d_ann_pct"] is not None
     assert m["trend_universe"]["share_above_ema50"] == pytest.approx(0.67, abs=0.01)
     assert m["trend_universe"]["dispersion_7d_std_pct"] > 0
+    assert A.allocator_spec("or:deepseek/deepseek-v4.1-flash-1017").kind == "chat"  # the chat fallback
     with pytest.raises(ValueError):
-        A.allocator_spec("ordecide")  # a decision model cannot write an allocation
-    assert A.allocator_spec("or:deepseek/deepseek-v4.1-flash-1017").kind == "chat"
+        A.allocator_spec("nonsense")
 
 
 def test_missing_weight_counts_as_zero(root):

@@ -115,6 +115,13 @@ class Settings:
     kairos_news_enabled: bool = _b("CTB_KAIROS_NEWS", True)
     kairos_news_max_per_hour: int = _i("CTB_KAIROS_NEWS_MAX_RPH", 20)
 
+    # --- strategy allocator (ctb/allocator.py, question set alloc-v1.0): probability -> weight ---
+    # weight = clip((p - p_zero) / (p_full - p_zero), 0, 1); the categorical winner is lifted to winner_weight when its p > winner_min_p
+    allocator_p_zero: float = _f("CTB_ALLOCATOR_P_ZERO", 0.5)
+    allocator_p_full: float = _f("CTB_ALLOCATOR_P_FULL", 0.65)
+    allocator_winner_min_p: float = _f("CTB_ALLOCATOR_WINNER_MIN_P", 0.55)
+    allocator_winner_weight: float = _f("CTB_ALLOCATOR_WINNER_WEIGHT", 0.5)
+
     # --- bracket geometry (multiples of decision-timeframe ATR) ---
     sl_atr: float = _f("CTB_SL_ATR", 1.5)
     tp_atr: float = _f("CTB_TP_ATR", 2.5)

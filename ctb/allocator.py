@@ -1,4 +1,11 @@
-"""LLM strategy allocator: the language model decides which live strategies run, and how much.
+"""LLM strategy allocator: the decision model decides which live strategies run, and how much.
+
+Default: the harness's decision model (CTB_MODEL_PROVIDER when it is a decision spec: kairos, jev,
+ordecide, or:<id>; else ordecide) answers the alloc-v1.0 question set (ctb/kairos/allocator_questions.py):
+per strategy "is its net book return over the next 24 h positive" plus "which strategy, or none, earns
+the most". Code maps the probabilities to weights: weight = clip((p - 0.5) / 0.15, 0, 1), the
+categorical winner is lifted to 0.5 when its own p > 0.55, enabled = weight > 0. Fallback: a chat
+model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that answers one JSON allocation directly.
 
 Each live strategy (carry, trend, xsmom, ...) has a virtual book and reads <root>/<id>/control.json
 every loop. This module is the only writer of the allocation part of those files ("enabled",
@@ -20,12 +27,15 @@ Hard rules, enforced in code whatever the model says:
     model is unreachable);
   - owner_lock is never overridden;
   - invalid model output is retried once, then the current allocation is kept and the error logged.
+(The step limit, the floor and owner_lock apply after the probability mapping as well.)
 
 No orders are placed here. The only network calls are the model and Bybit public market data.
 
-CLI:  python -m ctb.allocator once [--dry-run]   |   run   |   reset-peak [id ...]
-Env:  CTB_LIVE_ROOT, CTB_ALLOCATOR_MODEL (default: the configured chat model, CTB_LLM_MODEL),
-      CTB_ALLOCATOR_MAX_RPH (model requests per hour, default 12), CTB_ALLOCATOR_TREND_SYMBOLS.
+CLI:  python -m ctb.allocator once [--dry-run]   |   run   |   score   |   reset-peak [id ...]
+Env:  CTB_LIVE_ROOT, CTB_ALLOCATOR_MODEL: kairos | jev | ordecide | ordecide:<id> (decision models) or
+      llm | or:<id> (chat fallback); default CTB_MODEL_PROVIDER when that is a decision spec, else ordecide.
+      CTB_ALLOCATOR_MAX_RPH (model requests per hour, default 12), CTB_ALLOCATOR_TREND_SYMBOLS,
+      CTB_ALLOCATOR_P_ZERO / _P_FULL / _WINNER_MIN_P / _WINNER_WEIGHT (the mapping, see ctb/config.py).
 """
 
 from __future__ import annotations
@@ -46,11 +56,14 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from .config import ROOT
+from .config import ROOT, Settings
 from .kairos.allocator_prompt import REASONING_MAX_CHARS, build_messages, build_schema, retry_messages
+from .kairos.allocator_questions import (BEST_QID, NONE_ID, QUESTION_SET_VERSION, MappingParams, batches, build_questions,
+                                         map_answers, pos_qid)
 from .kairos.chat import _reasoning, parse_reply
-from .kairos.client import KairosError, RateBudget, SystemOneClient
-from .models import MODELS, ModelSpec, _OR_ID, OR_PREFIX
+from .kairos.client import KairosError, RateBudget, SystemOneClient, make_client
+from .kairos.parse import validate
+from .models import MODELS, ModelSpec, _OR_ID, OR_PREFIX, get as get_model
 
 log = logging.getLogger("ctb.allocator")
 
@@ -131,21 +144,34 @@ def _r(x: float | None, nd: int = 2) -> float | None:
 
 # ---------------------------------------------------------------------------------- the model
 def allocator_spec(name: str | None = None) -> ModelSpec:
-    """The chat model the allocator asks. Default: the harness's configured chat model ("llm",
-    CTB_LLM_MODEL). "or:<openrouter-id>" picks any OpenRouter chat model. System One and decision
-    models answer typed questions, not allocations, so they are refused."""
-    name = (name or os.environ.get("CTB_ALLOCATOR_MODEL", "")).strip() or "llm"
+    """The model the allocator asks.
+
+    Decision models (default): kairos, jev, ordecide, or ordecide:<openrouter-id>. With no name the
+    harness's CTB_MODEL_PROVIDER is used when it is a decision spec, else ordecide.
+    Chat fallback: llm (CTB_LLM_MODEL) or or:<openrouter-chat-model-id>."""
+    name = (name or os.environ.get("CTB_ALLOCATOR_MODEL", "")).strip()
+    if not name:
+        configured = os.environ.get("CTB_MODEL_PROVIDER", "kairos").strip().lower()
+        try:
+            spec = get_model(configured)
+        except ValueError:
+            spec = None
+        return spec if spec is not None and spec.kind == "systemone" else MODELS["ordecide"]
+    if name.startswith("ordecide:") and _OR_ID.match(name[len("ordecide:"):]):
+        return get_model(OR_PREFIX + name[len("ordecide:"):])
     if name in MODELS:
-        spec = MODELS[name]
-    elif name.startswith(OR_PREFIX) and _OR_ID.match(name[len(OR_PREFIX):]):
+        return MODELS[name]
+    if name.startswith(OR_PREFIX) and _OR_ID.match(name[len(OR_PREFIX):]):
         mid = name[len(OR_PREFIX):]
-        spec = replace(MODELS["llm"], provider=name, label=mid.split("/", 1)[1].split(":")[0],
+        return replace(MODELS["llm"], provider=name, label=mid.split("/", 1)[1].split(":")[0],
                        vendor=f"OpenRouter · {mid.split('/', 1)[0]}", model_env=None, default_model=mid)
-    else:
-        raise ValueError(f"unknown allocator model {name!r}; use llm or or:<openrouter-chat-model-id>")
-    if spec.kind != "chat":
-        raise ValueError(f"{name!r} is a decision model and cannot write an allocation; use a chat model (llm or or:<id>)")
-    return spec
+    raise ValueError(f"unknown allocator model {name!r}; use kairos, jev, ordecide, ordecide:<id>, llm or or:<chat-model-id>")
+
+
+def model_display(spec: ModelSpec) -> str:
+    """"provider / model" as the dashboard shows it, e.g. "ordecide / google/gemini-decision-1"."""
+    provider = ("ordecide" if spec.kind == "systemone" else "chat") if spec.provider.startswith(OR_PREFIX) else spec.provider
+    return f"{provider} / {spec.model}"
 
 
 class AllocatorClient(SystemOneClient):
@@ -187,7 +213,8 @@ class Decision:
     weights: dict[str, float]
     enabled: dict[str, bool]
     reasoning: str
-    confidence: float
+    confidence: float | None
+    derive_enabled: tuple[str, ...] = ()  # ids whose enabled flag follows their final weight (decision model mapping)
 
 
 def validate_decision(raw: Any, ids: list[str]) -> Decision:
@@ -261,6 +288,8 @@ def resolve(current: dict[str, Current], proposal: Decision | None, *, max_step:
         if abs(w - want_w) > 1e-9:
             step_limited.append(i)
         e = want_e
+        if proposal is not None and i in proposal.derive_enabled:
+            e = w > 0  # enabled = weight > 0, after the step limit: a book stepping down to 0.5 stays on
         if c.drawdown_pct is not None and c.drawdown_pct > dd_floor_pct:
             w, e = 0.0, False
             floored.append(i)
@@ -405,7 +434,10 @@ class Allocator:
     def __init__(self, root: Path | str, llm: Any, market: Callable[[], Awaitable[dict]], *, model: str,
                  budget: RateBudget | None = None, clock: Callable[[], float] = time.time,
                  default_interval_min: int = 60, max_step: float = 0.5, dd_floor_pct: float = 15.0,
-                 flatten_on_floor: bool = True, tick_s: float = 30.0):
+                 flatten_on_floor: bool = True, tick_s: float = 30.0, mode: str | None = None,
+                 params: MappingParams | None = None, max_questions: int | None = None):
+        # mode "decider": llm.ask(state, questions) answers alloc-v1.0; mode "chat": llm.ask_json(messages, schema) answers a JSON
+        # allocation. Unset: chat when the client has ask_json, else decider (create_allocator always sets it).
         self.root = Path(root)
         self.llm = llm
         self.market = market
@@ -417,6 +449,12 @@ class Allocator:
         self.dd_floor_pct = dd_floor_pct
         self.flatten_on_floor = flatten_on_floor
         self.tick_s = tick_s
+        mode = mode or ("chat" if hasattr(llm, "ask_json") else "decider")
+        if mode not in ('decider', 'chat'):
+            raise ValueError(f"mode must be decider or chat, got {mode!r}")
+        self.mode = mode
+        self.params = params or MappingParams()
+        self.max_questions = max_questions
         self._stop = asyncio.Event()
         self._busy = asyncio.Lock()
         self.last_error: str | None = None
@@ -561,9 +599,63 @@ class Allocator:
         return ctx, current, rows
 
     # ---- the model
-    async def ask(self, ctx: dict[str, Any], ids: list[str], labels: dict[str, str]) -> tuple[Decision, float, int, Any]:
-        """One validated decision: a second attempt on invalid output, then give up. Returns
-        (decision, cost_usd, attempts, last_raw_reply)."""
+    async def ask(self, ctx: dict[str, Any], ids: list[str], labels: dict[str, str],
+                  current: dict[str, Current]) -> tuple[Decision, float, int, dict[str, Any]]:
+        """One validated decision. Returns (decision, cost_usd, attempts, extra fields for the log)."""
+        if self.mode == "chat":
+            return await self._ask_chat(ctx, ids, labels)
+        return await self._ask_decider(ctx, ids, labels, current)
+
+    async def _ask_decider(self, ctx: dict[str, Any], ids: list[str], labels: dict[str, str],
+                           current: dict[str, Current]) -> tuple[Decision, float, int, dict[str, Any]]:
+        """alloc-v1.0 to the decision model, in as many requests as its question limit needs; each
+        request gets a second attempt when answers are missing or off-contract. A strategy whose
+        question never validates keeps its current allocation."""
+        qs = build_questions(ids, labels)
+        parsed: dict[str, Any] = {}
+        issues_all: list[str] = []
+        request_ids: list[str] = []
+        usage_all: list[dict[str, Any]] = []
+        cost, attempts = 0.0, 0
+        limit = self.max_questions or getattr(getattr(self.llm, "spec", None), "max_questions", None)
+        for batch in batches(qs, limit):
+            for attempt in (1, 2):
+                if not self.budget.try_take():
+                    raise AllocatorError(f"hourly model request budget exhausted ({self.budget.per_hour}/h)")
+                attempts += 1
+                try:
+                    res = await self.llm.ask(ctx, batch)
+                except KairosError as exc:
+                    raise AllocatorError(str(exc)[:300]) from exc
+                ok, issues = validate(res.answers, batch)
+                parsed.update(ok)
+                usage_all.append(res.usage or {})
+                cost += _num((res.usage or {}).get("cost")) or 0.0
+                rid = (res.metadata or {}).get("request_id") or (res.metadata or {}).get("id")
+                if rid:
+                    request_ids.append(str(rid))
+                if all(q in ok for q in batch):
+                    break
+                issues_all = issues
+                log.warning("allocator: decision model answer incomplete (attempt %d): %s", attempt, "; ".join(issues)[:300])
+        p = {sid: parsed[pos_qid(sid)]["p"] for sid in ids if pos_qid(sid) in parsed}
+        best = parsed[BEST_QID]["probs"] if BEST_QID in parsed else None
+        if not p and best is None:
+            raise AllocatorError("decision model gave no valid answers: " + "; ".join(issues_all)[:300])
+        hold = {sid: (c.enabled, c.weight) for sid, c in current.items()}
+        weights, enabled, mapping, summary = map_answers(ids, p, best, hold, self.params)
+        conf = [max(v, 1 - v) for v in p.values()]
+        extra = {"qset": QUESTION_SET_VERSION, "provider": getattr(getattr(self.llm, "spec", None), "provider", None),
+                 "request_ids": request_ids, "usage": usage_all, "mapping": mapping,
+                 "answers": {"p": {sid: round(v, 4) for sid, v in p.items()},
+                             "best": None if best is None else {k: round(v, 4) for k, v in best.items()}},
+                 "unanswered": [q for q in qs if q not in parsed], "issues": issues_all[:6] if len(parsed) < len(qs) else []}
+        decision = Decision(weights, enabled, summary[:REASONING_MAX_CHARS], round(sum(conf) / len(conf), 3) if conf else None,
+                            derive_enabled=tuple(sid for sid in ids if not mapping[sid]["held"]))
+        return decision, cost, attempts, extra
+
+    async def _ask_chat(self, ctx: dict[str, Any], ids: list[str], labels: dict[str, str]) -> tuple[Decision, float, int, dict[str, Any]]:
+        """Chat fallback: one JSON allocation; a second attempt on invalid output, then give up."""
         messages = build_messages(ctx, ids, labels)
         schema = build_schema(ids)
         cost, problem = 0.0, ""
@@ -574,7 +666,7 @@ class Allocator:
             try:
                 raw, usage = await self.llm.ask_json(messages, schema)
                 cost += _num(usage.get("cost")) or 0.0
-                return validate_decision(raw, ids), cost, attempt, raw
+                return validate_decision(raw, ids), cost, attempt, {}
             except DecisionInvalid as exc:
                 problem = str(exc)
             except KairosError as exc:
@@ -633,8 +725,8 @@ class Allocator:
                 ctx, current, rows = await self.build_context(now_ms)
                 record["inputs"] = ctx
                 ids = [r["id"] for r in rows]
-                decision, cost, attempts, _ = await self.ask(ctx, ids, {r["id"]: str(r.get("label") or r["id"]) for r in rows})
-                record.update(cost_usd=round(cost, 6), attempts=attempts)
+                decision, cost, attempts, extra = await self.ask(ctx, ids, {r["id"]: str(r.get("label") or r["id"]) for r in rows}, current)
+                record.update(cost_usd=round(cost, 6), attempts=attempts, **extra)
             except AllocatorError as exc:
                 error = str(exc)
                 if not current:  # failed before the strategies were read: nothing to apply, not even the floor
@@ -658,6 +750,7 @@ class Allocator:
                 "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {},
                 "reasoning": decision.reasoning if decision else "", "confidence": decision.confidence if decision else None,
                 "requested": {"weights": decision.weights, "enabled": decision.enabled} if decision else None,
+                "mode": self.mode,
                 "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
                 "risk_floor": plan.floored if plan else [], "step_limited": plan.step_limited if plan else [],
                 "error": error, "dry_run": dry_run,
@@ -787,14 +880,84 @@ class Allocator:
 
 # ---------------------------------------------------------------------------------- wiring and CLI
 def create_allocator(session: aiohttp.ClientSession, root: Path | str | None = None, spec: ModelSpec | None = None) -> Allocator:
-    """What the dashboard server calls: an Allocator on the harness's aiohttp session."""
+    """What the dashboard server calls: an Allocator on the harness's aiohttp session. The model is
+    allocator_spec(): a decision model by default, a chat model when CTB_ALLOCATOR_MODEL says so."""
     spec = spec or allocator_spec()
     try:
         rph = int(os.environ.get("CTB_ALLOCATOR_MAX_RPH", "12"))
     except ValueError:
         rph = 12
-    llm = AllocatorClient(spec, session, timeout_s=float(os.environ.get("CTB_KAIROS_TIMEOUT_S", "120")))
-    return Allocator(root or live_root(), llm, BybitMarket(session), model=f"{spec.model}", budget=RateBudget(rph))
+    timeout = float(os.environ.get("CTB_KAIROS_TIMEOUT_S", "120"))
+    s = Settings()
+    params = MappingParams(s.allocator_p_zero, s.allocator_p_full, s.allocator_winner_min_p, s.allocator_winner_weight)
+    if spec.kind == "chat":
+        llm: Any = AllocatorClient(spec, session, timeout_s=timeout)
+        mode = "chat"
+    else:
+        llm, mode = make_client(spec, session, timeout_s=timeout), "decider"
+    return Allocator(root or live_root(), llm, BybitMarket(session), model=model_display(spec), budget=RateBudget(rph),
+                     mode=mode, params=params)
+
+
+# ---------------------------------------------------------------------------------- scoring
+def _equity_at(hist: list, t_ms: int, tol_ms: int) -> float | None:
+    best = min(hist, key=lambda x: abs(x[0] - t_ms), default=None)
+    return float(best[1]) if best and abs(best[0] - t_ms) <= tol_ms else None
+
+
+def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None = None, tol_min: int = 45,
+                    min_weight: float = 0.1) -> dict[str, Any]:
+    """Score logged alloc-v1.0 answers against the realised net book return, from the equity at the
+    decision (logged inputs) and the equity samples in allocator/state.json (kept 8 days: run this at
+    least weekly). A book's return is divided by its weight, so it is the return on the capital the
+    strategy deploys; a book held below min_weight cannot be labelled and is counted as flat."""
+    alloc = Path(root) / ALLOCATOR_ID
+    now_ms = now_ms or int(time.time() * 1000)
+    hist = (read_json(alloc / "state.json") or {}).get("history", {})
+    h_ms, tol = horizon_h * 3_600_000, tol_min * 60_000
+    per: dict[str, dict[str, Any]] = {}
+    best_stats = {"n": 0, "correct": 0, "p_realised": 0.0}
+    pending, unlabelled = 0, {"flat": 0, "no_equity": 0}
+    for d in tail_jsonl(alloc / "decisions.jsonl", 5000):
+        ans = d.get("answers")
+        if d.get("qset") != QUESTION_SET_VERSION or d.get("error") or d.get("dry_run") or not isinstance(ans, dict):
+            continue
+        t = int(d["t_ms"])
+        if t + h_ms > now_ms:
+            pending += 1
+            continue
+        strategies = ((d.get("inputs") or {}).get("strategies") or {})
+        returns: dict[str, float] = {}
+        for sid, p in (ans.get("p") or {}).items():
+            e0 = _num((strategies.get(sid) or {}).get("equity_usdt"))
+            e1 = _equity_at(hist.get(sid, []), t + h_ms, tol)
+            w = _num((d.get("weights") or {}).get(sid)) or 0.0
+            if w < min_weight:
+                unlabelled["flat"] += 1
+            elif e0 is None or e0 <= 0 or e1 is None:
+                unlabelled["no_equity"] += 1
+            else:
+                r = (e1 / e0 - 1) / w
+                returns[sid] = r
+                st = per.setdefault(sid, {"n": 0, "pos": 0, "p_sum": 0.0, "brier": 0.0, "hits": 0})
+                y = 1 if r > 0 else 0
+                st["n"] += 1; st["pos"] += y; st["p_sum"] += p; st["brier"] += (p - y) ** 2; st["hits"] += int((p > 0.5) == bool(y))
+        best = ans.get("best")
+        if best and len(returns) == len(ans.get("p") or {}) and returns:
+            top = max(returns, key=lambda k: returns[k])
+            realised = top if returns[top] > 0 else NONE_ID
+            best_stats["n"] += 1
+            best_stats["correct"] += int(max(best, key=lambda k: best[k]) == realised)
+            best_stats["p_realised"] += best.get(realised, 0.0)
+    out_per = {}
+    for sid, st in per.items():
+        n, base = st["n"], st["pos"] / st["n"]
+        out_per[sid] = {"n": n, "base_rate": round(base, 3), "mean_p": round(st["p_sum"] / n, 3), "brier": round(st["brier"] / n, 4),
+                        "brier_always_0.5": 0.25, "brier_base_rate": round(base * (1 - base), 4), "hit_rate": round(st["hits"] / n, 3)}
+    bn = best_stats["n"]
+    return {"qset": QUESTION_SET_VERSION, "horizon_h": horizon_h, "pending": pending, "unlabelled": unlabelled, "strategies": out_per,
+            "best": {"n": bn, "accuracy": round(best_stats["correct"] / bn, 3) if bn else None,
+                     "mean_p_of_realised": round(best_stats["p_realised"] / bn, 3) if bn else None}}
 
 
 def _jprint(obj: Any) -> None:
@@ -809,6 +972,9 @@ async def _main(args: argparse.Namespace) -> int:
         if args.cmd == "reset-peak":
             print("peaks reset:", ", ".join(alloc.reset_peak(args.ids or None)) or "none")
             return 0
+        if args.cmd == "score":
+            _jprint(score_decisions(alloc.root, horizon_h=args.horizon_h))
+            return 0
         if args.cmd == "once":
             if not alloc.llm.configured:
                 print(f"{alloc.llm.spec.key_env} is not set", file=sys.stderr)
@@ -817,10 +983,13 @@ async def _main(args: argparse.Namespace) -> int:
             if args.dry_run:
                 print("== CONTEXT given to the model ==")
                 _jprint(rec.get("inputs"))
-                print("== MODEL ANSWER ==")
-                _jprint(rec.get("requested") and {**rec["requested"], "reasoning": rec["reasoning"], "confidence": rec["confidence"]})
+                print(f"== MODEL ANSWER ({rec['model']}) ==")
+                _jprint(rec.get("answers") or (rec.get("requested") and {**rec["requested"], "confidence": rec["confidence"]}))
+                if rec.get("mapping"):
+                    print("== MAPPING (probability to target weight) ==")
+                    _jprint(rec["mapping"])
                 print("== AFTER THE RULES (not applied) ==")
-                _jprint({k: rec[k] for k in ("weights", "enabled", "risk_floor", "step_limited", "skipped_owner_lock", "cost_usd", "error") if k in rec})
+                _jprint({k: rec[k] for k in ("reasoning", "weights", "enabled", "risk_floor", "step_limited", "skipped_owner_lock", "cost_usd", "error") if k in rec})
             else:
                 _jprint({k: v for k, v in rec.items() if k != "inputs"})
             return 1 if rec.get("error") else 0
@@ -838,6 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
     one = sub.add_parser("once", help="one decision now")
     one.add_argument("--dry-run", action="store_true", help="print the context and the model's answer, write nothing")
     sub.add_parser("run", help="decide every interval until stopped")
+    sc = sub.add_parser("score", help="score logged alloc-v1.0 answers against realised book returns")
+    sc.add_argument("--horizon-h", type=int, default=24)
     rp = sub.add_parser("reset-peak", help="restart a book's drawdown measurement from now")
     rp.add_argument("ids", nargs="*")
     args = p.parse_args(argv)
