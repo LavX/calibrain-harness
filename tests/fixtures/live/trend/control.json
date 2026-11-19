@@ -1,0 +1,10 @@
+{
+ "enabled": false,
+ "flatten": false,
+ "reset_latch": false,
+ "weight": 0.0,
+ "set_by": "owner",
+ "owner_lock": true,
+ "reason": "owner",
+ "updated_ms": 1799913600000
+}

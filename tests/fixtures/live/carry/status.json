@@ -1,0 +1,50 @@
+{
+ "id": "carry",
+ "label": "Funding carry (BTC, ETH)",
+ "enabled": true,
+ "state": "running",
+ "updated_ms": 1800000000000,
+ "last_rebalance_ms": 1799996400000,
+ "next_rebalance_ms": 1800025200000,
+ "last_error": null,
+ "equity_usdt": 10112.5,
+ "start_equity_usdt": 10000.0,
+ "pnl_usdt": 112.5,
+ "pnl_pct": 1.125,
+ "fees_usdt": 8.4,
+ "funding_usdt": 21.7,
+ "positions": [
+  {
+   "symbol": "BTCUSDT",
+   "side": "short",
+   "qty": 0.05,
+   "entry_price": 90000.0,
+   "mark_price": 90100.0,
+   "upnl_usdt": -5.0,
+   "market": "linear"
+  },
+  {
+   "symbol": "BTCUSDT",
+   "side": "long",
+   "qty": 0.05,
+   "entry_price": 90010.0,
+   "mark_price": 90100.0,
+   "upnl_usdt": 4.5,
+   "market": "spot"
+  }
+ ],
+ "targets": [
+  {
+   "symbol": "BTCUSDT",
+   "target_qty": 0.05,
+   "market": "linear"
+  },
+  {
+   "symbol": "BTCUSDT",
+   "target_qty": 0.05,
+   "market": "spot"
+  }
+ ],
+ "trades_today": 2,
+ "trades_total": 14
+}

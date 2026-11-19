@@ -1,0 +1,35 @@
+# Calibrain Harness dashboard as a systemd USER unit, for aurora4 (where the live strategy runner's units live).
+# Template: copy it, check the paths, then install it by hand (see docs/strategies-tab.md). Nothing here is installed for you.
+#
+# Binding: loopback and the tailnet address. There is no login on this dashboard: anyone who can reach the port on the
+# tailnet can switch strategies and start or stop the runner. Keep the tailnet ACL tight, or bind loopback only
+# (CTB_HOST=127.0.0.1) and reach it with `ssh -L 8800:127.0.0.1:8800 lavx@aurora4`.
+# The Host header check accepts the addresses named in CTB_HOST, so browse by the tailnet IP, not a MagicDNS name.
+[Unit]
+Description=Calibrain Harness dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/calibrain-harness
+Environment=CTB_HOST=127.0.0.1,100.96.108.128
+Environment=CTB_PORT=8800
+# The per-symbol LLM bot never starts trading by itself. Leave this off.
+Environment=CTB_TRADING_ENABLED=0
+# Where the live runner writes (default shown). strategies.json appears here once the runner has started.
+Environment=CTB_LIVE_ROOT=%h/Documents/calibrain-study/data/live
+# The demo account the per-symbol bot would use. Strategies whose account equals it, or all of them when this is unset,
+# are treated as sharing the account (only one mode trades it at a time).
+Environment=CTB_DASHBOARD_ACCOUNT=demo-dashboard
+# Runner units the dashboard may start before strategies.json exists (comma separated, exact unit names).
+Environment=CTB_LIVE_UNITS=calibrain-live@carry.service,calibrain-live@trend.service,calibrain-live@xsmom.service
+# API keys, model keys and the venue come from the repo's .env, which this unit does not print or copy.
+ExecStart=%h/Documents/calibrain-harness/.venv/bin/python -m ctb.server
+Restart=on-failure
+RestartSec=10
+Nice=10
+MemoryMax=1G
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

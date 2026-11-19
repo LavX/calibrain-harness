@@ -9,6 +9,7 @@ export type Bar = { symbol: string; tf: string; time: number; open: number; high
 
 export type State = {
   ov: any | null;
+  strat: any | null;
   mon: any | null;
   mkt: any | null;
   decisions: any[];
@@ -17,7 +18,7 @@ export type State = {
   perf: Record<string, [number, number][]>;
   symbol: string | null;
   tf: string;
-  view: "mon" | "eval" | "valid" | "trades" | "news" | "log";
+  view: "mon" | "eval" | "valid" | "strat" | "trades" | "news" | "log";
   ticks: Record<string, Tick>;
   book: Book | null;
   socket: { connected: boolean; lastMsg: number; latencyMs: number | null; msgs: number };
@@ -27,7 +28,7 @@ export type State = {
 };
 
 let state: State = {
-  ov: null, mon: null, mkt: null, decisions: [], latest: {}, news: { forecasts: [], headlines: [] }, perf: {},
+  ov: null, strat: null, mon: null, mkt: null, decisions: [], latest: {}, news: { forecasts: [], headlines: [] }, perf: {},
   symbol: null, tf: "5", view: "mon", ticks: {}, book: null,
   socket: { connected: false, lastMsg: 0, latencyMs: null, msgs: 0 }, modal: null, cmdHint: null,
   rev: { trades: 0, events: 0, eval: 0 },

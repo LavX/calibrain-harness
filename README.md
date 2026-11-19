@@ -418,6 +418,7 @@ ctb/                      Python service (internal package name from the project
   evaluation/             labeler, metrics, validation (per symbol, splits, walk-forward, drift), report
   runs.py · universe.py   test runs, symbol validation
   engine.py · server.py   orchestration, API, /ws, serves the UI
+  strategies.py           STRATEGIES tab backend: live demo strategies, modes, runner start/stop (docs/strategies-tab.md)
 web-next/                 terminal UI (Next.js 16, static export to web-next/out)
 scripts/                  smoke tests, backfills, run definitions
 docs/                     brand assets and demo media

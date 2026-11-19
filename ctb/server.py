@@ -22,6 +22,8 @@ from .evaluation import validation as validation_mod
 from .market.store import TIMEFRAMES
 from . import models as models_mod
 from . import runs as runs_mod
+from . import allocator as alloc_mod
+from . import strategies as strat_mod
 from . import universe as universe_mod
 from . import venue as venue_mod
 
@@ -43,7 +45,8 @@ LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "[::1]"}
 def _allowed_host(host: str, bind_host: str) -> bool:
     """Reject DNS-rebinding requests: the Host header must name this machine, not a remote domain."""
     name = host.rsplit(":", 1)[0] if not host.endswith("]") else host
-    return name in LOCAL_HOSTNAMES or (bind_host not in ("0.0.0.0", "::") and name == bind_host)
+    binds = [b.strip() for b in bind_host.split(",") if b.strip()]  # CTB_HOST may name several addresses
+    return name in LOCAL_HOSTNAMES or any(b not in ("0.0.0.0", "::") and name == b for b in binds)
 
 
 def _allowed_origin(origin: str, host: str) -> bool:
@@ -88,10 +91,11 @@ async def same_origin_only(request: web.Request, handler):
     return await handler(request)
 
 
-def make_app(engine: Engine) -> web.Application:
+def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = None) -> web.Application:
     s = engine.s
     app = web.Application(middlewares=[dev_cors, same_origin_only])
     routes = web.RouteTableDef()
+    strat = strategies_svc or strat_mod.StrategyService()
 
     @routes.get("/")
     async def index(_: web.Request) -> web.StreamResponse:
@@ -278,6 +282,8 @@ def make_app(engine: Engine) -> web.Application:
             return j({"error": f"no {venue_mod.get()['label']} keys configured (KEYS)"}, 400)
         if enabled and (why := venue_mod.orders_blocked()):
             return j({"error": why}, 409)
+        if enabled and (why := await strat.trading_block(venue_mod.name())):
+            return j({"error": why}, 409)
         if enabled and engine.executor and engine.executor.halted_reason:
             if not body.get("clear_halt"):
                 return j({"error": f"halted: {engine.executor.halted_reason}. Send clear_halt=true to resume."}, 409)
@@ -285,6 +291,83 @@ def make_app(engine: Engine) -> web.Application:
         s.trading_enabled = enabled
         engine.emit("event", engine.db.event("warn", "trading_toggled", f"{venue_mod.get()['label']} trading {'ENABLED' if enabled else 'disabled'} from dashboard"))
         return j({"trading_enabled": s.trading_enabled})
+
+    # ---------------------------------------------------------------- live demo strategies
+    @routes.get("/api/strategies")
+    async def strategies_get(_: web.Request) -> web.Response:
+        doc = dict(await strat.snapshot())
+        doc["venue"] = venue_mod.name()
+        doc["llm_trading_enabled"] = bool(s.trading_enabled)
+        return j(doc)
+
+    @routes.post("/api/strategies/{sid}/{action}")
+    async def strategies_act(req: web.Request) -> web.Response:
+        try:
+            return j(await strat.act(req.match_info["sid"], req.match_info["action"],
+                                     llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+        except strat_mod.StrategyError as exc:
+            return j({"error": exc.message}, exc.status)
+
+    @routes.post("/api/mode")
+    async def trading_mode(req: web.Request) -> web.Response:
+        """Header auto-trade mode: "llm" (LLM decides), "manual" or "bot" (legacy per-symbol bot). One mode trades a demo account at a time."""
+        body = await req.json()
+        bot_open = bool(engine.db.one("SELECT id FROM trades WHERE status IN ('open','opening') LIMIT 1"))
+        try:
+            out = await strat.set_mode(str(body.get("mode", "")) if isinstance(body, dict) else "", venue=venue_mod.name(), bot_open=bot_open)
+        except strat_mod.StrategyError as exc:
+            return j({"error": exc.message}, exc.status)
+        if out["llm_off"] and s.trading_enabled:
+            s.trading_enabled = False
+            engine.emit("event", engine.db.event("warn", "trading_toggled", "per-symbol bot auto-trade switched OFF: the mode is no longer PER-SYMBOL BOT"))
+        return j(out)
+
+    @routes.post("/api/strategies/auto")
+    async def strategies_auto(req: web.Request) -> web.Response:
+        """Header switch in LLM DECIDES / MANUAL mode: the allocator or the selected strategies on (and the runner running), or all off."""
+        body = await req.json()
+        body = body if isinstance(body, dict) else {}
+        ids = body.get("ids")
+        try:
+            return j(await strat.auto(bool(body.get("enabled")), [str(i) for i in ids] if isinstance(ids, list) else None,
+                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+        except strat_mod.StrategyError as exc:
+            return j({"error": exc.message}, exc.status)
+
+    @routes.get("/api/allocator")
+    async def allocator_status(req: web.Request) -> web.Response:
+        a = req.app.get("allocator")
+        if a is None:
+            return j({"error": "the LLM allocator is not running"}, 503)
+        return j({"status": a.status(), "control": a.control()})
+
+    @routes.get("/api/allocator/decisions")
+    async def allocator_decisions(req: web.Request) -> web.Response:
+        a = req.app.get("allocator")
+        if a is None:
+            return j({"error": "the LLM allocator is not running"}, 503)
+        try:
+            limit = int(req.query.get("limit", 50))
+        except ValueError:
+            limit = 50
+        return j(a.decisions(limit))
+
+    @routes.post("/api/allocator/{action}")
+    async def allocator_act(req: web.Request) -> web.Response:
+        body = await req.json()
+        try:
+            return j(await strat.allocator_act(req.match_info["action"], body.get("interval_min") if isinstance(body, dict) else None))
+        except strat_mod.StrategyError as exc:
+            return j({"error": exc.message}, exc.status)
+
+    @routes.post("/api/runner/{action}")
+    async def runner_act(req: web.Request) -> web.Response:
+        body = await req.json()
+        try:
+            return j(await strat.runner_act(str(body.get("unit", "")) if isinstance(body, dict) else "", req.match_info["action"],
+                                            llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+        except strat_mod.StrategyError as exc:
+            return j({"error": exc.message}, exc.status)
 
     @routes.post("/api/close")
     async def close(req: web.Request) -> web.Response:
@@ -670,10 +753,35 @@ def make_app(engine: Engine) -> web.Application:
     app.router.add_get("/_next/{tail:.+}", next_asset)
     app.router.add_get(r"/{name:[A-Za-z0-9_.-]+\.(?:ico|svg|png|webmanifest|txt)}", root_asset)
 
-    async def on_startup(_: web.Application) -> None:
-        await engine.start()
+    async def strategy_guard() -> None:
+        """The live runner started outside the dashboard (systemctl) while LLM auto-trade is on: turn auto-trade off."""
+        while True:
+            try:
+                if s.trading_enabled and (why := await strat.trading_block(venue_mod.name())):
+                    s.trading_enabled = False
+                    engine.emit("event", engine.db.event("warn", "trading_toggled", f"LLM auto-trade switched OFF: {why}"))
+            except Exception:  # noqa: BLE001 - a failed look must not stop the guard
+                log.exception("strategy guard check failed")
+            await asyncio.sleep(strat_mod.CACHE_S)
 
-    async def on_cleanup(_: web.Application) -> None:
+    async def on_startup(app_: web.Application) -> None:
+        await engine.start()
+        app_["strategy_guard"] = asyncio.create_task(strategy_guard())
+        # The LLM allocator (docs/allocator.md). attach_allocator first writes allocator/control.json from the mode, because the
+        # loop treats a missing file as enabled: it writes strategy controls only in LLM DECIDES (control enabled true).
+        try:
+            alloc = alloc_mod.create_allocator(engine.session, root=strat.root)
+            strat.attach_allocator(alloc)
+            app_["allocator"] = alloc
+            app_["allocator_task"] = asyncio.create_task(alloc.run())
+        except Exception as exc:  # noqa: BLE001 - no usable model configured: the tab works without the allocator
+            log.warning("LLM allocator not started: %s", exc)
+
+    async def on_cleanup(app_: web.Application) -> None:
+        app_["strategy_guard"].cancel()
+        if "allocator" in app_:
+            app_["allocator"].stop()
+            app_["allocator_task"].cancel()
         await engine.stop()
 
     app.on_startup.append(on_startup)
@@ -690,7 +798,7 @@ def main() -> None:
     print(f"Calibrain Harness: http://{s.host}:{s.port}  (venue: {venue_mod.get()['label']}, "
           f"model {s.model_spec.label} ({s.model_spec.model}) key {'set' if s.model_spec.api_key else 'NOT set'}, "
           f"trading {'ON' if s.trading_enabled else 'observe-only'})")
-    web.run_app(make_app(engine), host=s.host, port=s.port, print=None)
+    web.run_app(make_app(engine), host=[h.strip() for h in s.host.split(",") if h.strip()], port=s.port, print=None)
 
 
 if __name__ == "__main__":

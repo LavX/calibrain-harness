@@ -4,6 +4,7 @@ import { post } from "@/lib/api";
 import { loadOverview, selectSymbol, selectTf } from "@/lib/data";
 import { getState, setState, useStore } from "@/lib/store";
 import { age, short } from "@/lib/format";
+import { MODE_LABEL, headerAuto, switchMode, type StratDoc } from "./Strategies";
 
 const CITIES: [string, string][] = [["New York", "America/New_York"], ["London", "Europe/London"], ["Dubai", "Asia/Dubai"], ["Mumbai", "Asia/Kolkata"],
   ["Singapore", "Asia/Singapore"], ["Hong Kong", "Asia/Hong_Kong"], ["Tokyo", "Asia/Tokyo"], ["Sydney", "Australia/Sydney"], ["UTC", "UTC"]];
@@ -52,6 +53,7 @@ export function CommandBar() {
   const symbol = useStore((s) => s.symbol);
   const ov = useStore((s) => s.ov);
   const hint = useStore((s) => s.cmdHint);
+  const strat = useStore((s) => s.strat) as StratDoc | null;
   const input = useRef<HTMLInputElement>(null);
 
   const flash = (txt: string) => {
@@ -69,7 +71,7 @@ export function CommandBar() {
     const tfm = ({ "1M": "1", "5M": "5", "15M": "15", "1H": "60", "4H": "240" } as Record<string, string>)[raw];
     const pc = raw.match(/^(?:POS|MAXPOS)\s+(\d+)$/);
     const ttf = raw.match(/^(?:TF|TRADE)\s+(1M|5M|15M|1H)$/);
-    const views: Record<string, any> = { MON: "mon", EVAL: "eval", VALID: "valid", VAL: "valid", TRD: "trades", TRADES: "trades", NEWS: "news", N: "news", LOG: "log" };
+    const views: Record<string, any> = { MON: "mon", EVAL: "eval", VALID: "valid", VAL: "valid", STRATEGIES: "strat", STRATS: "strat", TRD: "trades", TRADES: "trades", NEWS: "news", N: "news", LOG: "log" };
     if (pc) return setPosCap(Number(pc[1]));
     if (ttf) return setState({ modal: { kind: "tf", data: ({ "1M": "1", "5M": "5", "15M": "15", "1H": "60" } as any)[ttf[1]] } });
     if (sym) return selectSymbol(sym);
@@ -105,6 +107,8 @@ export function CommandBar() {
     }
   };
 
+  const hasModes = !!strat && (strat.strategies.length > 0 || strat.allocator?.available);
+  const mode = hasModes ? strat!.mode : "bot";
   return (
     <header className="cmdbar">
       <div className="brand" title="Calibrain Harness · forward-testing harness for classification models (under development)">
@@ -122,8 +126,16 @@ export function CommandBar() {
           <input type="checkbox" checked={!!ov?.settings.exploration_mode} onChange={(e) => onExplore(e.target.checked)} />
           <span className="arm-box" /><span>EXPLORE</span>
         </label>
-        <label className="arm" data-tip="Allow the bot to place orders on your Bybit testnet account">
-          <input type="checkbox" checked={!!ov?.settings.trading_enabled} onChange={(e) => onTrading(e.target.checked)} />
+        {hasModes && (
+          <span className="seg modeseg" data-tip="Who trades the demo account: the LLM allocator decides which strategies trade (LLM DECIDES), you switch strategies per card (MANUAL), or the older per-symbol LLM bot trades. Only one at a time.">
+            {(["llm", "manual", "bot"] as const).map((m) => (
+              <button key={m} className={mode === m ? "on" : ""} onClick={() => switchMode(mode, m)}>{MODE_LABEL[m]}</button>
+            ))}
+          </span>
+        )}
+        <label className="arm" data-tip={mode === "bot" ? "Allow the bot to place orders on your Bybit testnet account" : mode === "llm" ? "On: the LLM allocator decides which strategies trade on the demo account. Off: allocator paused and every strategy off." : "On: switch the selected strategies on. Off: every strategy off."}>
+          <input type="checkbox" checked={mode === "bot" ? !!ov?.settings.trading_enabled : !!strat?.auto_on}
+            onChange={(e) => (mode === "bot" || !strat ? onTrading(e.target.checked) : headerAuto(strat, e.target.checked))} />
           <span className="arm-box" /><span>AUTO-TRADE</span>
         </label>
         <button className="kbtn" onClick={() => setState({ modal: { kind: "keys" } })}>KEYS</button>
@@ -162,7 +174,7 @@ export async function setPosCap(v?: number) {
   }
 }
 
-const VIEWS = [["mon", "F1", "MON"], ["eval", "F2", "EVAL"], ["valid", "F6", "VALID"], ["trades", "F3", "TRADES"], ["news", "F4", "NEWS"], ["log", "F5", "LOG"]] as const;
+const VIEWS = [["mon", "F1", "MON"], ["eval", "F2", "EVAL"], ["valid", "F6", "VALID"], ["strat", "F7", "STRATEGIES"], ["trades", "F3", "TRADES"], ["news", "F4", "NEWS"], ["log", "F5", "LOG"]] as const;
 
 export function FKeys() {
   const view = useStore((s) => s.view);
