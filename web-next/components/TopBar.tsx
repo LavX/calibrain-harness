@@ -47,6 +47,22 @@ function BrandMark() {
   );
 }
 
+/** The auto-trade mode, as the header shows it: "bot" until the strategies are known (an older install without them behaves as before). */
+function modeOf(strat: StratDoc | null): string {
+  return strat && (strat.strategies.length > 0 || strat.allocator?.available) ? strat.mode : "bot";
+}
+/** True only in mode "bot". In LLM DECIDES and MANUAL the per-symbol bot is observe-only, so its controls are locked. */
+export const useBotMode = () => useStore((s) => modeOf(s.strat as StratDoc | null) === "bot");
+const botMode = () => modeOf(getState().strat as StratDoc | null) === "bot";
+export const BOT_ONLY_TIP = "per-symbol bot only: switch the header mode to PER-SYMBOL BOT";
+
+/** Groups controls that only the per-symbol bot uses. Outside mode "bot" they are disabled, dimmed and carry the tooltip
+ * (a fieldset disables every control inside it, and the wrapper takes the pointer so the tooltip shows on disabled buttons). */
+export function BotOnly({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  const bot = useBotMode();
+  return <fieldset className={`botonly ${bot ? "" : "locked"} ${className}`} disabled={!bot} data-tip={bot ? undefined : BOT_ONLY_TIP}>{children}</fieldset>;
+}
+
 const PLACEHOLDER = "BTC · ETH · SOL · ASK · EVAL · KEYS · HELP";
 
 export function CommandBar() {
@@ -72,6 +88,7 @@ export function CommandBar() {
     const pc = raw.match(/^(?:POS|MAXPOS)\s+(\d+)$/);
     const ttf = raw.match(/^(?:TF|TRADE)\s+(1M|5M|15M|1H)$/);
     const views: Record<string, any> = { MON: "mon", EVAL: "eval", VALID: "valid", VAL: "valid", STRATEGIES: "strat", STRATS: "strat", TRD: "trades", TRADES: "trades", NEWS: "news", N: "news", LOG: "log" };
+    if ((pc || ttf || raw === "ASK" || raw === "PRB") && !botMode()) return flash(BOT_ONLY_TIP.toUpperCase());
     if (pc) return setPosCap(Number(pc[1]));
     if (ttf) return setState({ modal: { kind: "tf", data: ({ "1M": "1", "5M": "5", "15M": "15", "1H": "60" } as any)[ttf[1]] } });
     if (sym) return selectSymbol(sym);
@@ -96,6 +113,7 @@ export function CommandBar() {
     loadOverview();
   };
   const onExplore = async (on: boolean) => {
+    if (!botMode()) return;
     if (on && !confirm(`EXPLORE: trade the model's preferred side even when the strict gates say the edge is unproven.\n\nRisk per exploration trade: ${ov?.settings.explore_risk_pct ?? 0.1}% of equity. Safety gates still apply. Orders are only placed while AUTO-TRADE is also on.`)) return;
     try { await post("/api/settings", { exploration_mode: on }); } catch (err: any) { alert(err.message); }
     loadOverview();
@@ -122,10 +140,12 @@ export function CommandBar() {
         <button className="go" type="submit">GO</button>
       </form>
       <div className="cmd-right">
-        <label className="arm explore" data-tip="Exploration: trade the model's preferred side even when strict quality gates block it, at reduced risk. Safety gates still apply.">
-          <input type="checkbox" checked={!!ov?.settings.exploration_mode} onChange={(e) => onExplore(e.target.checked)} />
-          <span className="arm-box" /><span>EXPLORE</span>
-        </label>
+        <BotOnly>
+          <label className="arm explore" data-tip="Exploration: trade the model's preferred side even when strict quality gates block it, at reduced risk. Safety gates still apply.">
+            <input type="checkbox" checked={!!ov?.settings.exploration_mode} onChange={(e) => onExplore(e.target.checked)} />
+            <span className="arm-box" /><span>EXPLORE</span>
+          </label>
+        </BotOnly>
         {hasModes && (
           <span className="seg modeseg" data-tip="Who trades the demo account: the LLM allocator decides which strategies trade (LLM DECIDES), you switch strategies per card (MANUAL), or the older per-symbol LLM bot trades. Only one at a time.">
             {(["llm", "manual", "bot"] as const).map((m) => (
@@ -147,7 +167,7 @@ export function CommandBar() {
 
 export async function ask(probe: boolean) {
   const sym = getState().symbol;
-  if (!sym) return;
+  if (!sym || !botMode()) return;
   setState({ cmdHint: `ASKING KAIROS · ${sym}${probe ? " + probes" : ""}…` });
   try {
     await post("/api/decide", { symbol: sym, probe });
@@ -159,7 +179,7 @@ export async function ask(probe: boolean) {
 
 export async function setPosCap(v?: number) {
   const st = getState().ov?.settings;
-  if (!st) return;
+  if (!st || !botMode()) return;
   let n = v;
   if (n == null) {
     const r = prompt(`Max open positions (1–50). Now ${st.max_positions}.\nOnly affects new entries; open positions stay as they are.\nOne position per symbol, so with ${st.symbols.length} symbols at most ${st.symbols.length} can be open.`, String(st.max_positions));
@@ -186,7 +206,7 @@ export function FKeys() {
       ))}
       <span className="fk-spacer" />
       {st && (
-        <span className="tradetf" data-tip="How often the model is asked and trades are decided. The chart buttons only change the view.">
+        <BotOnly className="tradetf-wrap"><span className="tradetf" data-tip="How often the model is asked and trades are decided. The chart buttons only change the view.">
           <span className="tt-l">TRADE TF</span>
           <span className="seg">
             {Object.entries<any>(st.tf_profiles).map(([tf, p]) => (
@@ -195,7 +215,7 @@ export function FKeys() {
             ))}
           </span>
           <span className="tt-h">hold ≤ {st.horizon_minutes >= 60 ? `${st.horizon_minutes / 60}h` : `${st.horizon_minutes}m`} · stop {st.atr_tf}m ATR</span>
-        </span>
+        </span></BotOnly>
       )}
       {st && <ModelSwitch />}
       {st && <button className="kbtn stratbtn" onClick={() => setState({ modal: { kind: "strategy" } })}
@@ -210,7 +230,7 @@ function ModelSwitch() {
   const st = useStore((s) => s.ov?.settings);
   if (!st?.models) return null;
   const pick = async (provider: string) => {
-    if (provider === st.model_provider) return;
+    if (provider === st.model_provider || !botMode()) return;
     const m = st.models[provider];
     if (!m.configured) {
       alert(`${m.label} has no API key yet. Add it under KEYS first.`);
@@ -226,7 +246,7 @@ function ModelSwitch() {
     loadOverview();
   };
   return (
-    <span className="tradetf" data-tip="Classification model that answers the questions. Switching starts a new run.">
+    <BotOnly className="tradetf-wrap"><span className="tradetf" data-tip="Classification model that answers the questions. Switching starts a new run.">
       <span className="tt-l">MODEL</span>
       <span className="seg">
         {Object.entries<any>(st.models).map(([p, m]) => (
@@ -234,7 +254,7 @@ function ModelSwitch() {
             data-tip={`${m.label} · ${m.vendor} · ${m.model_id}${m.configured ? "" : " · no key yet"}`}>{m.label.toUpperCase()}</button>
         ))}
       </span>
-    </span>
+    </span></BotOnly>
   );
 }
 

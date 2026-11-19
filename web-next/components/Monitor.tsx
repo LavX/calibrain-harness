@@ -5,7 +5,9 @@ import { loadOverview, selectSymbol, selectTf } from "@/lib/data";
 import { setState, useModelLabel, useStore } from "@/lib/store";
 import { age, cssVar, dt, fx, hhmm, hhmmss, isNum, px, sg, short, TFL, ud, usd } from "@/lib/format";
 import { PerfChart, PerfLegend, PriceChart } from "./Charts";
-import { ask, setPosCap, useNow } from "./TopBar";
+import { BotOnly, ask, setPosCap, useBotMode, useNow } from "./TopBar";
+import { MODE_LABEL, PILL, type StratDoc } from "./Strategies";
+import type { PredDoc } from "./Predictions";
 
 const Ph = ({ code, children, right }: { code: string; children?: React.ReactNode; right?: React.ReactNode }) => (
   <div className="ph"><span className="code">{code}</span>{children}{right !== undefined && <span className="ph-r">{right}</span>}</div>
@@ -25,10 +27,7 @@ export function MonitorView({ hidden }: { hidden: boolean }) {
           <ChartHeader />
           <PriceChart />
         </section>
-        <section className="pnl a-kai">
-          <Ph code="KRS" right={<><button className="mini" onClick={() => ask(false)}>ASK</button><button className="mini" onClick={() => ask(true)} data-tip="Ask + repeat & mirror consistency probes (3 extra requests)">+PRB</button></>}><ModelName /> signal</Ph>
-          <div className="pb scroll"><KairosPanel /></div>
-        </section>
+        <section className="pnl a-kai"><SignalOrStrategies /></section>
         <section className="pnl a-acct"><Account /></section>
         <section className="pnl a-perf">
           <div className="ph"><span className="code">COMP</span>Relative perf · 24h<PerfLegend /></div>
@@ -155,6 +154,92 @@ function ChartHeader() {
   );
 }
 
+/* ---------------------------------------------------------------- signal panel, or the strategies that trade now */
+/** Only the per-symbol bot makes the KRS signal a live trade signal. In LLM DECIDES and MANUAL the strategies trade the demo
+ * account and the old bot is observe-only, so F1 shows what the strategies are doing instead. */
+function SignalOrStrategies() {
+  const bot = useBotMode();
+  if (!bot) return <StrategiesNow />;
+  return (
+    <>
+      <Ph code="KRS" right={<><button className="mini" onClick={() => ask(false)}>ASK</button><button className="mini" onClick={() => ask(true)} data-tip="Ask + repeat & mirror consistency probes (3 extra requests)">+PRB</button></>}><ModelName /> signal</Ph>
+      <div className="pb scroll"><KairosPanel /></div>
+    </>
+  );
+}
+
+const NOT_YET = "not computed yet";
+
+/** Today's P&L (UTC day) of one strategy in USDT: equity now minus equity at the start of the day. status.json only carries the
+ * P&L since the book started, so this reads the dashboard's own equity samples: the last one before UTC midnight, or the first
+ * one of today when the dashboard started later. Returns the P&L and the time of the baseline sample (seconds). */
+function pnlToday(s: StratDoc["strategies"][number], nowS: number): { v: number; since: number } | null {
+  const eq = s.status?.equity_usdt;
+  const h = s.equity_history;
+  if (!isNum(eq) || !h?.length) return null;
+  const mid = Math.floor(nowS / 86400) * 86400;
+  const before = h.filter((p) => p[0] < mid);
+  const base = before.length ? before[before.length - 1] : h.find((p) => p[0] >= mid);
+  return base ? { v: Number(eq) - base[1], since: Math.max(base[0], mid) } : null;
+}
+
+function StrategiesNow() {
+  const doc = useStore((s) => s.strat) as StratDoc | null;
+  const pred = useStore((s) => s.pred) as PredDoc | null;
+  useNow(10_000);
+  const nowS = Date.now() / 1000;
+  const to = <button className="mini" onClick={() => setState({ view: "strat" })} data-tip="Open the STRATEGIES screen (F7): cards, allocator, predictions, scoreboard">F7 details</button>;
+  if (!doc) return <><Ph code="NOW" right={to}>Strategies now</Ph><div className="pb"><div className="empty">Loading</div></div></>;
+
+  const byId = new Map((pred?.strategies || []).map((r) => [r.id, r]));
+  const rg = pred?.regime;
+  const stay = rg?.p7.find((p) => p.state === rg.state)?.p;
+  const regime = rg ? `${rg.state.replace("_", " · ").toUpperCase()}, ${isNum(stay) ? `${(Number(stay) * 100).toFixed(0)}% stays 7 d` : `stay probability ${NOT_YET}`}` : `regime ${NOT_YET}`;
+  const pnls = doc.strategies.map((s) => pnlToday(s, nowS));
+  const known = pnls.filter((x): x is { v: number; since: number } => !!x);
+  const total = known.length ? known.reduce((a, x) => a + x.v, 0) : null;
+  const lastMs = doc.allocator?.status?.last_decision_ms ?? pred?.allocator?.t_ms ?? null;
+  const model = doc.allocator?.status?.model;
+
+  return (
+    <>
+      <Ph code="NOW" right={to}>Strategies now</Ph>
+      <div className="pb scroll">
+        <div className="snow-head">
+          <div data-tip={rg?.state_help || undefined}><span className="muted">REGIME</span> <b className="amb">{regime}</b></div>
+          <div><span className="muted">P&amp;L TODAY</span> <b className={ud(total)}>{total === null ? NOT_YET : `${sg(total, 2)} USDT`}</b>
+            <span className="muted" data-tip="UTC day, from the dashboard's equity samples: the last one before 00:00 UTC, or the first of today when the dashboard started later"> (all strategies)</span></div>
+          <div><span className="muted">ALLOCATOR</span> <b className="w">{MODE_LABEL[doc.mode]}</b>{doc.mode !== "bot" && <> · <b className={doc.auto_on ? "up" : ""}>{doc.auto_on ? "AUTO ON" : "AUTO OFF"}</b></>}{model ? <span className="muted"> · {model}</span> : null}
+            <span className="muted"> · last decision </span><b className="w">{lastMs ? `${hhmm(lastMs / 1000)} (${age(nowS - lastMs / 1000)} ago)` : "none yet"}</b></div>
+        </div>
+        {doc.strategies.length ? (
+          <table className="t snow">
+            <thead><tr><th>Strategy</th><th>State</th><th className="r">Weight</th><th className="r">P&amp;L today</th><th className="r">Pos</th><th className="r" data-tip="The decider's p, mean over the last 24 h">p 24h</th></tr></thead>
+            <tbody>{doc.strategies.map((s, i) => {
+              const r = byId.get(s.id), c = s.control, p = pnls[i];
+              const w = isNum(c.weight) ? Number(c.weight) : isNum(r?.live_weight) ? Number(r!.live_weight) : null;
+              const core = isNum(r?.core) ? Number(r!.core) : null;
+              const [pl, pc] = PILL[s.pill] || [s.pill.toUpperCase(), "notlive"];
+              return (
+                <tr key={s.id}>
+                  <td className="sym lbl" data-tip={`${s.label} (${s.id})`}>{s.label}</td>
+                  <td><span className={`spill ${pc}`}>{pl}</span></td>
+                  <td className="r">{w === null ? <span className="muted">n/a</span> : <b className="w">{fx(w, 2)}</b>}{w !== null && core !== null && Math.abs(w - core) >= 0.005 && <span className="muted" data-tip="Core weight: the static inverse-volatility mix the allocator starts from"> / core {fx(core, 2)}</span>}</td>
+                  <td className={`r ${ud(p?.v)}`} data-tip={p ? `baseline sample at ${hhmm(p.since)}` : undefined}>{p ? sg(p.v, 2) : <span className="muted">n/a</span>}</td>
+                  <td className="r">{s.status ? s.status.positions.length : <span className="muted">n/a</span>}</td>
+                  <td className="r">{isNum(r?.p_decider) ? `${(Number(r!.p_decider) * 100).toFixed(0)}%` : <span className="muted" data-tip={`decider p: ${NOT_YET}`}>n/a</span>}</td>
+                </tr>
+              );
+            })}</tbody>
+          </table>
+        ) : <div className="empty">Strategies: {NOT_YET}</div>}
+        {!pred && <div className="muted snow-note">Predictions: {NOT_YET}</div>}
+        <div className="muted snow-note">The per-symbol bot is observe-only in this mode. Its signal panel returns when the header mode is PER-SYMBOL BOT.</div>
+      </div>
+    </>
+  );
+}
+
 /* ---------------------------------------------------------------- model signal */
 function ModelName() {
   return <>{useModelLabel()}</>;
@@ -266,8 +351,8 @@ function Account() {
     ["Equity", fx(w.equity), "USDT · UTA"], ["Available", fx(w.available), "USDT"],
     ["Unrealised", <span key="u" className={ud(w.unrealized_pnl)}>{sg(w.unrealized_pnl)}</span>, "USDT"],
     ["Today PnL", <span key="d" className={ud(a.daily_pnl)}>{sg(a.daily_pnl)}</span>, `halts at −${st.daily_loss_limit_pct}%`],
-    ["Positions", <span key="p">{a.positions.length}/{st.max_positions} <button className="mini" onClick={() => setPosCap()} data-tip="Change the max number of open positions. Applies to new entries only.">CAP</button></span>, `${a.open_orders} open orders`],
-    ["Risk / trade", `${st.exploration_mode ? Math.min(st.explore_risk_pct, st.risk_per_trade_pct) : st.risk_per_trade_pct}%`, `entry cap ${st.max_entry_slip_bp}bp · ≤${st.max_leverage}x`],
+    ["Positions", <span key="p">{a.positions.length}/{st.max_positions} <BotOnly><button className="mini" onClick={() => setPosCap()} data-tip="Change the max number of open positions. Applies to new entries only.">CAP</button></BotOnly></span>, `${a.open_orders} open orders`],
+    ["Risk / trade", <BotOnly key="r">{st.exploration_mode ? Math.min(st.explore_risk_pct, st.risk_per_trade_pct) : st.risk_per_trade_pct}%</BotOnly>, `entry cap ${st.max_entry_slip_bp}bp · ≤${st.max_leverage}x`],
   ];
   return (
     <>
