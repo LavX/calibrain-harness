@@ -1031,6 +1031,23 @@ class Allocator:
                                                self.flatten_on_floor and sid in plan.floored, now_ms)
         return applied
 
+    def _day_anchor(self, current: dict[str, "Current"], now_ms: int, *, persist: bool = True) -> dict[str, "Current"]:
+        """The step limit and the buffer count from the weights at the first weights run of the UTC day, so
+        repeated DECIDE NOW presses cannot ratchet a weight up by more than one step per day."""
+        day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
+        st = self._state()
+        anchor = st.get("day_anchor") if isinstance(st.get("day_anchor"), dict) else {}
+        if anchor.get("day") != day:
+            anchor = {"day": day, "w": {sid: c.weight for sid, c in current.items()}}
+            if persist:
+                st["day_anchor"] = anchor
+                self._save_state()
+        w = anchor.get("w") or {}
+        for sid, c in current.items():
+            if sid not in w:
+                w[sid] = c.weight
+        return {sid: replace(c, weight=float(w[sid])) for sid, c in current.items()}
+
     def _save_state(self) -> None:
         self._dirty = False
         write_json_atomic(self.dir / "state.json", self._state())
@@ -1138,7 +1155,8 @@ class Allocator:
                 kind, why = "held", "no strategies"
             else:
                 kind = "computed"
-                calc_out = compute_weights(ids, fc.data or {}, current, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+                anchored = self._day_anchor(current, now_ms, persist=not dry_run)
+                calc_out = compute_weights(ids, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
                 why = " | ".join(calc_out["reasons"][sid] for sid in ids)
                 decision = Decision(dict(calc_out["w_final"]), {sid: current[sid].enabled for sid in ids}, why, None,
                                     derive_enabled=tuple(calc_out["opt"]))
