@@ -86,7 +86,7 @@ def ctl(root, sid):
 
 def test_question_set_is_observable_versioned_and_batched():
     qs = build_questions(IDS)
-    assert QUESTION_SET_VERSION == "alloc-v1.0" and len(qs) == 4
+    assert QUESTION_SET_VERSION == "alloc-v1.1" and len(qs) == 4
     assert [q["type"] for q in qs.values()] == ["noul", "noul", "noul", "choice"]
     assert "net return" in qs["net_positive_carry"]["instructions"] and "24 hours" in qs["net_positive_carry"]["instructions"]
     assert set(qs[BEST_QID]["criteria"]) == {*IDS, "none"}
@@ -129,7 +129,7 @@ def test_decision_applies_rules_and_logs_everything_needed_for_scoring(root):
     assert ctl(root, "trend")["enabled"] is True and ctl(root, "xsmom")["weight"] == 0.5
     assert rec["step_limited"] == ["trend"] and ctl(root, "carry")["reason"].startswith("carry p=0.61 -> 0.73")
     line = json.loads((root / "allocator" / "decisions.jsonl").read_text().splitlines()[-1])
-    assert line["qset"] == "alloc-v1.0" and line["model"] == "ordecide / test" and line["request_ids"] == ["req-1"]
+    assert line["qset"] == "alloc-v1.1" and line["model"] == "ordecide / test" and line["request_ids"] == ["req-1"]
     assert line["answers"]["p"] == P and line["answers"]["best"]["xsmom"] == 0.5
     assert line["mapping"]["trend"]["target"] == 0 and line["weights"]["trend"] == 0.5 and line["inputs"]["strategies"]["carry"]
     assert a.status()["model"] == "ordecide / test"
