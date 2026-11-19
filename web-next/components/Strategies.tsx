@@ -40,7 +40,7 @@ const MODE_HELP: Record<string, string> = {
   manual: "You switch strategies per card. The LLM allocator is paused.",
   bot: "The older per-symbol LLM bot trades. The strategy runner and the allocator stay off, so only one thing trades the demo account.",
 };
-const PILL: Record<string, [string, string]> = {
+export const PILL: Record<string, [string, string]> = {
   running: ["RUNNING", "run"], paused: ["PAUSED", "stop"], latched: ["LATCHED", "latched"], error: ["ERROR", "latched"],
   stale: ["STALE", "latched"], runner_stopped: ["RUNNER STOPPED", "stop"], no_data: ["NO DATA", "notlive"],
 };

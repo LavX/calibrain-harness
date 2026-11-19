@@ -55,6 +55,12 @@ def _allowed_origin(origin: str, host: str) -> bool:
     return o == host or o in DEV_ORIGINS
 
 
+# The per-symbol bot's settings only change in mode "bot". In LLM DECIDES and MANUAL the old bot is observe-only, so a stale page
+# (or a script) must not edit them. The dashboard greys the same controls out with this message as the tooltip.
+BOT_ONLY_MSG = "per-symbol bot only: switch the header mode to PER-SYMBOL BOT"
+BOT_ONLY_SETTINGS = ("exploration_mode", "max_positions", "risk_per_trade_pct", "explore_risk_pct", "explore_min_lean_r")
+
+
 def j(data: Any, status: int = 200) -> web.Response:
     return web.Response(text=json.dumps(data, default=str), status=status, content_type="application/json")
 
@@ -98,6 +104,10 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     routes = web.RouteTableDef()
     strat = strategies_svc or strat_mod.StrategyService()
     preds = pred_mod.PredictionsService(root=strat.root)
+
+    def bot_only() -> web.Response | None:
+        """409 when the strategies own the demo account (mode is not "bot"); None when the old bot's settings may change."""
+        return j({"error": BOT_ONLY_MSG}, 409) if strat.owns_account() else None
 
     @routes.get("/")
     async def index(_: web.Request) -> web.StreamResponse:
@@ -413,6 +423,8 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     @routes.post("/api/decision-tf")
     async def decision_tf(req: web.Request) -> web.Response:
         """Switch the trading timeframe live: cadence, horizon and stop sizing change together."""
+        if (refused := bot_only()) is not None:
+            return refused
         body = await req.json()
         tf = str(body.get("tf", ""))
         if tf not in TF_PROFILES:
@@ -436,6 +448,8 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     @routes.post("/api/settings")
     async def settings(req: web.Request) -> web.Response:
         body = await req.json()
+        if any(k in body for k in BOT_ONLY_SETTINGS) and (refused := bot_only()) is not None:
+            return refused
         allowed = {"min_edge_r": float, "min_setup_quality": float, "risk_per_trade_pct": float, "allow_short": bool, "max_positions": int,
                    "exploration_mode": bool, "explore_min_lean_r": float, "explore_risk_pct": float}
         if "max_positions" in body:
@@ -606,6 +620,8 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     @routes.post("/api/model")
     async def set_model(req: web.Request) -> web.Response:
         """Switch the classification model (only while flat; starts a new run)."""
+        if (refused := bot_only()) is not None:
+            return refused
         body = await req.json()
         try:
             return j(await engine.set_model(str(body.get("provider", "")).strip().lower()))
