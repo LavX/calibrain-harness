@@ -379,6 +379,9 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     @routes.post("/api/close")
     async def close(req: web.Request) -> web.Response:
         body = await req.json()
+        if strat.owns_account():
+            return j({"error": "These positions belong to the live strategies (netted per coin). Close them from the "
+                               "STRATEGIES screen: pause a strategy or press FLATTEN."}, 409)
         if not engine.executor:
             return j({"error": "no executor"}, 400)
         ok = await engine.executor.close(str(body.get("symbol", "")).upper(), "manual")
@@ -386,6 +389,11 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
 
     @routes.post("/api/kill")
     async def kill(_: web.Request) -> web.Response:
+        if strat.owns_account():  # the runner owns the positions: flatten through its books, never behind its back
+            s.trading_enabled = False
+            done = strat.kill_all()
+            engine.emit("event", engine.db.event("warn", "killed", f"kill switch: allocator paused, strategies flattening: {', '.join(done)}"))
+            return j({"ok": True, "flattening": done})
         if engine.executor:
             await engine.executor.kill("dashboard kill switch")
         s.trading_enabled = False

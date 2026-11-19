@@ -255,12 +255,12 @@ function Account() {
   const now = useNow();
   const a = ov?.account, w = a?.wallet || {};
   const closePos = async (sym: string) => {
-    if (confirm(`Market-close ${sym} on testnet (reduce-only)?`)) {
+    if (confirm(`Market-close ${sym} (reduce-only)?`)) {
       await post("/api/close", { symbol: sym });
       loadOverview();
     }
   };
-  if (!a) return <><Ph code="PRTU">Account · testnet</Ph><div className="empty">{ov?.executor_error || "No testnet keys"}</div></>;
+  if (!a) return <><Ph code="PRTU">Account · {(ov?.settings?.venue_label || "BYBIT TESTNET").replace("BYBIT ", "").toLowerCase()}</Ph><div className="empty">{ov?.executor_error || "No API keys for this venue"}</div></>;
   const st = ov.settings;
   const cells: [string, React.ReactNode, string][] = [
     ["Equity", fx(w.equity), "USDT · UTA"], ["Available", fx(w.available), "USDT"],
@@ -271,7 +271,7 @@ function Account() {
   ];
   return (
     <>
-      <Ph code="PRTU" right={a.last_sync ? `${a.private_stream ? "stream" : "poll"} · sync ${age(now / 1000 - a.last_sync)} ago` : ""}>Account · testnet</Ph>
+      <Ph code="PRTU" right={a.last_sync ? `${a.private_stream ? "stream" : "poll"} · sync ${age(now / 1000 - a.last_sync)} ago` : ""}>Account · {(ov?.settings?.venue_label || "BYBIT TESTNET").replace("BYBIT ", "").toLowerCase()}</Ph>
       <div className="pb tight" style={{ flex: "none" }}>
         <div className="acct-grid">{cells.map(([l, n, s]) => <div className="cell" key={l}><div className="l">{l}</div><div className="n">{n}</div><div className="s">{s}</div></div>)}</div>
       </div>

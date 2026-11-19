@@ -153,8 +153,19 @@ class BybitTestnet:
         }
 
     async def positions(self) -> list[dict[str, Any]]:
-        res = await self._request("GET", "/v5/position/list", {"category": "linear", "settleCoin": "USDT"})
-        return [p for p in res.get("list", []) if float(p.get("size") or 0) > 0]
+        """Every open USDT linear position. Bybit returns 20 per page by default: ask for 200 and follow the cursor."""
+        out: list[dict[str, Any]] = []
+        cursor = ""
+        for _ in range(20):
+            params = {"category": "linear", "settleCoin": "USDT", "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            res = await self._request("GET", "/v5/position/list", params)
+            out.extend(p for p in res.get("list", []) if float(p.get("size") or 0) > 0)
+            cursor = res.get("nextPageCursor") or ""
+            if not cursor:
+                break
+        return out
 
     async def open_orders(self) -> list[dict[str, Any]]:
         res = await self._request("GET", "/v5/order/realtime", {"category": "linear", "settleCoin": "USDT"})
