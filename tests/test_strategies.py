@@ -486,3 +486,19 @@ def test_allocator_loop_writes_strategy_controls_only_in_llm_mode(root):
     first = doc["allocator"]["decisions"][0]
     assert first["trigger"] == "decide_now" and first["reasoning"] == "fake: carry only" and "inputs" not in first
     assert doc["allocator"]["status"]["model"] == "fake-model" and doc["allocator"]["status"]["state"] == "running"
+
+
+def test_kill_switch_in_strategies_mode_flattens_through_the_runner(root):
+    s = svc(root, FakeSystemd(), mode="manual")
+    assert s.owns_account()
+    done = s.kill_all()
+    assert done
+    for sid in done:
+        ctl = json.loads((root / sid / "control.json").read_text())
+        assert ctl["enabled"] is False and ctl["owner_lock"] is True and ctl["flatten"] is True
+    assert json.loads((root / "allocator" / "control.json").read_text())["enabled"] is False
+
+
+def test_bot_mode_does_not_own_the_account(root):
+    s = svc(root, FakeSystemd(), mode="bot")
+    assert not s.owns_account()

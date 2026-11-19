@@ -546,6 +546,25 @@ class StrategyService:
             return doc
 
     # ----------------------------------------------------------------- actions
+    def owns_account(self) -> bool:
+        """True when the live strategies (not the per-symbol bot) own the demo account: any mode but "bot"."""
+        return self.mode(self.registry()) != "bot"
+
+    def kill_all(self) -> list[str]:
+        """Dashboard kill switch while the strategies own the account: pause the allocator, then pause every strategy
+        (owner-locked) and ask the runner to flatten it. The runner closes positions through its own books."""
+        reg = self.registry()
+        self._write_allocator(enabled=False)
+        done = []
+        for e in reg.entries:
+            if not (self.root / e.id).is_dir():
+                continue
+            self._write_owner(e, False)
+            self._write(e, flatten=True, reason="kill switch from the dashboard")
+            done.append(e.id)
+        self._cache = None
+        return done
+
     async def act(self, sid: str, action: str, *, llm_trading: bool, venue: str) -> dict[str, Any]:
         """Per-card actions: enable / pause (the Auto trade switch, owner-locked), unlock (back to the LLM), flatten, reset."""
         reg = self.registry()
