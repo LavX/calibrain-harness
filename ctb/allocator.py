@@ -285,6 +285,22 @@ class Plan:
     skipped_owner_lock: list[str]
 
 
+def apply_explore_floor(plan: Plan, current: dict[str, Current], floor: float) -> list[str]:
+    """Decider-only mode on demo: every strategy keeps at least `floor` so it keeps producing fills.
+    Never applied to a drawdown-floored or owner-locked strategy. Returns the ids that were lifted."""
+    lifted: list[str] = []
+    if floor <= 0:
+        return lifted
+    for sid, c in current.items():
+        if sid in plan.floored or c.owner_lock or sid not in plan.weights:
+            continue
+        if plan.weights[sid] < floor:
+            plan.weights[sid] = floor
+            plan.enabled[sid] = True
+            lifted.append(sid)
+    return lifted
+
+
 def resolve(current: dict[str, Current], proposal: Decision | None, *, max_step: float = 0.5, dd_floor_pct: float = 15.0) -> Plan:
     """The proposal after the hard rules. proposal None means "keep as is" (model unavailable): only
     the drawdown floor can still change anything."""
@@ -969,6 +985,7 @@ class Allocator:
                 error = f"{type(exc).__name__}: {str(exc)[:200]}"
                 current = current or self._read_current(now_ms)
             plan = resolve(current, decision, max_step=self.max_step, dd_floor_pct=self.dd_floor_pct) if current else None
+            explored = apply_explore_floor(plan, current, self._explore_floor()) if plan and decision else []
             reasons = {}
             if plan:
                 for sid in current:
@@ -977,6 +994,8 @@ class Allocator:
                         reasons[sid] = f"risk floor: book {dd:.1f}% below its peak, weight forced to 0"
                     else:
                         reasons[sid] = decision.reasoning if decision else "kept (allocator error)"
+                        if sid in explored:
+                            reasons[sid] += f" | demo minimum {plan.weights[sid]:.2f}"
             applied: dict[str, bool] = {}
             if plan and not dry_run:
                 applied = self._apply(plan, current, reasons, now_ms)
@@ -987,6 +1006,7 @@ class Allocator:
                 "mode": self.mode,
                 "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
                 "risk_floor": plan.floored if plan else [], "step_limited": plan.step_limited if plan else [],
+                "explore_floor": explored,
                 "error": error, "dry_run": dry_run,
             })
             if not dry_run:
@@ -1075,6 +1095,17 @@ class Allocator:
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
+
+    def _explore_floor(self) -> float:
+        """The demo minimum weight (CTB_ALLOCATOR_EXPLORE_FLOOR) on the venues it applies to, else 0."""
+        from .config import _venue_name, load_settings
+        try:
+            s = load_settings()
+            raw = os.environ.get("CTB_ALLOCATOR_EXPLORE_FLOOR")  # read now: Settings defaults are fixed at import time
+            floor = float(raw) if raw not in (None, "") else s.allocator_explore_floor
+            return floor if _venue_name() in s.allocator_explore_venues else 0.0
+        except Exception:  # noqa: BLE001 - an unreadable setting must not stop the allocator
+            return 0.0
 
     def _read_current(self, now_ms: int) -> dict[str, Current]:
         out: dict[str, Current] = {}

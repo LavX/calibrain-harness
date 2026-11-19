@@ -19,6 +19,12 @@ from ctb.kairos.parse import validate
 T0 = 1_800_000_000.0
 IDS = ["carry", "trend", "xsmom"]
 
+@pytest.fixture(autouse=True)
+def _no_explore_floor(monkeypatch):
+    """These tests pin the decider-only mapping itself; the demo minimum is tested in test_allocator_explore_floor.py."""
+    monkeypatch.setenv("CTB_ALLOCATOR_EXPLORE_FLOOR", "0")
+
+
 
 def put(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
