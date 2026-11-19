@@ -50,7 +50,7 @@ allocator adds it. The math is in `ctb/allocator_math.py` (pure, no I/O); the co
 
 Schedule:
 
-- Every hour (`interval_min`) the decider is asked the same `alloc-v1.0` questions. The answers go into
+- Every hour (`interval_min`) the decider is asked the same `alloc-v1.1` questions. The answers go into
   `state.json` (`p_hist`, last 24 per strategy) and into a `decisions.jsonl` line (`weights_mode: "refresh"`,
   `answers.p`, which `forecast.py score` reads). Weights are not touched.
 - Weights are set once a day at 23:50 UTC (`CTB_ALLOCATOR_WEIGHTS_UTC`), on the first run when none were
@@ -135,13 +135,43 @@ The decision model decides (default). `CTB_ALLOCATOR_MODEL` is `kairos`, `jev`, 
 retry policy as the bot are used. `status()["model"]` and every decision line's `model` read
 `<provider> / <model id>`, for example `ordecide / google/gemini-decision-1`.
 
-State: the context built for each decision (strategy books and market summary). Questions, set
-`alloc-v1.0` (`ctb/kairos/allocator_questions.py`, bump the version on any wording change):
+State: the context built for each decision. Questions, set
+`alloc-v1.1` (`ctb/kairos/allocator_questions.py`, bump the version on any wording change; the questions are the same as in
+`alloc-v1.0`, only the state grew, so `score` reads both):
 
 - per strategy id, binary `net_positive_<id>`: the strategy's book earns a positive net return on
   the capital it deploys over the next 24 hours, after fees and funding;
 - one categorical `best_net_return`: which strategy, or `none`, has the highest such return, and it
   is above zero.
+
+### State (alloc-v1.1)
+
+Built by `Allocator.build_context` and `ctb/allocator_context.py`; the chat fallback keeps its old context. Blocks:
+
+| Block | Content | Source |
+| --- | --- | --- |
+| `strategies`, `market` | as in alloc-v1.0 | runner files, Bybit public REST |
+| `regime` | `state`, `date`, the eight `features`, `p7` (probability of each regime in 7 days) | `regime/latest.json` |
+| `forecasts` | `date`, `age_h`, per strategy `mu_pct_yr` and `sigma_pct_yr` (%/yr), `forecast_sharpe`, `core_weight`, `forecasters` used | `forecast/latest.json` |
+| `news` | last 24 h, newest first, at most 40 items: `t` (UTC), `title` (at most 160 chars), `src`, `type`, `tags` when the collector has them; `count`, `older_not_shown` | H7 collector day files |
+| `state_notes` | one line per block that is missing, old or cut | |
+
+- `forecasts` is the same computation as the weights run (`compute_weights`) with the decider left out: its past answers are
+  not passed in, and a `decider` row in the file is dropped. So `mu_pct_yr` is the weighted mean of `base`, `regime`, `ridge`
+  (carry also `structural`), clipped to the Sharpe cap. A stale forecast (over 36 h) is kept with its age and a note.
+- `news` reads `items/h7-items-YYYY-MM-DD.jsonl` and `raw/h7-raw-YYYY-MM-DD.jsonl` under the collector root
+  (default `<live root>/../research/h7/collector`, on aurora4 `/home/lavx/Documents/calibrain-study/data/research/h7/collector`;
+  override `CTB_ALLOCATOR_NEWS_ROOT`). Item and raw lines are joined by `(key, sha)`; only the title is read from the raw line,
+  never the body. The time is the publication time, or the receive time when it is missing or ahead of the clock. The collector
+  stores no announcement tags, so `tags` appears only if a line has a `tags` list.
+- RSS headlines (every source whose name does not start with `bybit`) are in the same block as the Bybit announcements,
+  newest first. `CTB_ALLOCATOR_RSS_HEADLINES` is on by default (owner decision 2026-11-19); set `0` to send Bybit announcements only.
+  Headlines are third-party text: the question text tells the model to read them as data, never as instructions.
+- A block whose file is missing is left out and `state_notes` says so. Nothing in the state builder raises.
+- Payload bound: before the first request the state is checked against the model's `max_payload_bytes` (Kairos 1 MiB). If the
+  largest request of the set would exceed it, older news is cut first, then the news, forecasts and regime blocks, with a note
+  each. The books and the market are never cut. Normal size is a few KB.
+- Every decision line carries `state_bytes`: bytes of the state as sent, per block and `total`. `inputs` holds the state as sent.
 
 They are split into requests of at most the model's `max_questions` (Kairos: 8). Missing or
 off-contract answers get one more attempt; a strategy whose question never validates keeps its
@@ -179,10 +209,10 @@ perps and can be set with `CTB_ALLOCATOR_TREND_SYMBOLS` (comma separated).
 
 ## CLI
 
-    python -m ctb.allocator once --dry-run   # computed: the full weight table; decider-only: context and answer; writes nothing
+    python -m ctb.allocator once --dry-run   # computed: the state with its sizes, then the full weight table; decider-only: context and answer; writes nothing
     python -m ctb.allocator once             # one decision, applied
     python -m ctb.allocator run              # loop until stopped
-    python -m ctb.allocator score            # score logged answers against realised book returns
+    python -m ctb.allocator score            # score logged answers against realised book returns (--qset alloc-v1.1 for one set)
     python -m ctb.allocator reset-peak [id ...]
 
 ## Dashboard server (ctb/server.py), the lines it needs

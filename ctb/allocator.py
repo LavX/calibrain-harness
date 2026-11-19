@@ -1,7 +1,7 @@
 """LLM strategy allocator: the decision model decides which live strategies run, and how much.
 
 Default: the harness's decision model (CTB_MODEL_PROVIDER when it is a decision spec: kairos, jev,
-ordecide, or:<id>; else ordecide) answers the alloc-v1.0 question set (ctb/kairos/allocator_questions.py):
+ordecide, or:<id>; else ordecide) answers the alloc-v1.1 question set (ctb/kairos/allocator_questions.py):
 per strategy "is its net book return over the next 24 h positive" plus "which strategy, or none, earns
 the most". Code maps the probabilities to weights: weight = clip((p - 0.5) / 0.15, 0, 1), the
 categorical winner is lifted to 0.5 when its own p > 0.55, enabled = weight > 0. Fallback: a chat
@@ -30,7 +30,11 @@ Files under the live root (CTB_LIVE_ROOT, default <repo>/data/live):
   allocator/state.json       equity samples and peaks, so P&L windows and drawdown survive restarts, the
                              decider's last answers (p_hist) and when weights were last set
   forecast/latest.json       written by the prediction layer (read only here)
-  regime/latest.json         the same (read only; shown in the one-line reasons)
+  regime/latest.json         the same (read only; shown in the one-line reasons and given to the decider)
+  ../research/h7/collector   the H7 collector's item and raw day files (read only): the last 24 h of Bybit announcements
+                             and RSS headlines go into the decider's state (ctb/allocator_context.py; RSS is on by
+                             default, owner decision 2026-11-19, set CTB_ALLOCATOR_RSS_HEADLINES=0 for Bybit only;
+                             the path can be set with CTB_ALLOCATOR_NEWS_ROOT)
 
 Hard rules, enforced in code whatever the model says:
   - a weight moves at most max_step (0.5) per decision;
@@ -67,11 +71,12 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
+from . import allocator_context as X
 from . import allocator_math as M
 from .config import ROOT, Settings
 from .kairos.allocator_prompt import REASONING_MAX_CHARS, build_messages, build_schema, retry_messages
-from .kairos.allocator_questions import (BEST_QID, NONE_ID, QUESTION_SET_VERSION, MappingParams, batches, build_questions,
-                                         map_answers, pos_qid)
+from .kairos.allocator_questions import (BEST_QID, NONE_ID, QUESTION_SET_VERSION, SCORED_QSETS, MappingParams, batches,
+                                         build_questions, map_answers, pos_qid)
 from .kairos.chat import _reasoning, parse_reply
 from .kairos.client import KairosError, RateBudget, SystemOneClient, make_client
 from .kairos.parse import validate
@@ -848,7 +853,68 @@ class Allocator:
         ctx = {"now_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(now_ms / 1000)),
                "limits": {"max_weight_step": self.max_step, "drawdown_floor_pct": self.dd_floor_pct},
                "strategies": strategies, "market": market}
+        if self.mode == "decider":   # alloc-v1.1 blocks; the chat fallback keeps its own prompt and context
+            self.add_decider_blocks(ctx, current, now_ms)
         return ctx, current, rows
+
+    def add_decider_blocks(self, ctx: dict[str, Any], current: dict[str, Current], now_ms: int) -> None:
+        """alloc-v1.1: regime, forecasts and news next to the books and the market. A block whose file is missing is left out
+        and a line in state_notes says so; nothing here raises."""
+        notes: list[str] = []
+        regime, note = X.regime_block(self.root)
+        if regime:
+            ctx["regime"] = regime
+        elif note:
+            notes.append(note)
+        fblock, note = self.forecast_block(current, now_ms)
+        if fblock:
+            ctx["forecasts"] = fblock
+        if note:
+            notes.append(note)
+        try:
+            news, news_notes = X.news_block(X.news_root(self.root), now_ms, rss=X.rss_headlines_enabled())
+        except Exception as exc:  # noqa: BLE001
+            news, news_notes = None, [f"news omitted: {type(exc).__name__}"]
+        if news is not None:
+            ctx["news"] = news
+        notes += news_notes
+        if notes:
+            ctx["state_notes"] = notes
+
+    def forecast_block(self, current: dict[str, Current], now_ms: int) -> tuple[dict[str, Any] | None, str | None]:
+        """The prediction layer's computed numbers per strategy, WITHOUT the decider: its answers are not passed in (p is empty),
+        so the combined mu is the weighted mean of base, regime, ridge (carry also structural) only, clipped to the Sharpe cap.
+        mu and sigma in %/yr, forecast Sharpe, core weight (the inverse-volatility size before the rules)."""
+        fc = self.load_forecast(now_ms)
+        if fc.state in ("missing", "invalid") or not fc.data:
+            return None, f"forecasts omitted: {fc.note}"
+        ids = list(current)
+        data = dict(fc.data)
+        data["strategies"] = {sid: ({**f, "mu": {k: v for k, v in f["mu"].items() if k != "decider"}} if isinstance(f, dict) and isinstance(f.get("mu"), dict) else f)
+                              for sid, f in (fc.data.get("strategies") or {}).items()}   # belt and braces: never feed back a decider row
+        try:
+            out = compute_weights(ids, data, current, {}, self.calc, None, self.dd_floor_pct)
+        except Exception as exc:  # noqa: BLE001
+            return None, f"forecasts omitted: could not be computed ({type(exc).__name__})"
+        rows: dict[str, Any] = {}
+        for sid in ids:
+            mu = out["mu"].get(sid, {}).get("combined")
+            sig = out["sigma_d"].get(sid)
+            if mu is None or sig is None or sig <= 0:
+                continue
+            rows[sid] = {"mu_pct_yr": round(M.ann_pct(mu), 2), "sigma_pct_yr": round(M.sigma_ann_pct(sig), 2),
+                         "forecast_sharpe": round(out["sr"][sid], 3), "core_weight": round(out["core"][sid], 4),
+                         "forecasters": sorted(k for k in out["mu"][sid] if k not in ("combined", "decider"))}
+        if not rows:
+            return None, "forecasts omitted: no strategy has a usable forecast"
+        block = {"date": fc.date, "age_h": None if fc.age_h is None else round(fc.age_h, 1), "strategies": rows}
+        missing = [sid for sid in ids if sid not in rows]
+        note = None
+        if fc.state == "stale":
+            note = f"forecasts are old: {fc.note}"
+        elif missing:
+            note = f"forecasts: no usable forecast for {', '.join(missing)}"
+        return block, note
 
     # ---- the model
     async def ask(self, ctx: dict[str, Any], ids: list[str], labels: dict[str, str],
@@ -870,7 +936,9 @@ class Allocator:
         usage_all: list[dict[str, Any]] = []
         cost, attempts = 0.0, 0
         limit = self.max_questions or getattr(getattr(self.llm, "spec", None), "max_questions", None)
-        for batch in batches(qs, limit):
+        parts = batches(qs, limit)
+        X.fit_state(ctx, parts, getattr(getattr(self.llm, "spec", None), "max_payload_bytes", None))   # in place: the log shows what was sent
+        for batch in parts:
             for attempt in (1, 2):
                 if not self.budget.try_take():
                     raise AllocatorError(f"hourly model request budget exhausted ({self.budget.per_hour}/h)")
@@ -898,7 +966,7 @@ class Allocator:
         weights, enabled, mapping, summary = map_answers(ids, p, best, hold, self.params)
         conf = [max(v, 1 - v) for v in p.values()]
         extra = {"qset": QUESTION_SET_VERSION, "provider": getattr(getattr(self.llm, "spec", None), "provider", None),
-                 "request_ids": request_ids, "usage": usage_all, "mapping": mapping,
+                 "state_bytes": X.block_sizes(ctx), "request_ids": request_ids, "usage": usage_all, "mapping": mapping,
                  "answers": {"p": {sid: round(v, 4) for sid, v in p.items()},
                              "best": None if best is None else {k: round(v, 4) for k, v in best.items()}},
                  "unanswered": [q for q in qs if q not in parsed], "issues": issues_all[:6] if len(parsed) < len(qs) else []}
@@ -987,6 +1055,7 @@ class Allocator:
             try:
                 ctx, current, rows = await self.build_context(now_ms)
                 record["inputs"] = ctx
+                record["state_bytes"] = X.block_sizes(ctx)
                 ids = [r["id"] for r in rows]
                 decision, cost, attempts, extra = await self.ask(ctx, ids, {r["id"]: str(r.get("label") or r["id"]) for r in rows}, current)
                 record.update(cost_usd=round(cost, 6), attempts=attempts, **extra)
@@ -1041,6 +1110,7 @@ class Allocator:
             try:
                 ctx, current, rows = await self.build_context(now_ms)
                 record["inputs"] = ctx
+                record["state_bytes"] = X.block_sizes(ctx)
                 _, cost, attempts, extra = await self._ask_decider(ctx, [r["id"] for r in rows],
                                                                     {r["id"]: str(r.get("label") or r["id"]) for r in rows}, current)
                 record.update(cost_usd=round(cost, 6), attempts=attempts)
@@ -1277,8 +1347,8 @@ def _equity_at(hist: list, t_ms: int, tol_ms: int) -> float | None:
 
 
 def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None = None, tol_min: int = 45,
-                    min_weight: float = 0.1) -> dict[str, Any]:
-    """Score logged alloc-v1.0 answers against the realised net book return, from the equity at the
+                    min_weight: float = 0.1, qset: str | None = None) -> dict[str, Any]:
+    """Score logged alloc-v1.0 and alloc-v1.1 answers (same questions; pass qset to keep one of them) against the realised net book return, from the equity at the
     decision (logged inputs) and the equity samples in allocator/state.json (kept 8 days: run this at
     least weekly). A book's return is divided by its weight, so it is the return on the capital the
     strategy deploys; a book held below min_weight cannot be labelled and is counted as flat."""
@@ -1291,7 +1361,7 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
     pending, unlabelled = 0, {"flat": 0, "no_equity": 0}
     for d in tail_jsonl(alloc / "decisions.jsonl", 5000):
         ans = d.get("answers")
-        if d.get("qset") != QUESTION_SET_VERSION or d.get("error") or d.get("dry_run") or not isinstance(ans, dict):
+        if d.get("qset") not in (SCORED_QSETS if qset is None else (qset,)) or d.get("error") or d.get("dry_run") or not isinstance(ans, dict):
             continue
         t = int(d["t_ms"])
         if t + h_ms > now_ms:
@@ -1326,7 +1396,7 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
         out_per[sid] = {"n": n, "base_rate": round(base, 3), "mean_p": round(st["p_sum"] / n, 3), "brier": round(st["brier"] / n, 4),
                         "brier_always_0.5": 0.25, "brier_base_rate": round(base * (1 - base), 4), "hit_rate": round(st["hits"] / n, 3)}
     bn = best_stats["n"]
-    return {"qset": QUESTION_SET_VERSION, "horizon_h": horizon_h, "pending": pending, "unlabelled": unlabelled, "strategies": out_per,
+    return {"qset": qset or "+".join(SCORED_QSETS), "horizon_h": horizon_h, "pending": pending, "unlabelled": unlabelled, "strategies": out_per,
             "best": {"n": bn, "accuracy": round(best_stats["correct"] / bn, 3) if bn else None,
                      "mean_p_of_realised": round(best_stats["p_realised"] / bn, 3) if bn else None}}
 
@@ -1386,7 +1456,7 @@ async def _main(args: argparse.Namespace) -> int:
             print("peaks reset:", ", ".join(alloc.reset_peak(args.ids or None)) or "none")
             return 0
         if args.cmd == "score":
-            _jprint(score_decisions(alloc.root, horizon_h=args.horizon_h))
+            _jprint(score_decisions(alloc.root, horizon_h=args.horizon_h, qset=args.qset))
             return 0
         if args.cmd == "once":
             if not alloc.llm.configured:
@@ -1394,13 +1464,18 @@ async def _main(args: argparse.Namespace) -> int:
                 return 2
             rec = await alloc.decide(dry_run=args.dry_run, trigger="cli")
             if args.dry_run and rec.get("weights_mode") in ("computed", "held", "refresh"):
+                if rec.get("inputs"):
+                    print(f"== STATE given to the model ({rec.get('qset')}, {(rec.get('state_bytes') or {}).get('total')} bytes) ==")
+                    _jprint(rec["inputs"])
+                    print("state bytes per block:", json.dumps(rec.get("state_bytes")))
                 print(format_table(rec))
                 print(f"decider: {rec.get('cost_usd', 0)} usd, error: {rec.get('error')}")
             elif args.dry_run:
                 if rec.get("mode") == "decider":
                     print("== forecast/latest.json is missing: decider-only mapping ==")
-                print("== CONTEXT given to the model ==")
+                print(f"== CONTEXT given to the model ({rec.get('qset')}, {(rec.get('state_bytes') or {}).get('total')} bytes) ==")
                 _jprint(rec.get("inputs"))
+                print("state bytes per block:", json.dumps(rec.get("state_bytes")))
                 print(f"== MODEL ANSWER ({rec['model']}) ==")
                 _jprint(rec.get("answers") or (rec.get("requested") and {**rec["requested"], "confidence": rec["confidence"]}))
                 if rec.get("mapping"):
@@ -1425,8 +1500,9 @@ def main(argv: list[str] | None = None) -> int:
     one = sub.add_parser("once", help="one decision now")
     one.add_argument("--dry-run", action="store_true", help="print the context and the model's answer, write nothing")
     sub.add_parser("run", help="decide every interval until stopped")
-    sc = sub.add_parser("score", help="score logged alloc-v1.0 answers against realised book returns")
+    sc = sub.add_parser("score", help="score logged alloc-v1.0 and v1.1 answers against realised book returns")
     sc.add_argument("--horizon-h", type=int, default=24)
+    sc.add_argument("--qset", choices=list(SCORED_QSETS), help="score one question set only (default: both, same questions)")
     rp = sub.add_parser("reset-peak", help="restart a book's drawdown measurement from now")
     rp.add_argument("ids", nargs="*")
     args = p.parse_args(argv)
