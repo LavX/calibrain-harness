@@ -4,7 +4,8 @@
 // the runner unit. The data lives in the store (polled every 10 s by the terminal) so the header shows the same mode.
 import { useState } from "react";
 import { post } from "@/lib/api";
-import { loadOverview, loadStrat } from "@/lib/data";
+import { loadOverview, loadPredictions, loadStrat } from "@/lib/data";
+import { PredictionsPanel, ScoreboardPanel } from "@/components/Predictions";
 import { useStore } from "@/lib/store";
 import { age, dt, fx, isNum, px, sg, ud } from "@/lib/format";
 
@@ -66,7 +67,7 @@ function setManualSet(ids: string[]) {
 }
 
 async function reloadAll() {
-  await Promise.all([loadStrat().catch(() => {}), loadOverview().catch(() => {})]);
+  await Promise.all([loadStrat().catch(() => {}), loadOverview().catch(() => {}), loadPredictions().catch(() => {})]);
 }
 
 /** Header: change the auto-trade mode (with a confirm that says what gets paused first). */
@@ -358,6 +359,8 @@ export function StrategiesView() {
       {doc.error && <div className="alert crit"><b>CONFIG</b> {doc.error}</div>}
       <RunnerBar doc={doc} />
       {(doc.allocator.available || doc.mode === "llm") && <AllocatorPanel doc={doc} />}
+      <PredictionsPanel />
+      <ScoreboardPanel />
       <div className="strat-grid">
         {doc.strategies.map((s) => (
           <Card key={s.id} s={s} mode={doc.mode} inSet={set.includes(s.id)}

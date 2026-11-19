@@ -1,6 +1,6 @@
 "use client";
 import { useEffect } from "react";
-import { connectSocket, loadDecisions, loadMarket, loadMonitor, loadNews, loadOverview, loadPerf, loadStrat } from "@/lib/data";
+import { connectSocket, loadDecisions, loadMarket, loadMonitor, loadNews, loadOverview, loadPerf, loadPredictions, loadStrat } from "@/lib/data";
 import { setState, useStore } from "@/lib/store";
 import { Alerts, Clocks, CommandBar, FKeys, StatusLine } from "./TopBar";
 import { MonitorView } from "./Monitor";
@@ -27,10 +27,12 @@ export default function Terminal() {
     (async () => {
       await loadOverview().catch(() => {});
       loadStrat().catch(() => {});
+      loadPredictions().catch(() => {});
       await Promise.all([loadMonitor(), loadMarket(), loadDecisions(), loadPerf(), loadNews()].map((p) => p.catch(() => {})));
       stop = [
         connectSocket(),
         every(10_000, loadStrat), // live strategies, allocator and the auto-trade mode
+        every(30_000, loadPredictions), // predictions panel and scoreboard (the server caches 30 s)
         every(10_000, loadOverview), // settings, budgets, labelled count (account itself is pushed)
         every(5_000, loadMonitor), // universe map, macro, tape, headlines, sparklines (ticks are pushed)
         every(10_000, loadMarket), // state preview + derivatives block (candles/book are pushed)

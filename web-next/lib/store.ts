@@ -10,6 +10,7 @@ export type Bar = { symbol: string; tf: string; time: number; open: number; high
 export type State = {
   ov: any | null;
   strat: any | null;
+  pred: any | null;
   mon: any | null;
   mkt: any | null;
   decisions: any[];
@@ -28,7 +29,7 @@ export type State = {
 };
 
 let state: State = {
-  ov: null, strat: null, mon: null, mkt: null, decisions: [], latest: {}, news: { forecasts: [], headlines: [] }, perf: {},
+  ov: null, strat: null, pred: null, mon: null, mkt: null, decisions: [], latest: {}, news: { forecasts: [], headlines: [] }, perf: {},
   symbol: null, tf: "5", view: "mon", ticks: {}, book: null,
   socket: { connected: false, lastMsg: 0, latencyMs: null, msgs: 0 }, modal: null, cmdHint: null,
   rev: { trades: 0, events: 0, eval: 0 },

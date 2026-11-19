@@ -2,7 +2,7 @@
 
     .venv/bin/python scripts/preview_strategies.py [--port 8801]
 
-Copies tests/fixtures/live to a temp dir with fresh timestamps, points CTB_LIVE_ROOT at it and starts the dashboard
+Copies tests/fixtures/live (and tests/fixtures/predictions, for the PREDICTIONS panel and scoreboard) to a temp dir with fresh timestamps, points CTB_LIVE_ROOT at it and starts the dashboard
 with a throw-away database and no keys (observe-only, orders are impossible). The LLM allocator runs with a FAKE model
 (no network call to any model, a canned allocation) and a 2 s tick, so DECIDE NOW answers within seconds. Start/stop of
 the runner unit answers "not installed" because no such unit exists on this machine; the file-based controls work.
@@ -28,6 +28,11 @@ def main() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="ctb-preview-"))
     live = tmp / "live"
     shutil.copytree(ROOT / "tests" / "fixtures" / "live", live)
+    # the predictions panel's files (regime, forecast, scores, returns); its decision lines are appended to the allocator's feed
+    pred = ROOT / "tests" / "fixtures" / "predictions"
+    shutil.copytree(pred, live, dirs_exist_ok=True, ignore=shutil.ignore_patterns("decisions.jsonl"))
+    with open(live / "allocator" / "decisions.jsonl", "a") as fh:
+        fh.write((pred / "allocator" / "decisions.jsonl").read_text())
     shift = int(time.time() * 1000) - FIXED
     for f in live.rglob("*.json"):
         doc = json.loads(f.read_text())

@@ -55,6 +55,25 @@ DECIDES** (control `enabled: true`). If no allocator can be created (no model co
 and LLM DECIDES refuses to switch on. DECIDE NOW is picked up by the loop within its 30 s tick. The feed shows failed
 attempts and risk-floor actions too.
 
+## Predictions panel and scoreboard
+
+Under the allocator panel, from `GET /api/predictions` (read-only, cached 30 s, `ctb/predictions.py`). It reads, under the
+live root: `regime/latest.json`, `forecast/latest.json`, `forecast/scores.json`, `forecast/archive/<day>.json`,
+the newest `allocator/decisions.jsonl` line that carries the `core` breakdown, `returns/<id>.csv`, and each strategy's
+`status.json` and `control.json`. A missing or damaged file blanks only its own section, which then says "not computed yet".
+
+- PREDICTIONS: the regime now with the 8 features and a one-line meaning each, the 7-day state probabilities, and per
+  strategy the core weight, the shadow tilt (tau) and forecast Sharpe, the expected net return in %/yr of each forecaster
+  (base, regime, ridge, structural, decider) and combined, risk in %/yr, the decider's mean p over 24 h, the live weight and
+  the allocator's one-line reason. A forecast older than 36 h is flagged (the allocator holds weights then).
+- SCOREBOARD: per strategy and forecaster the loss L and weight W, the decider's Brier score against the base rate and the
+  number of days scored, kappa and the 90 and 180-day tilt skill, and the line "tilt live control: off until the shadow tilt
+  beats the core over 90 days (n/90 days so far)". Below it live P&L (`status.json`) next to the modelled shadow return of
+  `returns/<id>.csv` from the go-live day (2026-11-19, `CTB_GO_LIVE_DATE` overrides it), at weight 1 and at the live weight,
+  and a chart of the cumulative return of the core book against the shadow-tilted book (full tilt, no rules, no costs, no
+  decider, the series the tilt skill is judged on). The chart needs a forecast archived on or after go-live plus the next
+  day's returns, so it starts empty.
+
 ## Files (the contract with the runner)
 
 Root: `CTB_LIVE_ROOT`, shared with `ctb.allocator` (default `data/live` in the repo; on aurora4 the unit sets `/home/lavx/Documents/calibrain-study/data/live`).
@@ -112,5 +131,5 @@ account the per-symbol bot would use (`testnet` default); the strategies always 
 ## Local preview
 
 `scripts/preview_strategies.py` copies the fixture files in `tests/fixtures/live` to a temp directory with fresh
-timestamps and starts the dashboard against them (no keys, no runner, observe-only). Press F7. The runner start/stop
+timestamps (plus `tests/fixtures/predictions` for the predictions panel) and starts the dashboard against them (no keys, no runner, observe-only). Press F7. The runner start/stop
 buttons answer "not installed" there because no such unit exists on the machine; the file-based controls work.

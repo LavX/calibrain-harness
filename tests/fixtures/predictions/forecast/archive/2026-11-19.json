@@ -1,0 +1,100 @@
+{
+ "date": "2026-11-19",
+ "made_ms": 1799900000000,
+ "kappa": 0.0,
+ "strategies": {
+  "carry": {
+   "sigma_d": 0.004,
+   "mu": {
+    "structural": 0.00012,
+    "base": 4e-05,
+    "regime": 3e-05,
+    "ridge": 2e-05
+   },
+   "own_mom": 0.1,
+   "n_days": 900,
+   "clipped": []
+  },
+  "trend": {
+   "sigma_d": 0.03,
+   "mu": {
+    "base": 0.0003,
+    "regime": 0.0004,
+    "ridge": -0.0001
+   },
+   "own_mom": 0.3,
+   "n_days": 900,
+   "clipped": []
+  },
+  "xsmom": {
+   "sigma_d": 0.035,
+   "mu": {
+    "base": 0.0002,
+    "regime": -0.0001,
+    "ridge": 0.0
+   },
+   "own_mom": -0.2,
+   "n_days": 900,
+   "clipped": []
+  }
+ },
+ "cov_d": {
+  "ids": [
+   "carry",
+   "trend",
+   "xsmom"
+  ],
+  "matrix": [
+   [
+    1.6e-05,
+    0,
+    0
+   ],
+   [
+    0,
+    0.0009,
+    0.000315
+   ],
+   [
+    0,
+    0.000315,
+    0.0012250000000000002
+   ]
+  ]
+ },
+ "weights_k": {
+  "carry": {
+   "structural": 0.4,
+   "base": 0.15,
+   "regime": 0.05,
+   "ridge": 0.05,
+   "decider": 0.35
+  },
+  "trend": {
+   "base": 0.3,
+   "regime": 0.05,
+   "ridge": 0.05,
+   "decider": 0.6
+  },
+  "xsmom": {
+   "base": 0.3,
+   "regime": 0.05,
+   "ridge": 0.05,
+   "decider": 0.6
+  }
+ },
+ "mu_combined": {
+  "carry": 8e-05,
+  "trend": 0.00025,
+  "xsmom": 0.00012
+ },
+ "regime": {
+  "state": "up_calm",
+  "p7": {
+   "up_calm": 0.62,
+   "up_wild": 0.2,
+   "down_calm": 0.1,
+   "down_wild": 0.08
+  }
+ }
+}
