@@ -22,6 +22,7 @@ from .evaluation import validation as validation_mod
 from .market.store import TIMEFRAMES
 from . import models as models_mod
 from . import runs as runs_mod
+from . import allocator as alloc_mod
 from . import strategies as strat_mod
 from . import universe as universe_mod
 from . import venue as venue_mod
@@ -94,19 +95,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     s = engine.s
     app = web.Application(middlewares=[dev_cors, same_origin_only])
     routes = web.RouteTableDef()
-    # ===== LLM ALLOCATOR WIRING (STUB: completes when feat/llm-allocator merges ctb/allocator.py) =====
-    # Assumed interface of ctb.allocator, the merge point with the other branch:
-    #     async def run(engine, root: Path) -> None   # the decision loop; it reads <root>/allocator/control.json
-    #                                                 # (enabled, interval_min, decide_now), writes <root>/allocator/status.json and
-    #                                                 # decisions.jsonl, and each strategy's control.json (enabled, weight, reason)
-    # Status is read from those files by ctb.strategies (the contract's revision 2), so no status() call is needed here.
-    # Until the module exists the allocator panel says "not installed" and LLM DECIDES refuses to switch on.
-    try:
-        from . import allocator as allocator_mod  # provided by feat/llm-allocator
-    except ImportError:
-        allocator_mod = None
-    strat = strategies_svc or strat_mod.StrategyService(allocator_available=allocator_mod is not None)
-    # ===== end of the allocator stub =====
+    strat = strategies_svc or strat_mod.StrategyService()
 
     @routes.get("/")
     async def index(_: web.Request) -> web.StreamResponse:
@@ -344,6 +333,24 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
                                       llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
         except strat_mod.StrategyError as exc:
             return j({"error": exc.message}, exc.status)
+
+    @routes.get("/api/allocator")
+    async def allocator_status(req: web.Request) -> web.Response:
+        a = req.app.get("allocator")
+        if a is None:
+            return j({"error": "the LLM allocator is not running"}, 503)
+        return j({"status": a.status(), "control": a.control()})
+
+    @routes.get("/api/allocator/decisions")
+    async def allocator_decisions(req: web.Request) -> web.Response:
+        a = req.app.get("allocator")
+        if a is None:
+            return j({"error": "the LLM allocator is not running"}, 503)
+        try:
+            limit = int(req.query.get("limit", 50))
+        except ValueError:
+            limit = 50
+        return j(a.decisions(limit))
 
     @routes.post("/api/allocator/{action}")
     async def allocator_act(req: web.Request) -> web.Response:
@@ -760,13 +767,21 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     async def on_startup(app_: web.Application) -> None:
         await engine.start()
         app_["strategy_guard"] = asyncio.create_task(strategy_guard())
-        if allocator_mod is not None:  # allocator stub: the decision loop (see the marked block in make_app)
-            app_["allocator"] = asyncio.create_task(allocator_mod.run(engine, strat.root))
+        # The LLM allocator (docs/allocator.md). attach_allocator first writes allocator/control.json from the mode, because the
+        # loop treats a missing file as enabled: it writes strategy controls only in LLM DECIDES (control enabled true).
+        try:
+            alloc = alloc_mod.create_allocator(engine.session, root=strat.root)
+            strat.attach_allocator(alloc)
+            app_["allocator"] = alloc
+            app_["allocator_task"] = asyncio.create_task(alloc.run())
+        except Exception as exc:  # noqa: BLE001 - no usable model configured: the tab works without the allocator
+            log.warning("LLM allocator not started: %s", exc)
 
     async def on_cleanup(app_: web.Application) -> None:
         app_["strategy_guard"].cancel()
         if "allocator" in app_:
-            app_["allocator"].cancel()
+            app_["allocator"].stop()
+            app_["allocator_task"].cancel()
         await engine.stop()
 
     app.on_startup.append(on_startup)

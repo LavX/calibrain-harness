@@ -9,7 +9,8 @@ account and writes plain files; this module
   * asks systemd to start or stop the runner unit(s) named in strategies.json (`systemctl --user`, argument
     lists, no shell, only names found in strategies.json or in CTB_LIVE_UNITS).
 
-Root: CTB_LIVE_ROOT, default /home/lavx/Documents/calibrain-study/data/live (the runner's own root).
+Root: CTB_LIVE_ROOT (shared with ctb.allocator), default data/live; on aurora4 the runner's root,
+/home/lavx/Documents/calibrain-study/data/live.
 
 Auto-trade guard (both directions): the bot's own LLM auto-trade must never trade on the demo account the live
 runner uses, because the positions would merge. It only matters on the demo venue. The bot's account label is
@@ -39,7 +40,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-DEFAULT_ROOT = Path("/home/lavx/Documents/calibrain-study/data/live")
+from .config import ROOT
+
+DEFAULT_ROOT = ROOT / "data" / "live"  # the same default as ctb.allocator; on aurora4 CTB_LIVE_ROOT points at the runner's root
 UNIT_RE = re.compile(r"^[A-Za-z0-9_.:-]+(@[A-Za-z0-9_.:-]+)?\.service$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ACTIONS = ("enable", "pause", "unlock", "flatten", "reset")
@@ -251,7 +254,7 @@ def is_active(st: dict[str, Any]) -> bool:
 
 
 # ------------------------------------------------------------------------------------------------ service
-DECISION_KEYS = ("t_ms", "model", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock")
+DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "risk_floor", "error")
 
 
 def clean_allocator(status: dict | None, control: dict | None, decisions: list[dict]) -> dict[str, Any]:
@@ -266,15 +269,23 @@ def clean_allocator(status: dict | None, control: dict | None, decisions: list[d
     return {"status": stt, "control": ctl, "decisions": [{k: d.get(k) for k in DECISION_KEYS} for d in decisions]}
 
 
+def control_view(ctl: dict, st: dict | None) -> dict[str, Any]:
+    return {"enabled": bool(ctl["enabled"]) if "enabled" in ctl else (st["enabled"] if st else False),
+            "weight": _num(ctl.get("weight")), "set_by": ctl.get("set_by") if ctl.get("set_by") in ("llm", "owner") else None,
+            "owner_lock": bool(ctl.get("owner_lock")), "reason": str(ctl["reason"])[:500] if ctl.get("reason") else None,
+            "flatten_pending": bool(ctl.get("flatten")), "reset_pending": bool(ctl.get("reset_latch"))}
+
+
 class StrategyService:
     def __init__(self, root: Path | None = None, run: Runner = run_cmd, clock: Callable[[], float] = time.time,
                  extra_units: tuple[str, ...] | None = None, dashboard_account: str | None = None,
-                 allocator_available: bool = False) -> None:
+                 allocator_available: bool = False, allocator: Any = None) -> None:
         self.root = root if root is not None else live_root()
         self.run, self.clock = run, clock
         self.extra_units = extra_units if extra_units is not None else extra_units_from_env()
         self.dashboard_account = dashboard_account if dashboard_account is not None else (os.environ.get("CTB_DASHBOARD_ACCOUNT") or None)
-        self.allocator_available = allocator_available  # ctb.allocator importable (set by the server)
+        self.allocator = allocator  # the running ctb.allocator.Allocator (set by the server at startup), or None
+        self.allocator_available = allocator_available or allocator is not None
         self._cache: tuple[float, dict] | None = None
         self._lock = asyncio.Lock()
         self._equity: dict[str, deque] = {}
@@ -299,6 +310,9 @@ class StrategyService:
     def _control(self, e: Entry) -> dict:
         return read_json(self.root / e.id / "control.json") or {}
 
+    def _control_by_id(self, sid: str) -> dict:
+        return read_json(self.root / sid / "control.json") or {}
+
     def _enabled(self, e: Entry) -> bool:
         """Is the strategy switched on: control.json if there is one, else what the runner reports."""
         ctl = self._control(e)
@@ -308,7 +322,14 @@ class StrategyService:
         return bool(stt and stt.get("enabled"))
 
     def _allocator_on(self) -> bool:
-        return bool((read_json(self.root / ALLOCATOR / "control.json") or {}).get("enabled"))
+        return (read_json(self.root / ALLOCATOR / "control.json") or {}).get("enabled") is True
+
+    def attach_allocator(self, allocator: Any) -> None:
+        """Called by the server at startup, before the allocator loop starts. The allocator treats a missing
+        allocator/control.json as enabled, so write it first: the loop only writes strategy controls in LLM DECIDES."""
+        self.allocator, self.allocator_available = allocator, allocator is not None
+        reg = self.registry()
+        self._write_allocator(enabled=self.mode(reg) == "llm")
 
     def _write(self, e: Entry, **changes: Any) -> None:
         """Merge changes into the strategy's control.json (unknown keys the runner may use are kept), atomically."""
@@ -394,8 +415,7 @@ class StrategyService:
                 held = self._holding(reg, venue)
                 if held:
                     raise StrategyError(409, f"{', '.join(held)} hold positions on the demo account. FLATTEN them first, then switch to the per-symbol bot.")
-                if (self.root / ALLOCATOR).is_dir():
-                    self._write_allocator(enabled=False)
+                self._write_allocator(enabled=False)
                 await self._pause_all(reg)
                 for u in self.conflicting_units(reg, venue):
                     if is_active(await unit_state(self.run, u)):
@@ -408,7 +428,7 @@ class StrategyService:
         if cur == "bot" and conflict and bot_open:
             raise StrategyError(409, "the per-symbol bot has open trades on the demo account. Close them (KILL, or wait for their exits) "
                                      "before the strategies take over the account.")
-        if mode == "manual" and (self.root / ALLOCATOR).is_dir():
+        if mode == "manual":
             self._write_allocator(enabled=False)  # the allocator is paused; strategies stay as they are
         self._mode = mode
         self._cache = None
@@ -474,6 +494,12 @@ class StrategyService:
                 "trades": tail_jsonl(d / "trades.jsonl")}
 
     def _read_allocator(self) -> dict[str, Any]:
+        a = self.allocator
+        if a is not None:  # the running allocator's own readers (same files, same contract)
+            try:
+                return clean_allocator(a.status(), a.control(), a.decisions(FEED_N))
+            except Exception:  # noqa: BLE001 - fall back to the files
+                pass
         d = self.root / ALLOCATOR
         return clean_allocator(read_json(d / "status.json"), read_json(d / "control.json"), tail_jsonl(d / "decisions.jsonl", FEED_N))
 
@@ -487,7 +513,14 @@ class StrategyService:
         async with self._lock:
             now = self.clock()
             if not force and self._cache and now - self._cache[0] < CACHE_S:
-                return self._cache[1]
+                # unit states and status files are cached; the allocator panel and the controls are small files, always fresh
+                doc = dict(self._cache[1])
+                alloc = await asyncio.to_thread(self._read_allocator)
+                alloc["available"] = self.allocator_available
+                doc["allocator"] = alloc
+                doc["strategies"] = [{**v, "control": control_view(self._control_by_id(v["id"]), v["status"])} for v in doc["strategies"]]
+                doc["auto_on"] = alloc["control"]["enabled"] if doc["mode"] == "llm" else any(v["control"]["enabled"] for v in doc["strategies"])
+                return doc
             reg = self.registry()
             units = {u: await unit_state(self.run, u) for u in reg.units}
             reads = await asyncio.gather(*(asyncio.to_thread(self._read, e) for e in reg.entries))
@@ -501,10 +534,7 @@ class StrategyService:
                 views.append({
                     "id": e.id, "label": e.label, "unit": e.unit, "account": e.account, "status": st,
                     "pill": pill(st, now * 1000, runner_active),
-                    "control": {"enabled": bool(ctl["enabled"]) if "enabled" in ctl else (st["enabled"] if st else False),
-                                "weight": _num(ctl.get("weight")), "set_by": ctl.get("set_by") if ctl.get("set_by") in ("llm", "owner") else None,
-                                "owner_lock": bool(ctl.get("owner_lock")), "reason": str(ctl["reason"])[:500] if ctl.get("reason") else None,
-                                "flatten_pending": bool(ctl.get("flatten")), "reset_pending": bool(ctl.get("reset_latch"))},
+                    "control": control_view(ctl, st),
                     "trades": r["trades"], "equity_history": self._sample(e.id, now, st["equity_usdt"] if st else None),
                     "runner_active": runner_active,
                 })

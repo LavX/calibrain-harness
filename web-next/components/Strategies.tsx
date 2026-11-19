@@ -20,7 +20,7 @@ type Strat = {
   id: string; label: string; unit: string | null; account: string; status: Status | null; pill: string; control: Control;
   trades: Trade[]; equity_history: [number, number][]; runner_active: boolean;
 };
-type Decision = { t_ms: number; model: string; weights: Record<string, number>; enabled: Record<string, boolean>; reasoning: string; applied: Record<string, boolean> | null; skipped_owner_lock: string[] | null };
+type Decision = { t_ms: number; model: string; trigger?: string; risk_floor?: string[]; error?: string | null; weights: Record<string, number>; enabled: Record<string, boolean>; reasoning: string; applied: Record<string, boolean> | null; skipped_owner_lock: string[] | null };
 type Allocator = {
   available: boolean;
   status: { state: string; model: string | null; last_decision_ms: number | null; next_decision_ms: number | null; last_error: string | null; cost_usd_today: number | null } | null;
@@ -296,7 +296,7 @@ function AllocatorPanel({ doc }: { doc: StratDoc }) {
                 <td className="wrap">{Object.entries(d.weights || {}).map(([id, w]) => (
                   <div key={id}><span className="amb">{id}</span> {fx(w, 2)}{d.enabled?.[id] === false ? " (off)" : ""}{d.skipped_owner_lock?.includes(id) ? " (owner lock, not applied)" : ""}</div>
                 ))}</td>
-                <td className="wrap">{d.reasoning}</td></tr>
+                <td className="wrap">{d.error && <div className="dn">failed: {d.error}</div>}{d.risk_floor?.length ? <div className="amb">risk floor: {d.risk_floor.join(", ")}</div> : null}{d.reasoning}<span className="muted"> {d.trigger ? `(${d.trigger})` : ""}</span></td></tr>
             ))}</tbody>
           </table>
         ) : <div className="empty">No decisions yet</div>}

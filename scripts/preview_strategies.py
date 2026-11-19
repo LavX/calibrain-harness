@@ -3,8 +3,9 @@
     .venv/bin/python scripts/preview_strategies.py [--port 8801]
 
 Copies tests/fixtures/live to a temp dir with fresh timestamps, points CTB_LIVE_ROOT at it and starts the dashboard
-with a throw-away database and no keys (observe-only, orders are impossible). Start/stop of the runner unit will
-answer "not installed" because no such unit exists on this machine; the file-based controls work.
+with a throw-away database and no keys (observe-only, orders are impossible). The LLM allocator runs with a FAKE model
+(no network call to any model, a canned allocation) and a 2 s tick, so DECIDE NOW answers within seconds. Start/stop of
+the runner unit answers "not installed" because no such unit exists on this machine; the file-based controls work.
 """
 
 import argparse
@@ -53,7 +54,27 @@ def main() -> None:
         env.pop(k, None)
     print(f"preview data in {live}; open http://127.0.0.1:{args.port} and press F7")
     os.chdir(ROOT)
-    os.execve(sys.executable, [sys.executable, "-m", "ctb.server"], env)
+    os.environ.update(env)
+    sys.path.insert(0, str(ROOT))
+    from ctb import allocator as alloc_mod
+    from ctb import server
+
+    class FakeModel:
+        """Stands in for the allocator's chat model: always the same valid answer, free of charge."""
+
+        async def ask_json(self, messages, schema):
+            props = schema["properties"]["weights"]["properties"]
+            return ({"weights": {i: (0.8 if i == "carry" else 0.0) for i in props}, "enabled": {i: i == "carry" for i in props},
+                     "reasoning": "fake model: carry only, everything else flat", "confidence": 0.5}, {"cost": 0.0})
+
+    async def no_market():
+        return {}
+
+    def fake_create(session, root=None, spec=None):
+        return alloc_mod.Allocator(root or live, FakeModel(), no_market, model="fake-model", tick_s=2.0)
+
+    alloc_mod.create_allocator = fake_create
+    server.main()
 
 
 if __name__ == "__main__":

@@ -46,15 +46,18 @@ MANUAL if strategies are configured, otherwise PER-SYMBOL BOT.
 
 State, model, last and next decision, interval (change), cost today, a DECIDE NOW button (confirm step) and the feed of
 the last 15 decisions (time, weight per strategy, reasoning, strategies skipped because of an owner lock). It reads
-`<root>/allocator/status.json` and `decisions.jsonl` and writes `<root>/allocator/control.json`
-(`enabled`, `interval_min`, `decide_now`). The decision loop itself is `ctb.allocator.run(engine, root)`; the dashboard
-starts it at startup when the module can be imported (see the marked stub block in `ctb/server.py`, the merge point
-with `feat/llm-allocator`). Until that branch is merged the panel says "not installed" and LLM DECIDES refuses to
-switch on.
+`<root>/allocator/status.json` and `decisions.jsonl` (through the running allocator's `status()`, `control()` and
+`decisions()`) and writes `<root>/allocator/control.json` (`enabled`, `interval_min`, `decide_now`). The decision loop is
+`ctb.allocator` (see `docs/allocator.md`): the server creates it on the engine's session at startup and stops it at
+cleanup. The loop treats a missing `allocator/control.json` as enabled, so the server writes that file from the mode
+before the loop starts, and the mode switch keeps it current: **the allocator only writes strategy controls in LLM
+DECIDES** (control `enabled: true`). If no allocator can be created (no model configured) the panel says "not installed"
+and LLM DECIDES refuses to switch on. DECIDE NOW is picked up by the loop within its 30 s tick. The feed shows failed
+attempts and risk-floor actions too.
 
 ## Files (the contract with the runner)
 
-Root: `CTB_LIVE_ROOT`, default `/home/lavx/Documents/calibrain-study/data/live`.
+Root: `CTB_LIVE_ROOT`, shared with `ctb.allocator` (default `data/live` in the repo; on aurora4 the unit sets `/home/lavx/Documents/calibrain-study/data/live`).
 
 | File | Written by | Read by |
 | --- | --- | --- |

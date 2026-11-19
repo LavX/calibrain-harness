@@ -419,3 +419,70 @@ def test_routes_and_trading_toggle_guard(root):
             assert r.status == 409
 
     run(go())
+
+
+# ---------------------------------------------------------------- the real allocator on the shared root
+class FakeModel:
+    async def ask_json(self, messages, schema):
+        ids = list(schema["properties"]["weights"]["properties"])
+        return ({"weights": {i: (0.8 if i == "carry" else 0.0) for i in ids}, "enabled": {i: i == "carry" for i in ids},
+                 "reasoning": "fake: carry only", "confidence": 0.5}, {"cost": 0.01})
+
+
+def make_alloc(root):
+    from ctb import allocator as alloc_mod
+
+    async def market():
+        return {}
+
+    clock = lambda: NOW  # noqa: E731
+    return alloc_mod.Allocator(root, FakeModel(), market, model="fake-model", clock=clock, tick_s=0.01)
+
+
+def alloc_ctl(root):
+    return json.loads((root / "allocator" / "control.json").read_text())
+
+
+def test_attach_writes_the_allocator_control_from_the_mode(tmp_path, root):
+    fresh = tmp_path / "fresh"
+    (fresh / "carry").mkdir(parents=True)
+    (fresh / "strategies.json").write_text('[{"id": "carry", "unit": "calibrain-live@carry.service", "account": "demo-main"}]')
+    s = st.StrategyService(fresh, run=FakeSystemd(), clock=lambda: NOW, extra_units=(), dashboard_account="demo-main")
+    s.attach_allocator(make_alloc(fresh))  # no allocator dir yet: MANUAL, so the loop must start paused, not on its default
+    assert alloc_ctl(fresh)["enabled"] is False and s.allocator_available
+    s2 = svc(root, FakeSystemd(), mode="llm", allocator=False)
+    s2._mode = None  # the fixture has the allocator switched on: derived mode is LLM DECIDES
+    s2.attach_allocator(make_alloc(root))
+    assert alloc_ctl(root)["enabled"] is True
+
+
+def test_mode_switches_always_write_the_allocator_control(tmp_path):
+    fresh = tmp_path / "fresh"
+    (fresh / "carry").mkdir(parents=True)
+    (fresh / "strategies.json").write_text('[{"id": "carry", "unit": "calibrain-live@carry.service", "account": "demo-main"}]')
+    s = svc(fresh, FakeSystemd(), mode="llm")
+    run(s.set_mode("manual", venue="demo", bot_open=False))
+    assert alloc_ctl(fresh)["enabled"] is False
+
+
+def test_allocator_loop_writes_strategy_controls_only_in_llm_mode(root):
+    s = svc(root, FakeSystemd(), mode="llm")
+    alloc = make_alloc(root)
+    s.attach_allocator(alloc)
+    before = read_ctl(root, "carry")
+    run(s.set_mode("manual", venue="demo", bot_open=False))  # allocator paused
+    run(alloc._tick())
+    assert read_ctl(root, "carry") == before  # untouched while paused
+    run(s.set_mode("llm", venue="demo", bot_open=False))
+    run(s.auto(True, None, llm_trading=False, venue="demo"))  # allocator on, runner started
+    run(s.allocator_act("decide_now"))
+    assert alloc_ctl(root)["decide_now"] is True
+    run(alloc._tick())  # the loop: decide_now handled
+    assert alloc_ctl(root)["decide_now"] is False
+    ctl = read_ctl(root, "carry")
+    assert ctl["weight"] == 0.8 and ctl["set_by"] == "llm" and ctl["reason"] == "fake: carry only"
+    assert read_ctl(root, "trend")["owner_lock"] is True and read_ctl(root, "trend")["weight"] == 0.0  # the owner's choice stands
+    doc = run(s.snapshot(force=True))
+    first = doc["allocator"]["decisions"][0]
+    assert first["trigger"] == "decide_now" and first["reasoning"] == "fake: carry only" and "inputs" not in first
+    assert doc["allocator"]["status"]["model"] == "fake-model" and doc["allocator"]["status"]["state"] == "running"
