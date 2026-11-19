@@ -6,11 +6,18 @@ weights. This module turns them, together with the decider's probabilities, into
 
   1. every forecast is clipped to an annual Sharpe of +-sharpe_cap: |mu| <= cap * sigma_d / sqrt(365)
   2. mu_s = sum_k W_sk mu_sk (weights renormalised over the forecasters that have a value)
-  3. w* = argmax over 0 <= w <= 1 of  sum_s w_s mu_s - gamma/2 w'Sigma w - sum_s k_s |w_s - w_prev_s|
-     with k_s = c_s G_s / H (round-trip-free cost per side, amortised over the holding horizon H days),
-     by proximal gradient (soft-threshold around w_prev, then clip to the box), deterministic
+  3. core plus tilt (the target): the core is the static inverse-volatility mix, w_s = min(1, k / sigma_s) with k
+     the largest scale at which the portfolio volatility is within the cap. The forecast only tilts it:
+     SR_s = mu_s 365 / (sigma_d_s sqrt(365)), tau_s = clip(SR_s / SR_full, -T_eff, +T_eff), T_eff = T kappa,
+     target_s = clip(core_s (1 + tau_s), 0, 1). With tau = 0 the target is the core exactly.
+     The tilt has to earn its room: kappa is 0 until the shadow tilted book has beaten the core book (see
+     kappa_for_skill), so the live weights are the core. The tilted target at full T is still computed and
+     logged as the shadow.
   4. the rules, in order: vol cap, buffer, step, decider veto, exploration floor, then the drawdown
      floor and owner_lock, which override everything (see apply_rules)
+
+solve_weights, the mean-variance optimiser of the first version (w* = argmax mu'w - gamma/2 w'Sigma w - cost
+term), is kept for the comparison and no longer used for the target.
 
 All returns are daily fractions (0.001 = 10 bp), all weights are fractions of a strategy's virtual book.
 Units for display: annual % = daily * 365 * 100, annual sigma % = sigma_d * sqrt(365) * 100.
@@ -80,7 +87,72 @@ def combine(mu: Mapping[str, float | None], weights: Mapping[str, float]) -> flo
     return num / den if den > 0 else None
 
 
-# ---------------------------------------------------------------------------------- optimiser
+# ---------------------------------------------------------------------------------- core plus tilt
+@dataclass(frozen=True)
+class TiltParams:
+    """The tilt constants. t_eff = t_max * kappa; kappa in [0, 1] is the tilt room the forecast has earned
+    (forecast/scores.json `kappa`, forwarded in forecast/latest.json; 0 at the start and whenever it is missing)."""
+    sr_full: float = 1.0   # a forecast Sharpe of this much gives the full tilt
+    t_max: float = 0.5     # T: the largest tilt, as a fraction of the core weight
+    kappa: float = 0.0
+
+    @property
+    def t_eff(self) -> float:
+        return max(0.0, self.t_max) * min(1.0, max(0.0, self.kappa))
+
+
+def forecast_sharpe(mu_d: float, sigma_d: float) -> float:
+    """SR = mu 365 / (sigma_d sqrt(365)): the annual forecast return over the annual volatility."""
+    return mu_d * DAYS / (sigma_d * math.sqrt(DAYS)) if sigma_d > 0 else 0.0
+
+
+def tilt_tau(sr: float, params: TiltParams) -> float:
+    """tau = clip(SR / SR_full, -T_eff, +T_eff)."""
+    t = params.t_eff
+    return min(t, max(-t, sr / params.sr_full)) if params.sr_full > 0 else 0.0
+
+
+def core_weights(sigma: Sequence[float], cov: Sequence[Sequence[float]], vol_cap: float, n: int | None = None) -> list[float]:
+    """The static inverse-volatility mix: w_s = min(1, k / sigma_s), k the largest scale at which
+    portfolio_vol_ann(w, cov, n) is at most vol_cap (all at 1 when even that is under it). Bisection, the
+    volatility rises with k. Needs sigma_s > 0; `cov` is in the order of `sigma`."""
+    if not sigma:
+        return []
+
+    def mix(k: float) -> list[float]:
+        return [min(1.0, k / x) for x in sigma]
+
+    hi = max(sigma)
+    if portfolio_vol_ann(mix(hi), cov, n) <= vol_cap:
+        return mix(hi)
+    lo = 0.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if portfolio_vol_ann(mix(mid), cov, n) <= vol_cap else (lo, mid)
+    return mix(lo)
+
+
+def tilted_target(core: Sequence[float], tau: Sequence[float]) -> list[float]:
+    """target_s = core_s (1 + tau_s), kept inside the box 0 <= w <= 1."""
+    return [min(1.0, max(0.0, c * (1.0 + t))) for c, t in zip(core, tau)]
+
+
+KAPPA_STEPS = (0.0, 0.5, 1.0)
+
+
+def kappa_for_skill(skill_90: float | None, skill_180: float | None) -> float:
+    """The tilt room the shadow tilt skill has earned (mean daily return of the shadow tilted book minus the core book):
+    1.0 when the last 90 days and the last 180 days are both positive, 0.5 when the last 90 days are positive,
+    else 0. None (fewer days than the window) and an exact zero do not count as positive, so kappa is 0 until 90
+    days exist. It goes back down by the same rules when the means turn negative."""
+    pos90 = skill_90 is not None and skill_90 > 0
+    pos180 = skill_180 is not None and skill_180 > 0
+    if pos90 and pos180:
+        return KAPPA_STEPS[2]
+    return KAPPA_STEPS[1] if pos90 else KAPPA_STEPS[0]
+
+
+# ---------------------------------------------------------------------------------- optimiser (kept for the comparison)
 def portfolio_vol_ann(w: Sequence[float], cov: Sequence[Sequence[float]], n: int | None = None) -> float:
     """sqrt(365 w'Sigma w) / N: the books are equal in size, so the portfolio is the average of the
     weighted books."""
@@ -119,12 +191,12 @@ def solve_weights(mu: Sequence[float], cov: Sequence[Sequence[float]], w_prev: S
 
 
 # ---------------------------------------------------------------------------------- rules
-def apply_rules(ids: Sequence[str], w_star: Mapping[str, float], w_prev: Mapping[str, float],
+def apply_rules(ids: Sequence[str], w_target: Mapping[str, float], w_prev: Mapping[str, float],
                 cov: Sequence[Sequence[float]], p: Mapping[str, float | None], params: RuleParams, *,
                 floored: Sequence[str] = (), locked: Sequence[str] = ()) -> tuple[dict[str, float], list[dict[str, Any]]]:
     """The six rules in order. `ids` is the order of `cov`. Returns (final weights, steps); each step is
     {"step", "before", "after", "changed"} so the log shows what every rule did."""
-    w = {i: float(w_star[i]) for i in ids}
+    w = {i: float(w_target[i]) for i in ids}
     steps: list[dict[str, Any]] = []
 
     def record(name: str, after: dict[str, float], extra: dict[str, Any] | None = None) -> None:
@@ -163,11 +235,21 @@ def sigma_ann_pct(sigma_d: float) -> float:
     return sigma_d * math.sqrt(DAYS) * 100.0
 
 
-def reason_line(sid: str, mu_combined: float, sigma_d: float, w_star: float, w_final: float, binding: Sequence[str],
-                regime: str | None = None) -> str:
-    """One plain line for the card, e.g.
-    "trend: mu +6.1%/yr (regime up_calm 0.62), sigma 18%, w* 0.41 -> 0.35 after step cap"."""
-    reg = f" ({regime})" if regime else ""
-    line = f"{sid}: mu {ann_pct(mu_combined):+.1f}%/yr{reg}, sigma {sigma_ann_pct(sigma_d):.0f}%, w* {w_star:.2f} -> {w_final:.2f}"
-    names = [STEP_LABELS[b] for b in binding]
-    return line + (f" after {', '.join(names)}" if names else "")
+def reason_line(sid: str, core: float, tau: float, sr: float, w_target: float, w_final: float, binding: Sequence[str],
+                regime: str | None = None, kappa: float = 0.0, shadow_tau: float | None = None) -> str:
+    """One plain line for the card. With no tilt room (kappa 0) the weight is the core and the tilt is shown as a shadow:
+    "trend: core 0.42 (tilt in shadow, +18%, earns live control after 90 days ahead of core) -> 0.25 after step cap".
+    With room: "trend: core 0.42, tilt +18% (SR +0.36), w 0.50 -> 0.45 after step cap [tilt room 0.50]"."""
+    if kappa <= 0.0:
+        st = tau if shadow_tau is None else shadow_tau
+        line = f"{sid}: core {core:.2f} (tilt in shadow, {st * 100:+.0f}%, earns live control after 90 days ahead of core)"
+    else:
+        line = f"{sid}: core {core:.2f}, tilt {tau * 100:+.0f}% (SR {sr:+.2f}), w {w_target:.2f}"
+    if abs(w_final - w_target) > 0.005 or binding:
+        line += f" -> {w_final:.2f}"
+        names = [STEP_LABELS[b] for b in binding]
+        if names:
+            line += f" after {', '.join(names)}"
+    if 0.0 < kappa < 1.0:
+        line += f" [tilt room {kappa:.2f}]"
+    return line + (f" ({regime})" if regime else "")

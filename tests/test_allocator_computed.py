@@ -54,7 +54,7 @@ async def market():
 
 
 def forecast(made_s, **over):
-    f = {"date": "2026-11-19", "made_ms": int(made_s * 1000),
+    f = {"date": "2026-11-19", "made_ms": int(made_s * 1000), "kappa": 1.0,   # full tilt room: the tests below look at the tilt; kappa 0 has its own tests
          "strategies": {
              "trend": {"sigma_d": SIGMA, "mu": {"base": 0.002, "regime": 0.0002, "ridge": 0.0}, "own_mom": 0.1, "n_days": 900},
              "carry": {"sigma_d": SIGMA, "mu": {"structural": -0.0004, "base": -0.0004, "regime": -0.0004, "ridge": -0.0004}, "own_mom": 0.0, "n_days": 900},
@@ -105,19 +105,33 @@ def lines(root):
 
 # expected numbers, by hand: trend base 2e-3 is above the Sharpe cap (1.57e-3) and is clipped; decider p 0.5 adds 0
 TREND_MU = 0.3 * CAP + 0.25 * 0.0002
-COST = 0.001 / 7                                  # 10 bp per side, G 1, H 7 days
-TREND_STAR = (TREND_MU - COST) / (2 * SIGMA ** 2)
+CARRY_MU = -0.0004 * 0.75                         # carry: the four forecasters at -4e-4 carry 0.75 of the weight, the decider 0 at p 0.5
+# core: two equal-sigma books, the inverse-vol mix is one scale c with sqrt(365 x 2 sigma^2 c^2) / 2 = 10%
+CORE = 0.10 * 2 / math.sqrt(365 * 2 * SIGMA ** 2)
+TREND_SR = TREND_MU * math.sqrt(365) / SIGMA      # about +0.50: inside the +-1 full-tilt scale, tau = SR
+CARRY_SR = CARRY_MU * math.sqrt(365) / SIGMA
+TREND_TARGET = CORE * (1 + min(0.5, TREND_SR))
+CARRY_TARGET = CORE * (1 + max(-0.5, CARRY_SR))
+# the tilt lifts the portfolio volatility over the cap (trend up more than carry down), so the vol cap scales both
+VOL_FACTOR = min(1.0, 0.10 / (math.sqrt(365 * SIGMA ** 2 * (TREND_TARGET ** 2 + CARRY_TARGET ** 2)) / 2))
 
 
 def test_decide_now_sets_weights_and_logs_the_breakdown(root):
     a = make(root)
     rec = decide(a, trigger="decide_now")
     assert rec["weights_mode"] == "computed" and rec["error"] is None
-    assert rec["w_star"]["trend"] == pytest.approx(TREND_STAR, abs=1e-6) and 0.45 < TREND_STAR < 0.5
-    # trend prev 0.2 -> w* 0.47: the vol cap (9%/yr) and buffer pass, the step cap holds it to 0.2 + 0.25
+    assert rec["core"]["trend"] == pytest.approx(CORE, abs=1e-6) == pytest.approx(rec["core"]["carry"], abs=1e-6)
+    assert rec["sr"]["trend"] == pytest.approx(TREND_SR, abs=1e-3) and rec["tau"]["trend"] == pytest.approx(min(0.5, TREND_SR), abs=1e-5)
+    assert rec["w_target"]["trend"] == pytest.approx(TREND_TARGET, abs=1e-5) and 0.5 < TREND_TARGET < 0.6
+    assert rec["kappa"] == 1.0 and rec["t_eff"] == 0.5
+    # the tilt (trend +50%, carry -29%) lifts the volatility over the 10% cap: the vol cap scales both, 0.55 -> 0.47 for trend
+    assert VOL_FACTOR < 1 and rec["steps"][0]["factor"] == pytest.approx(VOL_FACTOR, abs=1e-5)
+    # trend prev 0.2: the buffer passes, the step cap holds it to 0.2 + 0.25
+    assert TREND_TARGET * VOL_FACTOR > 0.45
     assert rec["w_final"]["trend"] == pytest.approx(0.45) and ctl(root, "trend")["weight"] == pytest.approx(0.45)
-    # carry forecasts are negative: w* 0, step down is unlimited, the exploration floor lifts it to 0.10 (testnet or demo)
-    assert rec["w_star"]["carry"] == 0.0 and rec["w_final"]["carry"] == 0.10 and ctl(root, "carry")["enabled"] is True
+    # carry forecasts are negative: tilt -29%, 0.5 -> 0.22 (down is unlimited), above the exploration floor
+    assert rec["tau"]["carry"] == pytest.approx(max(-0.5, CARRY_SR), abs=1e-5) and rec["tau"]["carry"] < -0.25
+    assert rec["w_final"]["carry"] == pytest.approx(CARRY_TARGET * VOL_FACTOR, abs=1e-4) and ctl(root, "carry")["enabled"] is True
     # xsmom has no forecast: held at its weight, and said so
     assert rec["w_final"]["xsmom"] == 0.3 and ctl(root, "xsmom")["weight"] == 0.3 and "xsmom" in rec["no_forecast"]
     # the full breakdown
@@ -126,10 +140,11 @@ def test_decide_now_sets_weights_and_logs_the_breakdown(root):
     assert line["mu"]["trend"]["decider"] == 0.0 and line["clipped"]["trend"] == ["base"]
     assert line["sigma_d"]["trend"] == SIGMA and line["p_decider"]["trend"] == 0.5
     assert [s["step"] for s in line["steps"]] == ["vol_cap", "buffer", "step", "veto", "explore_floor", "floor_lock"]
-    assert line["steps"][-2]["before"]["carry"] == 0.0 and line["steps"][-2]["after"]["carry"] == 0.10
+    assert line["steps"][-2]["before"]["carry"] == line["steps"][-2]["after"]["carry"] > 0.10   # the floor is not binding
     assert line["answers"]["p"]["trend"] == 0.5 and line["trigger"] == "decide_now"
     reason = line["reasons"]["trend"]
-    assert reason.startswith("trend: mu +") and "(regime up_calm 0.62)" in reason and f"w* {TREND_STAR:.2f} -> 0.45 after step cap" in reason
+    assert reason.startswith(f"trend: core {CORE:.2f}, tilt +50% (SR +0.") and "(regime up_calm 0.62)" in reason
+    assert f"w {TREND_TARGET:.2f} -> 0.45 after vol cap, step cap" in reason
     assert ctl(root, "trend")["reason"] == reason and ctl(root, "trend")["set_by"] == "llm"
     assert a.status()["weights_mode"] == "computed" and a.status()["last_weights_ms"] == int(T0 * 1000)
 
@@ -166,7 +181,7 @@ def test_hourly_tick_only_refreshes_the_decider(root):
     assert rec["weights_mode"] == "refresh" and rec["applied"] == {i: False for i in IDS}
     assert {i: (root / i / "control.json").read_bytes() for i in IDS} == before
     assert json.loads((root / "allocator" / "state.json").read_text())["p_hist"]["trend"][0][1] == 0.5
-    assert "w_star" not in lines(root)[-1] and lines(root)[-1]["answers"]["p"]["carry"] == 0.5  # forecast.py score reads these
+    assert "w_target" not in lines(root)[-1] and lines(root)[-1]["answers"]["p"]["carry"] == 0.5  # forecast.py score reads these
 
 
 def test_weights_are_set_in_the_2350_slot_not_before(root):
@@ -199,7 +214,7 @@ def test_stale_forecast_holds_weights_and_reports_the_error(root):
     before = {i: (root / i / "control.json").read_bytes() for i in IDS}
     a = make(root)
     rec = decide(a, trigger="decide_now")
-    assert rec["weights_mode"] == "held" and "40.0 h old" in rec["error"] and "w_star" not in rec
+    assert rec["weights_mode"] == "held" and "40.0 h old" in rec["error"] and "w_target" not in rec
     assert {i: (root / i / "control.json").read_bytes() for i in IDS} == before
     st = a.status()
     assert st["state"] == "error" and "40.0 h old" in st["last_error"] and st["forecast"]["state"] == "stale" and st["weights_mode"] == "held"
@@ -241,10 +256,11 @@ def test_owner_lock_is_never_touched(root):
 
 
 def test_buffer_keeps_a_small_change_out(root):
-    put(root / "trend" / "control.json", {"enabled": True, "weight": TREND_STAR - 0.05, "owner_lock": False})
+    want = TREND_TARGET * VOL_FACTOR
+    put(root / "trend" / "control.json", {"enabled": True, "weight": want - 0.05, "owner_lock": False})
     rec = decide(make(root), trigger="decide_now")
-    assert rec["w_final"]["trend"] == pytest.approx(TREND_STAR - 0.05, abs=1e-4)
-    assert "after buffer" in rec["reasons"]["trend"]
+    assert rec["w_final"]["trend"] == pytest.approx(want - 0.05, abs=1e-4)
+    assert "after vol cap, buffer" in rec["reasons"]["trend"]
 
 
 def test_decider_outage_does_not_stop_the_daily_weights(root):
@@ -255,13 +271,68 @@ def test_decider_outage_does_not_stop_the_daily_weights(root):
     assert ctl(root, "trend")["weight"] > 0.3
 
 
-def test_gross_exposure_raises_the_trading_cost(root):
+def test_trading_cost_and_gross_exposure_no_longer_move_the_target(root):
+    base = decide(make(root), dry_run=True, trigger="cli")["w_target"]
     put(root / "trend" / "control.json", {"enabled": True, "weight": 0.5, "owner_lock": False})
-    pos = [{"symbol": "BTCUSDT", "qty": 1.0, "mark_price": 1000.0}]   # 1000 gross on 1000 equity at weight 0.5: G = 2 at weight 1
+    pos = [{"symbol": "BTCUSDT", "qty": 1.0, "mark_price": 1000.0}]   # 1000 gross on 1000 equity at weight 0.5
     put(root / "trend" / "status.json", {"state": "running", "equity_usdt": 1000.0, "start_equity_usdt": 1000.0, "positions": pos})
-    rec = decide(make(root), trigger="decide_now")
-    assert rec["cost_per_day"]["trend"] == pytest.approx(2 * COST) and rec["cost_per_day"]["carry"] == pytest.approx(1.6 * COST)  # carry 16 bp
+    rec = decide(make(root), dry_run=True, trigger="cli")
+    assert rec["w_target"] == base and "cost_per_day" not in rec and "w_star" not in rec
     assert A.gross_per_unit([], 1000.0, 0.5) is None and A.gross_per_unit(pos, 1000.0, 0.05) is None
+
+
+def test_kappa_in_the_forecast_file_narrows_the_tilt(root):
+    f = forecast(T0 - 2 * 3600, kappa=0.5)
+    put(root / "forecast" / "latest.json", f)
+    rec = decide(make(root), dry_run=True, trigger="cli")
+    assert rec["kappa"] == 0.5 and rec["t_eff"] == 0.25
+    assert rec["tau"]["trend"] == pytest.approx(0.25) and rec["tau"]["carry"] == pytest.approx(-0.25)
+    assert "[tilt room 0.50]" in rec["reasons"]["trend"]
+    f["kappa"] = 7.0   # out of range: clipped to 1
+    put(root / "forecast" / "latest.json", f)
+    assert decide(make(root), dry_run=True, trigger="cli")["kappa"] == 1.0
+    f["kappa"] = "n/a"  # unreadable: no room
+    put(root / "forecast" / "latest.json", f)
+    assert decide(make(root), dry_run=True, trigger="cli")["kappa"] == 0.0
+
+
+def test_with_no_kappa_the_live_weight_is_the_core_and_the_tilt_is_a_shadow(root):
+    f = forecast(T0 - 2 * 3600)
+    del f["kappa"]                                    # the start: nothing earned
+    put(root / "forecast" / "latest.json", f)
+    rec = decide(make(root), trigger="decide_now")
+    assert rec["kappa"] == 0.0 and rec["t_eff"] == 0.0 and rec["tau"] == {"trend": 0.0, "carry": 0.0}
+    assert rec["w_target"] == pytest.approx(rec["core"]) and rec["core"]["trend"] == pytest.approx(CORE, abs=1e-6)
+    # the shadow is the tilted target at full T 0.5
+    assert rec["shadow_tau"]["trend"] == pytest.approx(min(0.5, TREND_SR), abs=1e-5) and rec["shadow_tau"]["carry"] == pytest.approx(max(-0.5, CARRY_SR), abs=1e-5)
+    assert rec["shadow_w_target"]["trend"] == pytest.approx(TREND_TARGET, abs=1e-5) and rec["shadow_w_target"]["carry"] == pytest.approx(CARRY_TARGET, abs=1e-5)
+    line = lines(root)[-1]
+    assert line["shadow_tau"] == rec["shadow_tau"] and line["shadow_w_target"] == rec["shadow_w_target"] and line["kappa"] == 0.0
+    # live: the core at the cap, trend prev 0.2 steps up to 0.37 (inside the 0.25 step), carry 0.5 down to 0.37
+    assert rec["steps"][0]["factor"] == pytest.approx(1.0, abs=1e-6)
+    assert rec["w_final"]["trend"] == pytest.approx(CORE, abs=1e-4) and rec["w_final"]["carry"] == pytest.approx(CORE, abs=1e-4)
+    assert rec["reasons"]["trend"].startswith(f"trend: core {CORE:.2f} (tilt in shadow, +50%, earns live control after 90 days ahead of core)")
+    assert "tilt room" not in rec["reasons"]["trend"] and "(regime up_calm 0.62)" in rec["reasons"]["trend"]
+    assert ctl(root, "trend")["reason"] == rec["reasons"]["trend"]
+
+
+def test_the_shadow_does_not_change_with_kappa(root):
+    shadows = []
+    for k in (0.0, 0.5, 1.0):
+        put(root / "forecast" / "latest.json", forecast(T0 - 2 * 3600, kappa=k))
+        r = decide(make(root), dry_run=True, trigger="cli")
+        shadows.append((r["shadow_tau"], r["shadow_w_target"]))
+    assert shadows[0] == shadows[1] == shadows[2]
+
+
+def test_zero_forecast_leaves_the_core_untouched(root):
+    f = forecast(T0 - 2 * 3600)
+    for s_ in f["strategies"].values():
+        s_["mu"] = {k: 0.0 for k in s_["mu"]}
+    put(root / "forecast" / "latest.json", f)
+    rec = decide(make(root), dry_run=True, trigger="cli")   # p 0.5: the decider adds 0 as well
+    assert rec["tau"] == {"trend": 0.0, "carry": 0.0} and rec["w_target"] == pytest.approx(rec["core"])
+    assert rec["steps"][0]["factor"] == pytest.approx(1.0, abs=1e-6)  # the core is at the cap and no tilt pushes it over
 
 
 def test_dry_run_writes_nothing_and_prints_the_table(root):
@@ -269,7 +340,7 @@ def test_dry_run_writes_nothing_and_prints_the_table(root):
     rec = decide(make(root), dry_run=True, trigger="cli")
     assert {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()} == snap
     table = A.format_table(rec)
-    for token in ("trend", "carry", "xsmom", "combined", "w*", "reasons:", "regime up_calm 0.62", "weights_mode computed"):
+    for token in ("trend", "carry", "xsmom", "combined", "core", "tilt", "target", "reasons:", "regime up_calm 0.62", "weights_mode computed"):
         assert token in table
 
 

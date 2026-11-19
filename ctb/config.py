@@ -122,7 +122,10 @@ class Settings:
     allocator_winner_min_p: float = _f("CTB_ALLOCATOR_WINNER_MIN_P", 0.55)
     allocator_winner_weight: float = _f("CTB_ALLOCATOR_WINNER_WEIGHT", 0.5)
 
-    # --- computed allocator (ctb/allocator_math.py, docs/allocator.md): mean-variance weights from forecast/latest.json ---
+    # --- computed allocator (ctb/allocator_math.py, docs/allocator.md): core plus tilt from forecast/latest.json ---
+    allocator_tilt_max: float = _f("CTB_ALLOCATOR_TILT_MAX", 0.5)          # T: the forecast tilts the core weight by at most +-T (times kappa)
+    allocator_tilt_sr_full: float = _f("CTB_ALLOCATOR_TILT_SR_FULL", 1.0)  # a forecast annual Sharpe of this gives the full tilt
+    # the next four belong to the mean-variance optimiser, kept for the comparison; the target no longer uses them
     allocator_gamma: float = _f("CTB_ALLOCATOR_GAMMA", 2.0)                # risk aversion; alone w = mu / (gamma sigma^2), 2 is half Kelly
     allocator_horizon_days: float = _f("CTB_ALLOCATOR_HORIZON_DAYS", 7.0)  # H: trading costs are amortised over this many days
     allocator_cost_bp: float = _f("CTB_ALLOCATOR_COST_BP", 10.0)           # c_s per side
