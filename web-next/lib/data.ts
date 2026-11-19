@@ -14,6 +14,9 @@ export async function loadOverview() {
 export async function loadStrat() {
   setState({ strat: await api("/api/strategies") });
 }
+export async function loadPredictions() {
+  setState({ pred: await api("/api/predictions") });
+}
 export async function loadMonitor() {
   setState({ mon: await api("/api/monitor") });
 }

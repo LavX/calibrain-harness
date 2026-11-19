@@ -1,0 +1,20 @@
+{
+ "date": "2026-11-20",
+ "features": {
+  "btc_trend": 0.42,
+  "breadth": 0.61,
+  "vol_rank": 0.33,
+  "vol_ratio": -0.12,
+  "dispersion": 1.35,
+  "avg_corr": 0.58,
+  "funding_level": 0.082,
+  "funding_spread": 0.051
+ },
+ "state": "up_calm",
+ "p7": {
+  "up_calm": 0.62,
+  "up_wild": 0.2,
+  "down_calm": 0.1,
+  "down_wild": 0.08
+ }
+}

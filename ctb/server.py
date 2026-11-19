@@ -23,6 +23,7 @@ from .market.store import TIMEFRAMES
 from . import models as models_mod
 from . import runs as runs_mod
 from . import allocator as alloc_mod
+from . import predictions as pred_mod
 from . import strategies as strat_mod
 from . import universe as universe_mod
 from . import venue as venue_mod
@@ -96,6 +97,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     app = web.Application(middlewares=[dev_cors, same_origin_only])
     routes = web.RouteTableDef()
     strat = strategies_svc or strat_mod.StrategyService()
+    preds = pred_mod.PredictionsService(root=strat.root)
 
     @routes.get("/")
     async def index(_: web.Request) -> web.StreamResponse:
@@ -299,6 +301,11 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         doc["venue"] = venue_mod.name()
         doc["llm_trading_enabled"] = bool(s.trading_enabled)
         return j(doc)
+
+    @routes.get("/api/predictions")
+    async def predictions_get(_: web.Request) -> web.Response:
+        """The PREDICTIONS panel and scoreboard: regime, forecasts, scores, shadow history. Read-only, cached 30 s, tolerant of missing files."""
+        return j(await preds.snapshot())
 
     @routes.post("/api/strategies/{sid}/{action}")
     async def strategies_act(req: web.Request) -> web.Response:
