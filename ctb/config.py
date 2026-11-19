@@ -122,6 +122,29 @@ class Settings:
     allocator_winner_min_p: float = _f("CTB_ALLOCATOR_WINNER_MIN_P", 0.55)
     allocator_winner_weight: float = _f("CTB_ALLOCATOR_WINNER_WEIGHT", 0.5)
 
+    # --- computed allocator (ctb/allocator_math.py, docs/allocator.md): mean-variance weights from forecast/latest.json ---
+    allocator_gamma: float = _f("CTB_ALLOCATOR_GAMMA", 2.0)                # risk aversion; alone w = mu / (gamma sigma^2), 2 is half Kelly
+    allocator_horizon_days: float = _f("CTB_ALLOCATOR_HORIZON_DAYS", 7.0)  # H: trading costs are amortised over this many days
+    allocator_cost_bp: float = _f("CTB_ALLOCATOR_COST_BP", 10.0)           # c_s per side
+    allocator_carry_cost_bp: float = _f("CTB_ALLOCATOR_CARRY_COST_BP", 16.0)  # carry trades two legs
+    allocator_sharpe_cap: float = _f("CTB_ALLOCATOR_SHARPE_CAP", 1.5)      # every forecast clipped to this annual Sharpe
+    allocator_decider_k: float = _f("CTB_ALLOCATOR_DECIDER_K", 0.8)        # mu_decider = (2p - 1) * k * sigma_d
+    allocator_p_window: int = _i("CTB_ALLOCATOR_P_WINDOW", 24)             # p = mean of the decider's last N answers
+    allocator_vol_cap: float = _f("CTB_ALLOCATOR_VOL_CAP", 0.10)           # portfolio volatility cap, annual
+    allocator_buffer: float = _f("CTB_ALLOCATOR_BUFFER", 0.10)             # a weight change under this is not made
+    allocator_step_up: float = _f("CTB_ALLOCATOR_STEP_UP", 0.25)           # weight rises at most this much per day
+    allocator_veto_p: float = _f("CTB_ALLOCATOR_VETO_P", 0.40)             # decider p below this caps the weight ...
+    allocator_veto_factor: float = _f("CTB_ALLOCATOR_VETO_FACTOR", 0.5)    # ... at this fraction of the previous weight
+    allocator_explore_floor: float = _f("CTB_ALLOCATOR_EXPLORE_FLOOR", 0.10)  # minimum weight so every strategy keeps trading (0 disables)
+    allocator_explore_venues: list[str] = field(default_factory=lambda: [v.lower() for v in _list("CTB_ALLOCATOR_EXPLORE_VENUES", "demo,testnet")])
+    allocator_stale_h: float = _f("CTB_ALLOCATOR_STALE_H", 36.0)           # a forecast older than this: hold weights, report the error
+    allocator_weights_utc: str = os.environ.get("CTB_ALLOCATOR_WEIGHTS_UTC", "23:50")  # daily weight-setting time
+    # forecaster weights when forecast/latest.json carries none (the ledger's starting values); "carry" has its own row
+    allocator_start_weights: dict = field(default_factory=lambda: {
+        "default": {"base": 0.30, "regime": 0.25, "ridge": 0.20, "decider": 0.25},
+        "carry": {"structural": 0.40, "base": 0.15, "regime": 0.10, "ridge": 0.10, "decider": 0.25},
+    })
+
     # --- bracket geometry (multiples of decision-timeframe ATR) ---
     sl_atr: float = _f("CTB_SL_ATR", 1.5)
     tp_atr: float = _f("CTB_TP_ATR", 2.5)
