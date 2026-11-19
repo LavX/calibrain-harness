@@ -9,7 +9,7 @@ import os
 import random
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import aiohttp
 
@@ -69,6 +69,11 @@ class Engine:
         self.drift_state: dict[str, Any] = {}
         self.members: dict[str, SystemOneClient] = {}
         self.member_budgets: dict[str, RateBudget] = {}
+        # True while the live strategies (not this per-symbol bot) own the demo account. The server wires this to
+        # StrategyService.owns_account (the same check as the bot-only guard); standalone the bot always owns it.
+        self.strategies_own_account: Callable[[], bool] = lambda: False
+        self._bot_paused_noted = False
+        self._budget_warn_at = 0.0
 
     # ------------------------------------------------------------------ pub/sub
     def emit(self, kind: str, data: dict[str, Any]) -> None:
@@ -383,6 +388,8 @@ class Engine:
             self.emit("bar", {"symbol": symbol})
         if tf != self.s.decision_tf:
             return
+        if self._bot_paused():
+            return
         await asyncio.sleep(self.s.bar_settle_s)  # let the last trades of the closed bar arrive
         await self.decide(symbol)
 
@@ -435,13 +442,33 @@ class Engine:
         pct, _ = risk_pct_for(self.s, exploration=self.s.exploration_mode)
         return min(eq * pct / 100 / (sl_bp / 10000), self.s.max_notional_usdt, eq * self.s.max_leverage * 0.9)
 
+    def _bot_paused(self) -> bool:
+        """True while the strategies own the account: the per-symbol bot then makes no model decisions at all (no request, no
+        budget check, no warning). Logs one INFO event when it enters that state, not once per bar."""
+        try:
+            paused = bool(self.strategies_own_account())
+        except Exception:  # noqa: BLE001 - a failed look at the strategy files must not stop the bot's own loop
+            log.exception("strategies-own-account check failed")
+            return False
+        if paused and not self._bot_paused_noted:
+            msg = "per-symbol bot paused: strategies mode"
+            log.info(msg)
+            self.emit("event", self.db.event("info", "bot_paused", msg))
+        self._bot_paused_noted = paused
+        return paused
+
     async def decide(self, symbol: str, *, force_probe: bool = False) -> dict[str, Any] | None:
         if symbol in self.inflight:
             return None
         if not self.kairos.configured:
             return None
+        if self._bot_paused():
+            return None
         if not self.budget.try_take():
-            self.emit("event", self.db.event("warn", "budget", f"model hourly budget ({self.s.kairos_max_requests_per_hour}) exhausted; skipped {symbol}", symbol))
+            # at most one warning per hour, not one per symbol per bar (a budget of 0 is a deliberate setting)
+            if time.time() - self._budget_warn_at >= 3600:
+                self._budget_warn_at = time.time()
+                self.emit("event", self.db.event("warn", "budget", f"model hourly budget ({self.s.kairos_max_requests_per_hour}) exhausted; skipped {symbol} (further skips are not logged for an hour)", symbol))
             return None
         self.inflight.add(symbol)
         try:

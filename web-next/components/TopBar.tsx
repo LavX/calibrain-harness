@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { post } from "@/lib/api";
 import { loadOverview, selectSymbol, selectTf } from "@/lib/data";
 import { getState, setState, useStore } from "@/lib/store";
-import { age, short } from "@/lib/format";
+import { age, hhmm, short } from "@/lib/format";
 import { MODE_LABEL, headerAuto, switchMode, type StratDoc } from "./Strategies";
 
 const CITIES: [string, string][] = [["New York", "America/New_York"], ["London", "Europe/London"], ["Dubai", "Asia/Dubai"], ["Mumbai", "Asia/Kolkata"],
@@ -194,9 +194,10 @@ export async function setPosCap(v?: number) {
   }
 }
 
-const VIEWS = [["mon", "F1", "MON"], ["eval", "F2", "EVAL"], ["valid", "F6", "VALID"], ["strat", "F7", "STRATEGIES"], ["trades", "F3", "TRADES"], ["news", "F4", "NEWS"], ["log", "F5", "LOG"]] as const;
+const VIEWS = [["mon", "F1", "MON"], ["eval", "F2", "EVAL"], ["trades", "F3", "TRADES"], ["news", "F4", "NEWS"], ["log", "F5", "LOG"], ["valid", "F6", "VALID"], ["strat", "F7", "STRATEGIES"]] as const;
 
 export function FKeys() {
+  const bot = useBotMode();
   const view = useStore((s) => s.view);
   const st = useStore((s) => s.ov?.settings);
   return (
@@ -205,19 +206,23 @@ export function FKeys() {
         <button key={v} className={view === v ? "on" : ""} onClick={() => setState({ view: v })}><b>{k}</b>{l}</button>
       ))}
       <span className="fk-spacer" />
-      {st && (
-        <BotOnly className="tradetf-wrap"><span className="tradetf" data-tip="How often the model is asked and trades are decided. The chart buttons only change the view.">
-          <span className="tt-l">TRADE TF</span>
-          <span className="seg">
-            {Object.entries<any>(st.tf_profiles).map(([tf, p]) => (
-              <button key={tf} className={tf === st.decision_tf ? "on" : ""} onClick={() => setState({ modal: { kind: "tf", data: tf } })}
-                data-tip={`${p.label}: decide every ${p.label} close · hold ≤ ${p.horizon_minutes}m · stop from ${p.atr_tf}m ATR · ~${p.required_rph} model req/h`}>{p.label}</button>
-            ))}
-          </span>
-          <span className="tt-h">hold ≤ {st.horizon_minutes >= 60 ? `${st.horizon_minutes / 60}h` : `${st.horizon_minutes}m`} · stop {st.atr_tf}m ATR</span>
-        </span></BotOnly>
-      )}
-      {st && <ModelSwitch />}
+      {st && (bot ? (
+        <>
+          <BotOnly className="tradetf-wrap"><span className="tradetf" data-tip="How often the model is asked and trades are decided. The chart buttons only change the view.">
+            <span className="tt-l">TRADE TF</span>
+            <span className="seg">
+              {Object.entries<any>(st.tf_profiles).map(([tf, p]) => (
+                <button key={tf} className={tf === st.decision_tf ? "on" : ""} onClick={() => setState({ modal: { kind: "tf", data: tf } })}
+                  data-tip={`${p.label}: decide every ${p.label} close · hold ≤ ${p.horizon_minutes}m · stop from ${p.atr_tf}m ATR · ~${p.required_rph} model req/h`}>{p.label}</button>
+              ))}
+            </span>
+            <span className="tt-h">hold ≤ {st.horizon_minutes >= 60 ? `${st.horizon_minutes / 60}h` : `${st.horizon_minutes}m`} · stop {st.atr_tf}m ATR</span>
+          </span></BotOnly>
+          <ModelSwitch />
+        </>
+      ) : (
+        <span className="botchip" data-tip={`TRADE TF, hold and stop, and the MODEL picker only drive the per-symbol bot, which is observe-only in this mode. ${BOT_ONLY_TIP}`}>PER-SYMBOL BOT SETTINGS (inactive)</span>
+      ))}
       {st && <button className="kbtn stratbtn" onClick={() => setState({ modal: { kind: "strategy" } })}
         data-tip="Brackets, entries, mirror averaging, trade trigger, filters, sizing, drift action">STRATEGY</button>}
       <span className="venue">VENUE <b>{st?.venue_label || "BYBIT TESTNET"}</b> · SIGNALS <b>BYBIT MAINNET</b> · MODEL <b>{String(st?.model_id || "—").toUpperCase()}</b></span>
@@ -276,6 +281,9 @@ export function StatusLine() {
   const sock = useStore((s) => s.socket);
   const symbol = useStore((s) => s.symbol);
   const mon = useStore((s) => s.mon);
+  const strat = useStore((s) => s.strat) as StratDoc | null;
+  const predAt = useStore((s) => s.pred?.allocator?.t_ms ?? null) as number | null;
+  const bot = useBotMode();
   const now = useNow();
   if (!ov) return <footer className="statusline" />;
   const d = ov.data, k = ov.kairos, a = ov.account, st = ov.settings;
@@ -292,14 +300,34 @@ export function StatusLine() {
         <Dot c={sock.connected && stale !== null && stale < 3 ? "ok" : sock.connected ? "warn" : "bad"} />UI SOCKET <b>{sock.connected ? "LIVE" : "DOWN"}</b>
         {sock.latencyMs !== null && <> · <b>{sock.latencyMs.toFixed(0)}</b> ms</>}
       </span>
-      <span><Dot c={!k.configured ? "warn" : k.last_error ? "bad" : "ok"} />{String(k.label || "MODEL").toUpperCase()} <b>{k.configured ? (k.last_error ? "ERROR" : "READY") : "NO KEY"}</b> {k.requests_last_hour}/{k.budget_per_hour} req/h</span>
       <span><Dot c={ov.executor_error ? "bad" : a?.private_stream ? "ok" : "warn"} />{st?.venue_label?.replace("BYBIT ", "") || "TESTNET"} <b>{ov.executor_error ? "OFFLINE" : a?.private_stream ? "STREAMING" : "POLLING"}</b>{a?.last_sync ? ` · sync ${age(now / 1000 - a.last_sync)}` : ""}</span>
-      {ov.run && <span data-tip={ov.run.name}>RUN <b className="amb">{ov.run.id}</b></span>}
-      <span>MODE <b className={a?.trading_enabled ? "up" : ""}>{a?.trading_enabled ? "AUTO-TRADE" : "OBSERVE"}</b>{st.exploration_mode && <b className="amb"> · EXPLORE</b>}</span>
-      <span>TRADE TF <b className="amb">{st.tf_profiles[st.decision_tf]?.label || st.decision_tf}</b> · HOLD ≤ <b>{st.horizon_minutes}m</b></span>
-      <span>LABELLED <b>{ov.labelled_total}</b></span>
+      {bot ? (
+        <>
+          <span><Dot c={!k.configured ? "warn" : k.last_error ? "bad" : "ok"} />{String(k.label || "MODEL").toUpperCase()} <b>{k.configured ? (k.last_error ? "ERROR" : "READY") : "NO KEY"}</b> {k.requests_last_hour}/{k.budget_per_hour} req/h</span>
+          {ov.run && <span data-tip={ov.run.name}>RUN <b className="amb">{ov.run.id}</b></span>}
+          <span>MODE <b className={a?.trading_enabled ? "up" : ""}>{a?.trading_enabled ? "AUTO-TRADE" : "OBSERVE"}</b>{st.exploration_mode && <b className="amb"> · EXPLORE</b>}</span>
+          <span>TRADE TF <b className="amb">{st.tf_profiles[st.decision_tf]?.label || st.decision_tf}</b> · HOLD ≤ <b>{st.horizon_minutes}m</b></span>
+          <span>LABELLED <b>{ov.labelled_total}</b></span>
+        </>
+      ) : <StrategiesStatus doc={strat} predAt={predAt} />}
       <span>{short(symbol || "")} FUNDING IN <b>{fundTxt}</b></span>
       <span style={{ marginLeft: "auto" }} suppressHydrationWarning>UTC <b>{new Date(now).toISOString().slice(11, 19)}</b></span>
     </footer>
+  );
+}
+
+/** Status bar in LLM DECIDES and MANUAL: what the strategies are doing. The per-symbol bot's model, run, mode, trade TF and
+ * labelled count are left out because that bot is observe-only here and they would read as live trading state. */
+function StrategiesStatus({ doc, predAt }: { doc: StratDoc | null; predAt: number | null }) {
+  if (!doc) return <span>STRATEGIES <b>n/a</b></span>;
+  const running = doc.strategies.filter((s) => s.pill === "running").length;
+  const lastMs = doc.allocator?.status?.last_decision_ms ?? predAt;
+  return (
+    <span data-tip="Strategies that trade the demo account. The per-symbol bot is observe-only in this mode, so its model, run, mode and labelled count are not shown.">
+      STRATEGIES <b className={running ? "up" : ""}>{running}/{doc.strategies.length} running</b>
+      {" · "}AUTO <b className={doc.auto_on ? "up" : ""}>{doc.auto_on ? "ON" : "OFF"}</b>
+      {" · "}ALLOCATOR <b>{MODE_LABEL[doc.mode]}</b>
+      {" · "}LAST DECISION <b>{lastMs ? hhmm(lastMs / 1000) : "none yet"}</b>
+    </span>
   );
 }

@@ -104,6 +104,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     routes = web.RouteTableDef()
     strat = strategies_svc or strat_mod.StrategyService()
     preds = pred_mod.PredictionsService(root=strat.root)
+    engine.strategies_own_account = strat.owns_account  # the per-symbol bot makes no model decisions while the strategies own the account
 
     def bot_only() -> web.Response | None:
         """409 when the strategies own the demo account (mode is not "bot"); None when the old bot's settings may change."""

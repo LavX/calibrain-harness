@@ -4,6 +4,7 @@ import {
   createChart, type IChartApi, type ISeriesApi, type SeriesMarker, type Time, type UTCTimestamp,
 } from "lightweight-charts";
 import { setBarSink, useStore, type Bar } from "@/lib/store";
+import { useBotMode } from "./TopBar";
 import { cssVar, decimalsOf, fx, SERIES_C, sg, short, ud, usd } from "@/lib/format";
 
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number };
@@ -39,6 +40,7 @@ export function PriceChart() {
   const [pd, setPd] = useState(2);
   const mkt = useStore((s) => s.mkt);
   const decisions = useStore((s) => s.decisions);
+  const bot = useBotMode();
 
   useEffect(() => {
     const chart = createChart(host.current!, baseOpts() as any);
@@ -110,10 +112,12 @@ export function PriceChart() {
     });
   }, [mkt]);
 
-  // Kairos decision markers: a decision made just after a bar close describes that bar
+  // Kairos decision markers: a decision made just after a bar close describes that bar.
+  // Only in mode "bot": in LLM DECIDES and MANUAL the per-symbol bot is observe-only, and its LONG/SHORT arrows would read as live trades.
   useEffect(() => {
     const a = api.current;
     if (!a || !mkt?.bars?.length) return;
+    if (!bot) { a.candles.setMarkers([]); return; }
     const tfs = Number(mkt.tf) * 60, first = mkt.bars[0].time;
     const up = cssVar("--up"), dn = cssVar("--down");
     const marks: SeriesMarker<Time>[] = decisions
@@ -134,7 +138,7 @@ export function PriceChart() {
       else dedup.push(m);
     }
     a.candles.setMarkers(dedup);
-  }, [decisions, mkt]);
+  }, [decisions, mkt, bot]);
 
   const chg = ohlc ? ohlc.close - ohlc.open : 0;
   return (
