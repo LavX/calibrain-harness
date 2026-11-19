@@ -7,6 +7,13 @@ the most". Code maps the probabilities to weights: weight = clip((p - 0.5) / 0.1
 categorical winner is lifted to 0.5 when its own p > 0.55, enabled = weight > 0. Fallback: a chat
 model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that answers one JSON allocation directly.
 
+Computed weights (ctb/allocator_math.py): when <root>/forecast/latest.json exists (written daily by the
+prediction layer) the decider is only one forecaster. It is still asked every hour, p is the mean of its
+last 24 answers, and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: mean-variance
+optimum of the combined forecasts, then the vol cap, buffer, step, decider veto, exploration floor, the
+drawdown floor and owner_lock. A forecast older than 36 h holds the weights and reports the error in
+status.json. Without the file the decider-only mapping above applies and status.json says so.
+
 Each live strategy (carry, trend, xsmom, ...) has a virtual book and reads <root>/<id>/control.json
 every loop. This module is the only writer of the allocation part of those files ("enabled",
 "weight", "set_by", "reason"), unless the owner locked a strategy ("owner_lock": true).
@@ -19,7 +26,10 @@ Files under the live root (CTB_LIVE_ROOT, default <repo>/data/live):
   allocator/control.json     written by the dashboard: {"enabled", "interval_min", "decide_now"}
   allocator/status.json      written here (see Allocator.status)
   allocator/decisions.jsonl  one line per decision (also risk-floor actions and failed attempts)
-  allocator/state.json       equity samples and peaks, so P&L windows and drawdown survive restarts
+  allocator/state.json       equity samples and peaks, so P&L windows and drawdown survive restarts, the
+                             decider's last answers (p_hist) and when weights were last set
+  forecast/latest.json       written by the prediction layer (read only here)
+  regime/latest.json         the same (read only; shown in the one-line reasons)
 
 Hard rules, enforced in code whatever the model says:
   - a weight moves at most max_step (0.5) per decision;
@@ -56,6 +66,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
+from . import allocator_math as M
 from .config import ROOT, Settings
 from .kairos.allocator_prompt import REASONING_MAX_CHARS, build_messages, build_schema, retry_messages
 from .kairos.allocator_questions import (BEST_QID, NONE_ID, QUESTION_SET_VERSION, MappingParams, batches, build_questions,
@@ -262,6 +273,7 @@ class Current:
     weight: float
     owner_lock: bool
     drawdown_pct: float | None
+    gross: float | None = None   # gross exposure per unit of capital at weight 1 (None: unknown, 1 is used)
 
 
 @dataclass
@@ -299,6 +311,187 @@ def resolve(current: dict[str, Current], proposal: Decision | None, *, max_step:
         enabled[i], weights[i] = e, round(w, 4)
     return Plan(enabled, weights, [i for i in floored if i not in locked],
                 [i for i in step_limited if i not in floored and i not in locked], locked)
+
+
+def gross_per_unit(positions: list[dict[str, Any]], equity: float | None, weight: float, min_weight: float = 0.10) -> float | None:
+    """G_s: the book's gross exposure per unit of capital at weight 1. status.json positions over equity,
+    divided by the weight, because the runner scales the book's targets by it. Below min_weight the
+    scaling is too noisy to undo, and with no positions there is nothing to measure: None (caller uses 1)."""
+    if equity is None or equity <= 0 or weight < min_weight or not positions:
+        return None
+    gross = sum(abs((_num(p.get("qty")) or 0.0) * (_num(p.get("mark_price")) or _num(p.get("entry_price")) or 0.0)) for p in positions)
+    return gross / equity / weight if gross > 0 else None
+
+
+# ---------------------------------------------------------------------------------- computed layer: settings and files
+@dataclass(frozen=True)
+class Calc:
+    """The constants of the computed weights, from ctb/config.py Settings (tests pass their own)."""
+    gamma: float = 2.0
+    horizon_days: float = 7.0
+    cost_bp: float = 10.0
+    carry_cost_bp: float = 16.0
+    sharpe_cap: float = 1.5
+    decider_k: float = 0.8
+    p_window: int = 24
+    stale_h: float = 36.0
+    weights_utc: tuple[int, int] = (23, 50)
+    rules: M.RuleParams = M.RuleParams()
+    start_weights: Any = None   # {"default": {...}, "<id>": {...}}
+
+    @staticmethod
+    def from_settings(s: Settings) -> "Calc":
+        from .config import _venue_name
+        try:
+            hh, mm = (int(x) for x in s.allocator_weights_utc.split(":"))
+            if not (0 <= hh < 24 and 0 <= mm < 60):
+                raise ValueError
+        except ValueError:
+            hh, mm = 23, 50
+        try:
+            floor = s.allocator_explore_floor if _venue_name() in s.allocator_explore_venues else 0.0
+        except Exception:  # noqa: BLE001 - an unreadable venue setting must not stop the allocator
+            floor = 0.0
+        return Calc(gamma=s.allocator_gamma, horizon_days=s.allocator_horizon_days, cost_bp=s.allocator_cost_bp,
+                    carry_cost_bp=s.allocator_carry_cost_bp, sharpe_cap=s.allocator_sharpe_cap, decider_k=s.allocator_decider_k,
+                    p_window=max(1, s.allocator_p_window), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
+                    rules=M.RuleParams(vol_cap=s.allocator_vol_cap, buffer=s.allocator_buffer, step_up=s.allocator_step_up,
+                                       veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, explore_floor=floor),
+                    start_weights=s.allocator_start_weights)
+
+    def cost(self, sid: str) -> float:
+        """c_s as a return fraction per side."""
+        return (self.carry_cost_bp if sid == "carry" else self.cost_bp) / 1e4
+
+    def start(self, sid: str) -> dict[str, float]:
+        sw = self.start_weights or {}
+        return dict(sw.get(sid) or sw.get("default") or {})
+
+
+@dataclass
+class Forecast:
+    state: str                     # "missing" | "invalid" | "stale" | "fresh"
+    data: dict[str, Any] | None = None
+    date: str | None = None
+    made_ms: int | None = None
+    age_h: float | None = None
+    note: str = ""
+
+    @property
+    def error(self) -> str | None:
+        """What the status shows as an error: a forecast that exists but cannot be used. A missing file is a mode, not an error."""
+        return self.note if self.state in ("invalid", "stale") else None
+
+    def info(self) -> dict[str, Any]:
+        return {"state": self.state, "date": self.date, "made_ms": self.made_ms,
+                "age_h": None if self.age_h is None else round(self.age_h, 2), "note": self.note}
+
+
+def read_forecast(root: Path, now_ms: int, stale_h: float) -> Forecast:
+    path = root / "forecast" / "latest.json"
+    if not path.exists():
+        return Forecast("missing", note="forecast/latest.json is missing: weights come from the decider alone")
+    raw = read_json(path)
+    made = _num(raw.get("made_ms")) if isinstance(raw, dict) else None
+    if not isinstance(raw, dict) or not isinstance(raw.get("strategies"), dict) or made is None:
+        return Forecast("invalid", note="forecast/latest.json is unreadable or incomplete: weights held")
+    age = max(0.0, (now_ms - made) / 3_600_000)
+    date = raw.get("date") if isinstance(raw.get("date"), str) else None
+    if age > stale_h:
+        return Forecast("stale", raw, date, int(made), age, f"forecast is {age:.1f} h old (limit {stale_h:g} h): weights held")
+    return Forecast("fresh", raw, date, int(made), age)
+
+
+def latest_weights_slot_ms(now_ms: int, hh: int, mm: int) -> int:
+    """The most recent hh:mm UTC at or before now."""
+    day0 = now_ms - now_ms % DAY_MS
+    slot = day0 + (hh * 60 + mm) * 60_000
+    return slot if slot <= now_ms else slot - DAY_MS
+
+
+def regime_text(root: Path) -> str | None:
+    r = read_json(root / "regime" / "latest.json")
+    if not isinstance(r, dict) or not isinstance(r.get("state"), str):
+        return None
+    p7 = r.get("p7") if isinstance(r.get("p7"), dict) else {}
+    pr = _num(p7.get(r["state"]))
+    return f"regime {r['state']}" + ("" if pr is None else f" {pr:.2f}")
+
+
+def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str, Current], p: dict[str, float | None],
+                    calc: Calc, regime: str | None = None, dd_floor_pct: float = 15.0) -> dict[str, Any]:
+    """The computed layer for one day, no I/O: forecasts to target weights with the full breakdown.
+    Strategies without a usable forecast (no sigma, or no forecaster with a value) are held at their weight."""
+    fstrat = forecast.get("strategies") or {}
+    fw = forecast.get("weights_k") if isinstance(forecast.get("weights_k"), dict) else {}
+    cov_in = forecast.get("cov_d") if isinstance(forecast.get("cov_d"), dict) else {}
+    cov_ids = [x for x in (cov_in.get("ids") or []) if isinstance(x, str)]
+    matrix = cov_in.get("matrix") or []
+    mu_log: dict[str, dict[str, float | None]] = {}
+    sigma_log: dict[str, float | None] = {}
+    clipped: dict[str, list[str]] = {}
+    opt: list[str] = []
+    held: dict[str, str] = {}
+    for sid in ids:
+        f = fstrat.get(sid) if isinstance(fstrat.get(sid), dict) else None
+        sig = _num(f.get("sigma_d")) if f else None
+        sigma_log[sid] = sig
+        if not f or sig is None or sig <= 0:
+            held[sid] = "no forecast"
+            continue
+        mus: dict[str, float | None] = {}
+        clipped[sid] = []
+        for k, v in (f.get("mu") or {}).items():
+            n = _num(v)
+            if n is None:
+                continue
+            mus[k], was = M.clip_mu(n, sig, calc.sharpe_cap)
+            if was:
+                clipped[sid].append(k)
+        if p.get(sid) is not None:
+            mus["decider"], was = M.clip_mu(M.decider_mu(p[sid], sig, calc.decider_k), sig, calc.sharpe_cap)
+            if was:
+                clipped[sid].append("decider")
+        raw_w = fw.get(sid)
+        weights = {k: n for k, v in raw_w.items() if (n := _num(v)) is not None} if isinstance(raw_w, dict) and raw_w else calc.start(sid)
+        if "decider" not in weights:
+            weights["decider"] = calc.start(sid).get("decider", 0.25)
+        comb = M.combine(mus, weights)
+        if comb is None:
+            held[sid] = "no forecaster has a value"
+            continue
+        mus["combined"] = comb
+        mu_log[sid] = mus
+        opt.append(sid)
+    for sid in ids:
+        mu_log.setdefault(sid, {})
+    w_prev = {sid: current[sid].weight for sid in ids}
+    if not opt:
+        return {"opt": [], "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "w_star": {},
+                "w_final": dict(w_prev), "steps": [], "reasons": {sid: f"{sid}: held at {w_prev[sid]:.2f} ({held[sid]})" for sid in ids}}
+
+    def cov_ij(a: str, b: str) -> float:
+        if a in cov_ids and b in cov_ids:
+            try:
+                v = _num(matrix[cov_ids.index(a)][cov_ids.index(b)])
+            except (IndexError, TypeError):
+                v = None
+            if v is not None:
+                return v
+        return sigma_log[a] ** 2 if a == b else 0.0  # no covariance given: independent
+
+    cov = [[cov_ij(a, b) for b in opt] for a in opt]
+    cost = [calc.cost(sid) * (current[sid].gross if current[sid].gross is not None else 1.0) / calc.horizon_days for sid in opt]
+    star = M.solve_weights([mu_log[sid]["combined"] for sid in opt], cov, [w_prev[sid] for sid in opt], cost, gamma=calc.gamma)
+    w_star = dict(zip(opt, star))
+    final, steps = M.apply_rules(opt, w_star, {sid: w_prev[sid] for sid in opt}, cov, {sid: p.get(sid) for sid in opt}, calc.rules,
+                                 floored=[sid for sid in opt if current[sid].drawdown_pct is not None and current[sid].drawdown_pct > dd_floor_pct], locked=[sid for sid in opt if current[sid].owner_lock])
+    reasons = {sid: f"{sid}: held at {w_prev[sid]:.2f} ({why})" for sid, why in held.items()}
+    for sid in opt:
+        binding = [st["step"] for st in steps if sid in st["changed"]]
+        reasons[sid] = M.reason_line(sid, mu_log[sid]["combined"], sigma_log[sid], w_star[sid], final[sid], binding, regime)
+    return {"opt": opt, "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "w_star": w_star,
+            "w_final": {**{sid: w_prev[sid] for sid in ids}, **final}, "steps": steps, "cost": dict(zip(opt, cost)), "reasons": reasons}
 
 
 # ---------------------------------------------------------------------------------- market summary
@@ -435,7 +628,7 @@ class Allocator:
                  budget: RateBudget | None = None, clock: Callable[[], float] = time.time,
                  default_interval_min: int = 60, max_step: float = 0.5, dd_floor_pct: float = 15.0,
                  flatten_on_floor: bool = True, tick_s: float = 30.0, mode: str | None = None,
-                 params: MappingParams | None = None, max_questions: int | None = None):
+                 params: MappingParams | None = None, max_questions: int | None = None, calc: Calc | None = None):
         # mode "decider": llm.ask(state, questions) answers alloc-v1.0; mode "chat": llm.ask_json(messages, schema) answers a JSON
         # allocation. Unset: chat when the client has ask_json, else decider (create_allocator always sets it).
         self.root = Path(root)
@@ -455,6 +648,7 @@ class Allocator:
         self.mode = mode
         self.params = params or MappingParams()
         self.max_questions = max_questions
+        self.calc = calc or Calc.from_settings(Settings())
         self._stop = asyncio.Event()
         self._busy = asyncio.Lock()
         self.last_error: str | None = None
@@ -502,7 +696,35 @@ class Allocator:
             self.state_cache = s if isinstance(s, dict) else {}
             self.state_cache.setdefault("peaks", {})
             self.state_cache.setdefault("history", {})
+            self.state_cache.setdefault("p_hist", {})   # the decider's last answers per strategy: [[t_ms, p], ...]
         return self.state_cache
+
+    # ---- computed layer: forecast, decider history, schedule
+    def load_forecast(self, now_ms: int) -> Forecast:
+        return read_forecast(self.root, now_ms, self.calc.stale_h)
+
+    def _push_p(self, p: dict[str, float], now_ms: int) -> None:
+        hist = self._state()["p_hist"]
+        for sid, v in p.items():
+            hist[sid] = (hist.get(sid) or []) + [[now_ms, v]]
+            hist[sid] = hist[sid][-self.calc.p_window:]
+        self._dirty = True
+
+    def p_means(self, ids: list[str], extra: dict[str, float] | None = None) -> dict[str, float | None]:
+        """p per strategy: the mean of the decider's last p_window answers (`extra`: one more, not stored, for dry runs)."""
+        hist = self._state()["p_hist"]
+        out: dict[str, float | None] = {}
+        for sid in ids:
+            vals = [v for _, v in (hist.get(sid) or [])]
+            if extra and sid in extra:
+                vals.append(extra[sid])
+            out[sid] = M.mean_p(vals[-self.calc.p_window:])
+        return out
+
+    def weights_due(self, now_ms: int) -> bool:
+        """True when the daily weight-setting slot (23:50 UTC) has passed since weights were last set, or never were."""
+        last = _num(self._state().get("last_weights_ms"))
+        return last is None or last < latest_weights_slot_ms(now_ms, *self.calc.weights_utc)
 
     def observe(self, sid: str, equity: float | None, start_equity: float | None, now_ms: int) -> bool:
         """Track the peak and keep sparse equity samples. Returns True when the state changed."""
@@ -580,7 +802,8 @@ class Allocator:
             "trades_7d": sum(1 for t in t_ms if t >= now_ms - 7 * DAY_MS),
             "last_error": status.get("last_error"),
         }
-        return ctx, Current(enabled=enabled, weight=weight, owner_lock=lock, drawdown_pct=dd)
+        return ctx, Current(enabled=enabled, weight=weight, owner_lock=lock, drawdown_pct=dd,
+                            gross=gross_per_unit(positions, eq, weight))
 
     async def build_context(self, now_ms: int) -> tuple[dict[str, Any], dict[str, Current], list[dict[str, Any]]]:
         rows = self.strategies()
@@ -693,13 +916,17 @@ class Allocator:
         write_json_atomic(path, ctl)
         return True
 
-    def _apply(self, plan: Plan, current: dict[str, Current], reasons: dict[str, str], now_ms: int) -> dict[str, bool]:
+    def _apply(self, plan: Plan, current: dict[str, Current], reasons: dict[str, str], now_ms: int, *,
+               refresh_reasons: bool = False) -> dict[str, bool]:
         applied: dict[str, bool] = {}
         for sid, c in current.items():
             if sid in plan.skipped_owner_lock:
                 applied[sid] = False
                 continue
             unchanged = plan.enabled[sid] == c.enabled and abs(plan.weights[sid] - c.weight) < 1e-9
+            if unchanged and refresh_reasons:
+                ctl = read_json(self.root / sid / "control.json")
+                unchanged = isinstance(ctl, dict) and ctl.get("reason") == reasons[sid][:REASONING_MAX_CHARS]  # new text for the card
             if unchanged:
                 applied[sid] = False  # nothing to tell the runner; keep control.json (and its reason) as is
                 continue
@@ -713,8 +940,15 @@ class Allocator:
 
     # ---- one decision
     async def decide(self, *, dry_run: bool = False, trigger: str = "schedule") -> dict[str, Any]:
-        """Build the context, ask the model, apply the rules and write the controls. With dry_run
-        nothing is written: the record comes back (context, answer, plan) and that is all."""
+        """One decision. With forecast/latest.json (and a decision model) the computed layer runs; without it the
+        decider-only mapping. With dry_run nothing is written: the record comes back and that is all."""
+        fc = self.load_forecast(self.now_ms()) if self.mode == "decider" else None
+        if fc is None or fc.state == "missing":
+            return await self._decide_legacy(dry_run=dry_run, trigger=trigger)
+        return await self._decide_computed(fc, dry_run=dry_run, trigger=trigger)
+
+    async def _decide_legacy(self, *, dry_run: bool = False, trigger: str = "schedule") -> dict[str, Any]:
+        """Build the context, ask the model, apply the rules and write the controls (decider-only weights)."""
         async with self._busy:
             now_ms = self.now_ms()
             record: dict[str, Any] = {"t_ms": now_ms, "model": self.model, "trigger": trigger}
@@ -755,6 +989,86 @@ class Allocator:
                 "risk_floor": plan.floored if plan else [], "step_limited": plan.step_limited if plan else [],
                 "error": error, "dry_run": dry_run,
             })
+            if not dry_run:
+                append_jsonl(self.dir / "decisions.jsonl", record)
+                self.last_error = error
+                self._save_state()
+                self.write_status(now_ms, last_decision_ms=now_ms)
+            return record
+
+    async def _decide_computed(self, fc: Forecast, *, dry_run: bool = False, trigger: str = "schedule") -> dict[str, Any]:
+        """The decider is asked (hourly: that is all, its answers go into the p history); the weights are set on a
+        weights run: DECIDE NOW, the CLI, or the daily 23:50 UTC slot. A stale or unreadable forecast holds the weights."""
+        async with self._busy:
+            now_ms = self.now_ms()
+            record: dict[str, Any] = {"t_ms": now_ms, "model": self.model, "trigger": trigger, "forecast": fc.info()}
+            current: dict[str, Current] = {}
+            error: str | None = None
+            extra: dict[str, Any] = {}
+            try:
+                ctx, current, rows = await self.build_context(now_ms)
+                record["inputs"] = ctx
+                _, cost, attempts, extra = await self._ask_decider(ctx, [r["id"] for r in rows],
+                                                                    {r["id"]: str(r.get("label") or r["id"]) for r in rows}, current)
+                record.update(cost_usd=round(cost, 6), attempts=attempts)
+            except AllocatorError as exc:
+                error = str(exc)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if not current:
+                current = self._read_current(now_ms)
+            ids = list(current)
+            extra.pop("mapping", None)  # the decider-only mapping is not used here
+            record.update(extra)
+            p_new = (extra.get("answers") or {}).get("p") or {}
+            if p_new and not dry_run:
+                self._push_p(p_new, now_ms)
+            p_now = self.p_means(ids, p_new if dry_run else None)
+            weights_run = trigger != "schedule" or self.weights_due(now_ms)
+            calc_out: dict[str, Any] | None = None
+            decision: Decision | None = None
+            if not weights_run:
+                kind, why = "refresh", f"decider answers refreshed; weights are set daily at {self.calc.weights_utc[0]:02d}:{self.calc.weights_utc[1]:02d} UTC"
+            elif fc.state != "fresh":
+                kind, why = "held", fc.note
+            elif not current:
+                kind, why = "held", "no strategies"
+            else:
+                kind = "computed"
+                calc_out = compute_weights(ids, fc.data or {}, current, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+                why = " | ".join(calc_out["reasons"][sid] for sid in ids)
+                decision = Decision(dict(calc_out["w_final"]), {sid: current[sid].enabled for sid in ids}, why, None,
+                                    derive_enabled=tuple(calc_out["opt"]))
+            plan = resolve(current, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct) if current else None
+            reasons: dict[str, str] = {}
+            if plan:
+                for sid in current:
+                    if sid in plan.floored:
+                        reasons[sid] = f"risk floor: book {current[sid].drawdown_pct:.1f}% below its peak, weight forced to 0"
+                    else:
+                        reasons[sid] = calc_out["reasons"][sid] if calc_out else why
+            applied: dict[str, bool] = {}
+            if plan and not dry_run:
+                applied = self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed")
+            if kind == "computed" and plan and not dry_run:
+                self._state()["last_weights_ms"] = now_ms
+                self._dirty = True
+            record.update({
+                "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {},
+                "reasoning": why, "confidence": None, "requested": None, "mode": self.mode, "weights_mode": kind,
+                "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
+                "risk_floor": plan.floored if plan else [],
+                "step_limited": next((st["changed"] for st in (calc_out or {}).get("steps", []) if st["step"] == "step"), []),
+                "p_decider": p_now,
+                "error": error or fc.error, "dry_run": dry_run,
+            })
+            if calc_out:
+                record.update({
+                    "mu": calc_out["mu"], "mu_ann_pct": {sid: {k: round(M.ann_pct(v), 2) for k, v in m.items() if v is not None} for sid, m in calc_out["mu"].items()},
+                    "sigma_d": calc_out["sigma_d"], "w_prev": calc_out["w_prev"], "w_star": {k: round(v, 6) for k, v in calc_out["w_star"].items()},
+                    "w_final": plan.weights if plan else {}, "steps": calc_out["steps"], "reasons": reasons, "clipped": calc_out["clipped"],
+                    "no_forecast": calc_out["held"], "cost_per_day": calc_out["cost"],
+                })
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
                 self.last_error = error
@@ -813,12 +1127,18 @@ class Allocator:
         last = last_decision_ms or prev.get("last_decision_ms")
         nxt = None if paused or not last else int(last) + ctl["interval_min"] * 60_000
         last_dec = (self.decisions(1) or [{}])[0]
+        fc = self.load_forecast(now_ms) if self.mode == "decider" else None
+        err = self.last_error or (fc.error if fc else None)  # an unusable forecast is an error; a missing one is a mode
+        weights_mode = {None: "chat", "missing": "decider-only", "fresh": "computed"}.get(fc.state if fc else None, "held")
+        nxt_w = None if fc is None or fc.state == "missing" or paused else latest_weights_slot_ms(now_ms, *self.calc.weights_utc) + DAY_MS
         write_json_atomic(self.dir / "status.json", {
-            "state": "paused" if paused else ("error" if self.last_error else "running"),
+            "state": "paused" if paused else ("error" if err else "running"),
             "model": self.model, "last_decision_ms": last, "next_decision_ms": nxt,
-            "last_error": self.last_error, "cost_usd_today": self.cost_usd_today(now_ms),
+            "last_error": err, "cost_usd_today": self.cost_usd_today(now_ms),
             "interval_min": ctl["interval_min"], "updated_ms": now_ms,
             "last_reasoning": last_dec.get("reasoning") or None, "last_confidence": last_dec.get("confidence"),
+            "weights_mode": weights_mode, "forecast": fc.info() if fc else None,
+            "last_weights_ms": _num(self._state().get("last_weights_ms")), "next_weights_ms": nxt_w,
         })
 
     # ---- loop
@@ -858,6 +1178,8 @@ class Allocator:
             raw["decide_now"] = False
             write_json_atomic(self.dir / "control.json", raw)
             await self.decide(trigger="decide_now")
+        elif self.mode == "decider" and self.load_forecast(now_ms).state == "fresh" and self.weights_due(now_ms):
+            await self.decide(trigger="daily")  # the 23:50 UTC slot (or the first run): ask the decider, then set the weights
         elif due:
             await self.decide(trigger="schedule")
         else:
@@ -960,6 +1282,46 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
                      "mean_p_of_realised": round(best_stats["p_realised"] / bn, 3) if bn else None}}
 
 
+FORECASTER_ORDER = ("base", "regime", "ridge", "structural", "decider", "combined")
+RULE_COLUMNS = (("vol_cap", "vol"), ("buffer", "buf"), ("step", "step"), ("veto", "veto"), ("explore_floor", "floor"), ("floor_lock", "dd/lock"))
+
+
+def format_table(rec: dict[str, Any]) -> str:
+    """The computed weights as plain text tables (python -m ctb.allocator once --dry-run). Needs a record with
+    the breakdown (mu, sigma_d, w_prev, w_star, steps, w_final, p_decider, reasons); other records get one line."""
+    fc = rec.get("forecast") or {}
+    head = f"weights_mode {rec.get('weights_mode')}, trigger {rec.get('trigger')}, forecast {fc.get('state')} {fc.get('date') or ''} age {fc.get('age_h')} h"
+    if "mu" not in rec:
+        return head + "\n" + str(rec.get("reasoning") or "")
+    ids = list(rec["w_final"])
+    ks = [k for k in FORECASTER_ORDER if any(k in (rec["mu"].get(i) or {}) for i in ids)]
+    out = [head, "", "mu, % per year (each forecast clipped to Sharpe +-1.5), p = mean of the decider's last answers:"]
+    rows = [["id", *ks, "p", "sigma %/yr"]]
+    for i in ids:
+        mu = rec["mu"].get(i) or {}
+        sd = (rec.get("sigma_d") or {}).get(i)
+        p = (rec.get("p_decider") or {}).get(i)
+        rows.append([i, *[("-" if mu.get(k) is None else f"{M.ann_pct(mu[k]):+.1f}") for k in ks], "-" if p is None else f"{p:.2f}",
+                     "-" if sd is None else f"{M.sigma_ann_pct(sd):.1f}"])
+    out += _grid(rows)
+    out += ["", "weights: previous, optimum, after each rule in order, final:"]
+    steps = {st["step"]: st for st in rec.get("steps") or []}
+    rows = [["id", "prev", "w*", *[lab for _, lab in RULE_COLUMNS], "final"]]
+    for i in ids:
+        ws = (rec.get("w_star") or {}).get(i)
+        rows.append([i, f"{rec['w_prev'][i]:.2f}", "-" if ws is None else f"{ws:.2f}",
+                     *[("-" if key not in steps or i not in steps[key]["after"] else f"{steps[key]['after'][i]:.2f}") for key, _ in RULE_COLUMNS],
+                     f"{rec['w_final'][i]:.2f}"])
+    out += _grid(rows)
+    out += ["", "reasons:", *[f"  {rec['reasons'][i]}" for i in ids if i in (rec.get("reasons") or {})]]
+    return "\n".join(out)
+
+
+def _grid(rows: list[list[str]]) -> list[str]:
+    widths = [max(len(r[c]) for r in rows) for c in range(len(rows[0]))]
+    return ["  " + "  ".join(cell.rjust(w) if c else cell.ljust(w) for c, (cell, w) in enumerate(zip(r, widths))) for r in rows]
+
+
 def _jprint(obj: Any) -> None:
     print(json.dumps(obj, indent=1, ensure_ascii=False, default=str))
 
@@ -980,7 +1342,12 @@ async def _main(args: argparse.Namespace) -> int:
                 print(f"{alloc.llm.spec.key_env} is not set", file=sys.stderr)
                 return 2
             rec = await alloc.decide(dry_run=args.dry_run, trigger="cli")
-            if args.dry_run:
+            if args.dry_run and rec.get("weights_mode") in ("computed", "held", "refresh"):
+                print(format_table(rec))
+                print(f"decider: {rec.get('cost_usd', 0)} usd, error: {rec.get('error')}")
+            elif args.dry_run:
+                if rec.get("mode") == "decider":
+                    print("== forecast/latest.json is missing: decider-only mapping ==")
                 print("== CONTEXT given to the model ==")
                 _jprint(rec.get("inputs"))
                 print(f"== MODEL ANSWER ({rec['model']}) ==")
