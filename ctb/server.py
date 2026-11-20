@@ -136,6 +136,23 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             return False
         return isinstance(body, dict) and body.get("cancel_kill") is True
 
+    async def bot_kill(ex: Any, reason: str) -> dict[str, Any]:
+        """The per-symbol bot's kill, verified. Executor.kill logs a failed close and ignores a failed cancel, so its return
+        proves nothing: the account is read again and the answer says what is still open (or that it could not be read)."""
+        try:
+            await ex.kill(reason)
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            return {"killed": False, "why": f"per-symbol bot kill failed: {exc}"}
+        await ex.sync()  # a fresh account read (sync keeps the old snapshot and sets sync_error when it fails)
+        if ex.sync_error:
+            return {"killed": False, "why": f"per-symbol bot: kill sent, but the account could not be read back to verify it ({ex.sync_error})"}
+        left = [str(p.get("symbol", "?")) for p in ex.positions]
+        orders = len(ex.open_orders)
+        if left or orders:
+            return {"killed": False, "why": (f"per-symbol bot: still open after the kill: {len(left)} positions ({', '.join(left) or 'none'}), "
+                                             f"{orders} open orders. A close may still be filling; check F9 and kill again.")}
+        return {"killed": True, "why": "per-symbol bot: verified on a fresh account read: no positions, no open orders, trading off"}
+
     def refused(exc: strat_mod.StrategyError) -> web.Response:
         return j({"error": exc.message, **exc.detail}, exc.status)
 
@@ -406,11 +423,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         out = await hub.kill_all()
         ex = getattr(engine, "executor", None)
         if bot_mode and ex is not None:
-            try:
-                await ex.kill("dashboard KILL ALL")
-                bot = {"killed": True, "why": "per-symbol bot: positions closed, orders cancelled, trading off"}
-            except Exception as exc:  # noqa: BLE001 - reported, never swallowed
-                bot = {"killed": False, "why": f"per-symbol bot kill failed: {exc}"}
+            bot = await bot_kill(ex, "dashboard KILL ALL")
         elif bot_mode:
             bot = {"killed": False, "why": "per-symbol bot: no executor (no keys for its venue), nothing to close"}
         elif bot_open:
@@ -536,10 +549,11 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             done = out["flattening"]
             engine.emit("event", engine.db.event("warn", "killed", f"kill switch: allocator paused, strategies flattening: {', '.join(done)}"))
             return j({**out, "ok": True, "flattening": done, "bot_auto_trade": "off"})
-        if engine.executor:
-            await engine.executor.kill("dashboard kill switch")
         s.trading_enabled = False
-        return j({"killed": True})
+        if not engine.executor:
+            return j({"killed": False, "why": "per-symbol bot: no executor (no keys for its venue), nothing to close", "bot_auto_trade": "off"})
+        bot = await bot_kill(engine.executor, "dashboard kill switch")
+        return j({**bot, "bot_auto_trade": "off", **({} if bot["killed"] else {"error": bot["why"]})}, 200 if bot["killed"] else 409)
 
     @routes.post("/api/decide")
     async def decide_now(req: web.Request) -> web.Response:

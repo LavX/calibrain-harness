@@ -781,21 +781,37 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
     run(go())
 
 
-@pytest.mark.parametrize("mode", ["bot", "manual"])
-def test_kill_all_kills_the_per_symbol_bot_only_when_it_owns_the_account(roots, tmp_path, monkeypatch, mode):
+class FakeExecutor:
+    """Executor.kill's contract: closes each position (a failed close is only logged), cancels orders, never raises."""
+
+    def __init__(self, closes_work=True):
+        self.positions = [{"symbol": "BTCUSDT"}]
+        self.open_orders: list = []
+        self.sync_error = None
+        self.closes_work = closes_work
+        self.kills: list[str] = []
+
+    async def kill(self, reason):
+        self.kills.append(reason)
+        if self.closes_work:
+            self.positions = []
+
+    async def sync(self):
+        pass
+
+
+@pytest.mark.parametrize("mode,closes_work", [("bot", True), ("bot", False), ("manual", True)])
+def test_kill_all_kills_the_per_symbol_bot_only_when_it_owns_the_account(roots, tmp_path, monkeypatch, mode, closes_work):
     from aiohttp.test_utils import TestClient, TestServer
 
     from ctb.server import make_app
 
-    kills: list[str] = []
-
-    async def executor_kill(reason):
-        kills.append(reason)
+    ex = FakeExecutor(closes_work)
 
     class Engine:
         s = SimpleNamespace(trading_enabled=mode == "bot", public_view=lambda: {})
         db = SimpleNamespace(event=lambda *a: a, one=lambda *a: None)
-        executor = SimpleNamespace(kill=executor_kill)
+        executor = ex
 
         async def start(self): ...
         async def stop(self): ...
@@ -818,10 +834,13 @@ def test_kill_all_kills_the_per_symbol_bot_only_when_it_owns_the_account(roots, 
     assert by["okx-demo"]["ok"] is True and eng.s.trading_enabled is False and body["bot"]["auto_trade"] == "off"
     # bybit-demo is killed in every mode: nothing assumes the bot mode paused it (it does only when they share the account)
     assert by["bybit-demo"]["ok"] is True and ctl(roots[0], "carry")["flatten"] is True
-    if mode == "bot":  # the bot is killed too
-        assert kills == ["dashboard KILL ALL"] and body["bot"]["killed"] is True
-    else:  # the strategies own it: Executor.kill would close their netted legs, so the bot is not touched on the exchange
-        assert kills == [] and body["bot"]["killed"] is False
+    if mode == "manual":  # the strategies own it: Executor.kill would close their netted legs, so the bot is not touched on the exchange
+        assert ex.kills == [] and body["bot"]["killed"] is False
+    elif closes_work:  # verified on a fresh read
+        assert ex.kills == ["dashboard KILL ALL"] and body["bot"]["killed"] is True and "verified" in body["bot"]["why"]
+    else:  # a close failed (Executor.kill only logs it): never reported as closed
+        assert body["bot"]["killed"] is False and "still open" in body["bot"]["why"] and "BTCUSDT" in body["bot"]["why"]
+        assert body["ok"] is False
 
 
 @pytest.mark.parametrize("pause", ["auto_off", "to_manual"])
