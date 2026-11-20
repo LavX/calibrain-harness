@@ -128,6 +128,10 @@ def read_json(path: Path) -> Any:
         return None
 
 
+def _join_errors(*parts: str | None) -> str | None:
+    return "; ".join(p for p in parts if p) or None
+
+
 def write_json_atomic(path: Path, obj: Any) -> None:
     """Write-then-rename in the same directory, so a reader never sees a half-written file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -723,6 +727,9 @@ class Allocator:
         # "<venue>/<strategy>": the drawdown floor's last failed write ({venue, venue_label, strategy, error, t_ms}). Rebuilt
         # by every risk check: an entry stays while the write keeps failing and goes once it succeeds or is no longer needed.
         self.floor_errors: dict[str, dict[str, Any]] = {}
+        # the same for the last decision's writes (and a venue the decision could not handle at all); rebuilt by every
+        # decision that is not a dry run, so an entry stays until a later decision writes that book
+        self.decision_errors: dict[str, dict[str, Any]] = {}
         self.state_cache: dict[str, Any] | None = None
         self._dirty = False
         self._seed_budget()
@@ -1200,9 +1207,11 @@ class Allocator:
                         if sid in explored:
                             reasons[sid] += f" | demo minimum {plan.weights[sid]:.2f}"
             applied: dict[str, bool] = {}
+            failed: dict[str, str] = {}
             if plan and not dry_run and self.primary.managed:
-                applied = self._apply(plan, current, reasons, now_ms)
-            venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, explored)}
+                applied = self._apply(plan, current, reasons, now_ms, errors=failed)
+            venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, explored,
+                                                          {"write_failed": failed} if failed else None)}
             record.update({
                 "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {},
                 "reasoning": decision.reasoning if decision else "", "confidence": decision.confidence if decision else None,
@@ -1216,11 +1225,13 @@ class Allocator:
                 "error": error, "dry_run": dry_run,
             })
             for v in self.venues[1:]:  # the same per-strategy decision, under each venue's own rules
-                venues[v.id] = self._legacy_venue(v, decision, now_ms, dry_run)
+                venues[v.id] = self._other_venue(v, lambda v=v: self._legacy_venue(v, decision, now_ms, dry_run))
             record["venues"] = venues
+            not_applied = self._write_failures(venues, now_ms, dry_run)
+            record["error"] = _join_errors(record["error"], not_applied)
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
-                self.last_error = error
+                self.last_error = record["error"]
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
@@ -1279,9 +1290,11 @@ class Allocator:
                     else:
                         reasons[sid] = calc_out["reasons"][sid] if calc_out else why
             applied: dict[str, bool] = {}
+            failed: dict[str, str] = {}
             if plan and not dry_run and self.primary.managed:
-                applied = self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed")
-            venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied)}
+                applied = self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed", errors=failed)
+            venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, None,
+                                                          {"write_failed": failed} if failed else None)}
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1309,14 +1322,48 @@ class Allocator:
                     "no_forecast": calc_out["held"],
                 })
             for v in self.venues[1:]:  # the same forecasts and decider p, each venue's own books, anchor and rules
-                venues[v.id] = self._computed_venue(v, fc, kind, why, p_new, now_ms, dry_run, decided_ids=ids)
+                venues[v.id] = self._other_venue(v, lambda v=v: self._computed_venue(v, fc, kind, why, p_new, now_ms, dry_run, decided_ids=ids))
             record["venues"] = venues
+            # only a weights run rewrites every book: an hourly refresh or a held run leaves earlier failures standing
+            not_applied = self._write_failures(venues, now_ms, dry_run, replace=kind == "computed")
+            record["error"] = _join_errors(record["error"], not_applied)
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
-                self.last_error = error
+                self.last_error = _join_errors(error, not_applied)  # the forecast's error is said by write_status, as before
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
+
+    def _other_venue(self, v: AllocVenue, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """One other venue's part of a decision. Anything that goes wrong there (beyond a single write, which _apply keeps
+        per strategy) is that venue's error: the decision, its record and the other venues go on."""
+        try:
+            return run()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("allocator: decision on %s failed", v.id)
+            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "nothing applied (error)",
+                    "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+    def _write_failures(self, venues: dict[str, dict[str, Any]], now_ms: int, dry_run: bool, replace: bool = True) -> str | None:
+        """What a decision could not apply: every write that failed and every venue that failed, as one line for the
+        decision's error (None when all went through). Unless a dry run, also kept in decision_errors: status.json and the
+        venue alerts show them until a later decision that sets the weights (replace) writes those books."""
+        found: dict[str, dict[str, Any]] = {}
+        for vid, vr in venues.items():
+            label = vr.get("label") or vid
+            for sid, err in (vr.get("write_failed") or {}).items():
+                found[self.vk(vid, sid)] = {"venue": vid, "venue_label": label, "strategy": sid, "error": err, "t_ms": now_ms}
+            if vr.get("error"):
+                found[self.vk(vid, "*")] = {"venue": vid, "venue_label": label, "strategy": None, "error": vr["error"], "t_ms": now_ms}
+        if not dry_run:
+            for key, e in found.items():
+                if self.decision_errors.get(key, {}).get("error") != e["error"]:
+                    log.error("allocator: decision on %s %s not applied: %s", e["venue"], e["strategy"] or "(venue)", e["error"])
+            self.decision_errors = found if replace else {**self.decision_errors, **found}
+        if not found:
+            return None
+        txt = "; ".join(f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in found.values())
+        return f"control.json not written, kept as it was ({txt})"
 
     def _venue_record(self, v: AllocVenue, plan: Plan | None, current: dict[str, Current], reasons: dict[str, str],
                       applied: dict[str, bool], explored: list[str] | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1361,9 +1408,10 @@ class Allocator:
             else:
                 reasons[sid] = decision.reasoning + (f" | demo minimum {plan.weights[sid]:.2f}" if sid in explored else "")
         writable = {s: c for s, c in current.items() if s in decided or s in plan.floored or decision is None}
-        applied = self._apply(plan, writable, reasons, now_ms, venue=v) if not dry_run and v.managed else {}
+        failed: dict[str, str] = {}
+        applied = self._apply(plan, writable, reasons, now_ms, venue=v, errors=failed) if not dry_run and v.managed else {}
         applied.update({s: False for s in current if s not in writable})
-        return self._venue_record(v, plan, current, reasons, applied, explored)
+        return self._venue_record(v, plan, current, reasons, applied, explored, {"write_failed": failed} if failed else None)
 
     def _computed_venue(self, v: AllocVenue, fc: Forecast, kind: str, why: str, p_new: dict[str, float], now_ms: int,
                         dry_run: bool, decided_ids: list[str] | None = None) -> dict[str, Any]:
@@ -1391,11 +1439,14 @@ class Allocator:
                    for sid, c in current.items()}
         # a held strategy (no decision covers it) is not written at all; only the drawdown floor may still cut it
         writable = {s: c for s, c in current.items() if s in covered or s in plan.floored}
-        applied = (self._apply(plan, writable, reasons, now_ms, refresh_reasons=kind == "computed", venue=v)
+        failed: dict[str, str] = {}
+        applied = (self._apply(plan, writable, reasons, now_ms, refresh_reasons=kind == "computed", venue=v, errors=failed)
                    if not dry_run and v.managed else {})
         applied.update({s: False for s in current if s not in writable})
         extra = {"core": {k: round(x, 6) for k, x in calc_out["core"].items()},
                  "w_target": {k: round(x, 6) for k, x in calc_out["w_target"].items()}, "steps": calc_out["steps"]} if calc_out else {}
+        if failed:
+            extra["write_failed"] = failed
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:
@@ -1503,6 +1554,7 @@ class Allocator:
             "weights_mode": weights_mode, "forecast": fc.info() if fc else None,
             "last_weights_ms": _num(self._state().get("last_weights_ms")), "next_weights_ms": nxt_w,
             "risk_floor_errors": list(self.floor_errors.values()),
+            "decision_write_errors": list(self.decision_errors.values()),
         })
 
     # ---- loop

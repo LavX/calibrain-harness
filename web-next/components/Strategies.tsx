@@ -29,6 +29,7 @@ type Decision = { t_ms: number; model: string; trigger?: string; risk_floor?: st
 type VenueDecision = {
   label: string; managed: boolean; weights?: Record<string, number>; enabled?: Record<string, boolean>; applied?: Record<string, boolean>;
   skipped_owner_lock?: string[]; skipped_kill_pending?: string[]; skipped_paused?: string[]; risk_floor?: string[]; note?: string;
+  write_failed?: Record<string, string>; error?: string;
 };
 type Allocator = {
   available: boolean;
@@ -361,11 +362,11 @@ function VenueLines({ d, names, primary }: { d: Decision; names: Map<string, str
   const others = Object.entries(d.venues || {}).filter(([vid]) => vid !== primary);
   if (!others.length) return null;
   return <>{others.map(([vid, v]) => {
-    const why = (id: string) => v.skipped_owner_lock?.includes(id) ? "owner lock" : v.skipped_kill_pending?.includes(id) ? "kill pending"
+    const why = (id: string) => v.write_failed?.[id] ? "write failed" : v.skipped_owner_lock?.includes(id) ? "owner lock" : v.skipped_kill_pending?.includes(id) ? "kill pending"
       : v.skipped_paused?.includes(id) ? "allocator paused" : v.risk_floor?.includes(id) ? "risk floor" : v.applied?.[id] ? "written" : "unchanged";
     return (
       <div key={vid}><span className="muted">{v.label}:</span>{" "}
-        {v.note ? <span className="muted">{v.note}</span> : Object.entries(v.weights || {}).map(([id, w], i) => (
+        {v.note ? <span className={v.error ? "dn" : "muted"}>{v.note}{v.error ? `: ${v.error}` : ""}</span> : Object.entries(v.weights || {}).map(([id, w], i) => (
           <span key={id}>{i ? ", " : ""}{names.get(id) || id} {fx(w, 2)} <span className="muted">({why(id)})</span></span>))}
       </div>
     );

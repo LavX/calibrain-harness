@@ -52,6 +52,10 @@ Things to know before handing a venue over:
 - Each (venue, strategy) stands alone in the floor: a control.json that cannot be written (a read-only directory, a full
   disk) is logged, named in the feed and in `status.json` (`last_error`, `risk_floor_errors`), and raised as a red
   FLOOR FAILED alert for that venue and strategy; the floor goes on with the other books and tries again every tick.
+- A decision does the same: a write that fails on one book (or a venue that fails as a whole) leaves that book as it was
+  and is named in the decision's `error`, `write_failed` in its venue part, `status.json` (`last_error`,
+  `decision_write_errors`) and a red WRITE FAILED alert. The decision line is still written and the next decision is
+  still an interval away: a failed write never makes the allocator ask the model again at once.
 
 ## Rules enforced in code
 

@@ -294,6 +294,12 @@ DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", 
                  "skipped_paused", "risk_floor", "write_failed", "error", "venue", "venue_label", "venues")
 
 
+def _write_errors(raw: Any) -> list[dict[str, Any]]:
+    return [{"venue": str(e.get("venue") or ""), "venue_label": str(e.get("venue_label") or e.get("venue") or ""),
+             "strategy": str(e["strategy"]) if e.get("strategy") else None, "error": str(e.get("error") or "")[:300], "t_ms": _num(e.get("t_ms"))}
+            for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)][:50]
+
+
 def clean_allocator(status: dict | None, control: dict | None, decisions: list[dict]) -> dict[str, Any]:
     """The allocator panel's data: its status.json, the dashboard's control.json and the newest decisions (inputs dropped)."""
     stt = None
@@ -305,11 +311,9 @@ def clean_allocator(status: dict | None, control: dict | None, decisions: list[d
                                                    "next_weights_ms", "updated_ms")},
                "weights_mode": status.get("weights_mode") if isinstance(status.get("weights_mode"), str) else None,
                "last_error": str(status["last_error"])[:500] if status.get("last_error") else None,
-               # the drawdown floor's failed writes, per (venue, strategy): the venue alerts name them
-               "risk_floor_errors": [{"venue": str(e.get("venue") or ""), "venue_label": str(e.get("venue_label") or e.get("venue") or ""),
-                                      "strategy": str(e["strategy"]) if e.get("strategy") else None, "error": str(e.get("error") or "")[:300],
-                                      "t_ms": _num(e.get("t_ms"))}
-                                     for e in (status.get("risk_floor_errors") or []) if isinstance(e, dict)][:50]}
+               # the failed writes of the drawdown floor and of the last decision, per (venue, strategy): the venue alerts name them
+               "risk_floor_errors": _write_errors(status.get("risk_floor_errors")),
+               "decision_write_errors": _write_errors(status.get("decision_write_errors"))}
     ctl = {"enabled": bool(control and control.get("enabled")), "interval_min": int(control["interval_min"]) if control and isinstance(control.get("interval_min"), int) else None,
            "decide_now_pending": bool(control and control.get("decide_now"))}
     return {"status": stt, "control": ctl, "decisions": [{k: d.get(k) for k in DECISION_KEYS} for d in decisions]}

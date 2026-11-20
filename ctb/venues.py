@@ -350,16 +350,23 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
     }
 
 
-def floor_alerts(alloc: dict, labels: dict[str, str]) -> list[dict]:
-    """The allocator's drawdown floor could not write a book's control.json (or read a venue): red, per (venue, strategy),
-    until a later tick's write succeeds."""
+def allocator_alerts(alloc: dict, labels: dict[str, str]) -> list[dict]:
+    """Red, per (venue, strategy): the allocator could not write a book's control.json (or handle a venue at all), from the
+    drawdown floor (until a later tick's write succeeds) or from the last decision (until a later weights run writes it)."""
     out = []
-    for e in ((alloc.get("status") or {}).get("risk_floor_errors") or []):
-        sid = e.get("strategy")
-        out.append({"venue": e["venue"], "venue_label": labels.get(e["venue"]) or e.get("venue_label") or e["venue"],
-                    "strategy": sid, "name": S.short_name(sid, sid) if sid else None, "kind": "floor_failed", "level": "crit",
-                    "text": f"the drawdown floor could not {'cut this book' if sid else 'read this venue'} ({e.get('error')}); "
-                            "it tries again every tick. Check that the venue's directory is writable and the disk has space"})
+    stt = alloc.get("status") or {}
+    for key, kind in (("risk_floor_errors", "floor_failed"), ("decision_write_errors", "write_failed")):
+        for e in stt.get(key) or []:
+            sid = e.get("strategy")
+            if kind == "floor_failed":
+                text = (f"the drawdown floor could not {'cut this book' if sid else 'read this venue'} ({e.get('error')}); it tries "
+                        "again every tick. Check that the venue's directory is writable and the disk has space")
+            else:
+                text = (f"the allocator's last decision could not {'write this book' if sid else 'be applied on this venue'} "
+                        f"({e.get('error')}); it keeps its previous controls until a later decision writes them. Check that the "
+                        "venue's directory is writable and the disk has space")
+            out.append({"venue": e["venue"], "venue_label": labels.get(e["venue"]) or e.get("venue_label") or e["venue"],
+                        "strategy": sid, "name": S.short_name(sid, sid) if sid else None, "kind": kind, "level": "crit", "text": text})
     return out
 
 
@@ -649,7 +656,7 @@ class VenueHub:
             all_alerts += alerts(v, now_ms)
             out.append(v)
         prim = await self.primary.snapshot()
-        all_alerts += floor_alerts(prim.get("allocator") or {}, {v["id"]: v["label"] for v in out})
+        all_alerts += allocator_alerts(prim.get("allocator") or {}, {v["id"]: v["label"] for v in out})
         return {"generated_at": now, "primary": self.primary_id, "venues": out, "alerts": all_alerts,
                 "mode": prim["mode"], "auto_on": prim["auto_on"], "allocator": prim["allocator"]}
 

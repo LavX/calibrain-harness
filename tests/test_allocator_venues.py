@@ -145,7 +145,7 @@ def test_a_failed_floor_write_does_not_stop_the_floor_on_the_other_books(roots, 
     a.write_status(a.now_ms(), paused=True)  # said in status.json even while paused, and raised as a red venue alert
     status = json.loads((bybit / "allocator" / "status.json").read_text())
     assert "drawdown floor could not write control.json" in status["last_error"]
-    alerts = V.floor_alerts(st.clean_allocator(status, None, []), {"bybit-demo": "BYBIT·DEMO"})
+    alerts = V.allocator_alerts(st.clean_allocator(status, None, []), {"bybit-demo": "BYBIT·DEMO"})
     assert [(x["venue"], x["strategy"], x["kind"], x["level"]) for x in alerts] == [("bybit-demo", "trend", "floor_failed", "crit")]
     asyncio.run(a.risk_check())  # the same failure again: no new feed line, the alert stays
     assert len((bybit / "allocator" / "decisions.jsonl").read_text().splitlines()) == len(feed)
@@ -153,6 +153,56 @@ def test_a_failed_floor_write_does_not_stop_the_floor_on_the_other_books(roots, 
     monkeypatch.setattr(A, "write_json_atomic", real)  # the disk has room again: the next tick cuts it and the error goes
     asyncio.run(a.risk_check())
     assert ctl(bybit, "trend")["enabled"] is False and a.floor_errors == {}
+
+
+def test_a_failed_write_on_another_venue_does_not_unwind_the_decision(roots, monkeypatch):
+    """OKX trend's control.json cannot be written during a decision: Bybit and OKX's other books are written, the decision
+    line and status.json are written, the failure is named, and the next tick does not ask the model again."""
+    bybit, okx = roots
+    put(bybit / "allocator" / "control.json", {"enabled": True, "interval_min": 60})
+    real = A.write_json_atomic
+
+    def read_only(path, obj):
+        if path == okx / "trend" / "control.json":
+            raise PermissionError(13, "Permission denied")
+        real(path, obj)
+
+    monkeypatch.setattr(A, "write_json_atomic", read_only)
+    model = ChatModel()
+    calls = []
+    ask = model.ask_json
+    model.ask_json = lambda *a, **k: (calls.append(1), ask(*a, **k))[1]
+    a = chat_alloc(bybit, okx, model)
+    asyncio.run(a._tick())
+    assert {i: ctl(bybit, i)["weight"] for i in BYBIT_IDS} == {"carry": 0.5, "trend": 0.5, "xsmom": 0.5}
+    assert ctl(okx, "xsmom")["weight"] == 0.5 and ctl(okx, "trend")["weight"] == 0.0  # the failed one is as it was
+    feed = (bybit / "allocator" / "decisions.jsonl").read_text().splitlines()
+    rec = json.loads(feed[-1])
+    assert list(rec["venues"]["okx-demo"]["write_failed"]) == ["trend"] and rec["venues"]["okx-demo"]["applied"]["xsmom"] is True
+    assert "OKX·DEMO trend" in rec["error"] and "Permission denied" in rec["error"]
+    status = json.loads((bybit / "allocator" / "status.json").read_text())
+    assert status["last_decision_ms"] == int(T0 * 1000) and "OKX·DEMO trend" in status["last_error"]
+    alerts = V.allocator_alerts(st.clean_allocator(status, None, []), {"okx-demo": "OKX·DEMO"})
+    assert [(x["venue"], x["strategy"], x["kind"], x["level"]) for x in alerts] == [("okx-demo", "trend", "write_failed", "crit")]
+    asyncio.run(a._tick())  # not due again: no second model call, no second decision line
+    assert len(calls) == 1 and len((bybit / "allocator" / "decisions.jsonl").read_text().splitlines()) == len(feed)
+
+
+def test_a_failed_write_on_another_venue_is_named_in_the_computed_mode_too(roots, monkeypatch):
+    from test_allocator_computed import FakeDecider, answers, forecast
+
+    bybit, okx = roots
+    day0 = T0 - T0 % 86_400
+    t = day0 + 8 * 3600
+    put(bybit / "forecast" / "latest.json", forecast(t - 7200))
+    real = A.write_json_atomic
+    monkeypatch.setattr(A, "write_json_atomic", lambda path, obj: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+                        if path == okx / "trend" / "control.json" else real(path, obj))
+    a = A.Allocator(bybit, FakeDecider(answers({i: 0.5 for i in BYBIT_IDS})), market, model="ordecide / test", clock=lambda: t,
+                    budget=RateBudget(50), venues=venues(bybit, okx))
+    rec = decide(a, trigger="decide_now")
+    assert list(rec["venues"]["okx-demo"]["write_failed"]) == ["trend"] and "No space left on device" in rec["error"]
+    assert list(a.decision_errors) == ["okx-demo/trend"] and ctl(bybit, "trend")["weight"] > 0  # Bybit's weights run landed
 
 
 # ---------------------------------------------------------------- per-write safety on every venue
