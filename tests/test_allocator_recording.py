@@ -449,3 +449,17 @@ def test_a_switched_off_flat_book_is_recorded_without_exposure(root):
                                          "positions": [{"symbol": "BTCUSDT", "qty": 0.01, "mark_price": 60000.0}]})
     vr = decide(_alloc(root), trigger="decide_now")["venues"]["bybit-demo"]
     assert vr["policies"]["live"]["xsmom"] == 0.3  # off, not yet flat: still exposed
+
+
+def test_the_predictions_panel_finds_a_weights_line_in_a_compressed_archive(tmp_path):
+    import gzip as gz
+
+    from ctb import predictions as P
+
+    d = tmp_path / "allocator"
+    d.mkdir()
+    (d / "decisions-2027-01-11.jsonl.gz").write_bytes(gz.compress((json.dumps({"t_ms": 1, "core": {"trend": 0.4}}) + "\n").encode()))
+    (d / "decisions-2027-01-12.jsonl.gz").write_bytes(gz.compress((json.dumps({"t_ms": 2, "weights_mode": "held"}) + "\n").encode()))
+    (d / "decisions-2027-01-13.jsonl").write_text(json.dumps({"t_ms": 3, "weights_mode": "held"}) + "\n")
+    (d / "decisions.jsonl").write_text(json.dumps({"t_ms": 4, "weights_mode": "refresh"}) + "\n")
+    assert P.newest_with(d, "core")["core"] == {"trend": 0.4}  # two days of held runs in between

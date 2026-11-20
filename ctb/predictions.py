@@ -98,14 +98,38 @@ def read_last_with(path: Path, key: str, max_bytes: int = DECISIONS_READ_BYTES) 
     return None
 
 
+_ARCHIVE_HITS: dict[tuple[str, str], tuple[int, int, dict | None]] = {}  # (archive, key) -> (mtime_ns, size, newest match)
+
+
+def _newest_in(path: Path, key: str) -> dict | None:
+    """The newest line of a whole (possibly gzipped) archive with a non-empty `key`, remembered per file version: an
+    archive no longer changes once written, so it is read once."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    hit = _ARCHIVE_HITS.get((str(path), key))
+    if hit and hit[:2] == (st.st_mtime_ns, st.st_size):
+        return hit[2]
+    found = None
+    for rec in DL._lines(path):  # a damaged archive yields what is readable
+        if rec.get(key):
+            found = rec
+    _ARCHIVE_HITS[(str(path), key)] = (st.st_mtime_ns, st.st_size, found)
+    return found
+
+
 def newest_with(alloc: Path, key: str) -> dict | None:
-    """The newest decision line with a non-empty `key`: the current decisions.jsonl, else the newest archive that is not
-    compressed (after the daily rotation the last weights line is usually in yesterday's file)."""
+    """The newest decision line with a non-empty `key`: the end of the current decisions.jsonl, else the file being split
+    and the archives, newest first, compressed ones too (days of held runs can push the last weights line far back)."""
     line = read_last_with(alloc / DL.LOG, key)
-    if line is None:
-        newest = next((p for _, p in reversed(DL.archives(alloc)) if not p.name.endswith(".gz")), None)
-        line = read_last_with(newest, key) if newest is not None else None
-    return line
+    if line is not None:
+        return line
+    for path in DL._newest_first(alloc)[1:]:
+        line = _newest_in(path, key)
+        if line is not None:
+            return line
+    return None
 
 
 def read_returns(path: Path) -> dict[str, float]:
