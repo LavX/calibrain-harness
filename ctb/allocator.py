@@ -30,7 +30,8 @@ Files under the live root (CTB_LIVE_ROOT, default <repo>/data/live):
   allocator/status.json      written here (see Allocator.status)
   allocator/decisions.jsonl  one line per decision (also risk-floor actions and failed attempts); the full model input
                              only on weights runs, errors and every CTB_ALLOCATOR_FULL_INPUT_EVERY-th routine poll.
-                             Rotated daily (ctb/decision_log.py): decisions-<day>.jsonl, older days gzipped, 90 days kept
+                             Renamed daily to decisions-<day>.jsonl (ctb/decision_log.py); a nightly compact (outside
+                             this process) gzips archives older than 2 days and deletes those older than 90
   allocator/policies.jsonl   one slim line per weights run and managed venue: the paired policies of decisions.jsonl
                              (t_ms, venue, policy_state_version, weights_mode, policies), for the dashboard's history
   allocator/answers.jsonl    one slim line per decider answer (issued_ms, horizon_start_ms, maturity_ms, question_version,
@@ -1895,7 +1896,7 @@ class Allocator:
         err = _join_errors(self.last_error, self._state().get("cap_error")) or (fc.error if fc else None)
         rot = DL.rotation_error(self.dir)
         if rot:  # archiving only: the lines keep going to decisions.jsonl
-            err = _join_errors(err, f"decision log rotation failed, lines keep going to decisions.jsonl and it is retried every 15 min ({rot})")
+            err = _join_errors(err, f"decision log rotation failed, lines keep going to decisions.jsonl and the rename is retried with the next line ({rot})")
         floor = [f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in self.floor_errors.values()]
         if floor:  # the drawdown floor could not cut a book: said even while paused
             err = "; ".join(([err] if err else []) + [f"drawdown floor could not write control.json ({'; '.join(floor)})"])

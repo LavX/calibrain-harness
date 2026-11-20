@@ -71,20 +71,22 @@ def test_routine_polls_keep_the_full_input_only_every_nth_time_weights_runs_and_
 
 
 # ---------------------------------------------------------------- the daily rotation of decisions.jsonl
-def test_decisions_rotate_daily_with_gzip_and_keep_90_days(tmp_path):
+def test_decisions_are_renamed_daily_and_compacted_outside_the_live_path(tmp_path):
     from ctb import decision_log as DL
 
     d = tmp_path / "allocator"
     day0 = DAY * (int(T0) // DAY)
-    for k in range(95):  # one line a day at 12:00 UTC, 95 days
-        DL.append(d, {"t_ms": (day0 + k * DAY + 12 * 3600) * 1000, "k": k}, (day0 + k * DAY + 12 * 3600) * 1000)
-    names = sorted(p.name for p in d.iterdir())
-    days = [m.group(1) for m in map(DL.ARCHIVE_RE.match, names) if m]
-    assert "decisions.jsonl" in names and len(days) == 90  # 94 days archived, the 4 older than 90 days deleted
-    plain = [n for n in names if n.startswith("decisions-") and not n.endswith(".gz")]
-    assert plain == [f"decisions-{days[-1]}.jsonl"]  # every older day is gzipped, the newest archive stays plain
-    assert [r["k"] for r in DL.tail(d, 3)] == [92, 93, 94]  # the feed reads across the rotation
-    assert [r["k"] for r in DL.iter_all(d)] == list(range(4, 95))
+    for k in range(95):  # one line a day at 12:00 UTC, 95 days: each first line of a day renames yesterday's file
+        t = (day0 + k * DAY + 12 * 3600) * 1000
+        DL.append(d, {"t_ms": t, "k": k}, t)
+    dated = sorted(p.name for p in d.iterdir() if DL.DATED_RE.match(p.name))
+    assert len(dated) == 94 and all(n.endswith(".jsonl") for n in dated)  # the live path only renames: nothing gzipped
+    assert [r["k"] for r in DL.iter_all(d)] == list(range(95)) and [r["k"] for r in DL.tail(d, 3)] == [92, 93, 94]
+    now = (day0 + 94 * DAY + 12 * 3600) * 1000
+    out = DL.compact(d, now)
+    assert len(out["deleted"]) == 4 and len(out["gzipped"]) == 88  # older than 90 days gone; older than 2 days gzipped
+    assert DL.compact(d, now) == {"gzipped": [], "deleted": []}  # a rerun has nothing to do
+    assert [r["k"] for r in DL.iter_all(d)] == list(range(4, 95)) and (d / "decisions.jsonl").exists()
 
 
 def test_the_allocator_feed_and_cost_read_across_midnight(root):
@@ -94,7 +96,8 @@ def test_the_allocator_feed_and_cost_read_across_midnight(root):
     clock.t = SLOT + 30 * 60  # 00:20 UTC the next day
     decide(a, trigger="schedule")
     d = root / "allocator"
-    assert sorted(p.name for p in d.iterdir() if p.name.startswith("decisions")) == ["decisions-" + A.time.strftime("%Y-%m-%d", A.time.gmtime(SLOT - 60)) + ".jsonl", "decisions.jsonl"]
+    assert sorted(p.name for p in d.iterdir() if p.name.endswith(".jsonl") and p.name.startswith("decisions")) == [
+        "decisions-" + A.time.strftime("%Y-%m-%d", A.time.gmtime(SLOT - 60)) + ".jsonl", "decisions.jsonl"]
     assert len(a.decisions(10)) == 2 and len(jl(d / "decisions.jsonl")) == 1
 
 
@@ -316,9 +319,9 @@ def test_the_scorer_still_reads_old_decision_lines_once(tmp_path):
     assert c["n"] == 2 and c["brier"] == pytest.approx(((0.7 - 1) ** 2 + (0.4 - 0) ** 2) / 2, abs=1e-4)
 
 
-def test_the_first_rotation_splits_a_legacy_log_by_day_before_retention(tmp_path):
-    """A log from before rotation spans many days. Each line goes to its own day's archive; only days past the 90-day
-    retention are deleted, never recent ones for the date of the file's first line."""
+def test_the_log_from_before_rotation_is_renamed_once_as_legacy_and_kept(tmp_path):
+    """The existing multi-day decisions.jsonl is renamed once, unsplit, to decisions-legacy-<first>-<last>.jsonl. Readers
+    include it in order and compaction never touches it, however old."""
     import calendar
     import datetime as dt
 
@@ -329,32 +332,56 @@ def test_the_first_rotation_splits_a_legacy_log_by_day_before_retention(tmp_path
 
     d = tmp_path / "allocator"
     d.mkdir()
-    legacy = [{"t_ms": ms(7, 1), "k": "jul1"}, {"t_ms": ms(11, 18, 9), "k": "nov18a"}, {"t_ms": ms(11, 18, 23), "k": "nov18b"},
-              {"t_ms": ms(11, 19), "k": "nov19"}]
+    legacy = [{"t_ms": ms(7, 1), "k": "jul1"}, {"t_ms": ms(11, 18, 9), "k": "nov18"}, {"t_ms": ms(11, 20, 8), "k": "nov20a"}]
     (d / "decisions.jsonl").write_text("".join(json.dumps(x) + "\n" for x in legacy))
-    DL.append(d, {"t_ms": ms(11, 20), "k": "nov20"}, ms(11, 20))
-    names = sorted(p.name for p in d.iterdir())
-    assert names == ["decisions-2026-11-18.jsonl.gz", "decisions-2026-11-19.jsonl", "decisions.jsonl"]  # July 1 is past 90 days
-    assert [r["k"] for r in DL.iter_all(d)] == ["nov18a", "nov18b", "nov19", "nov20"]
-    assert [r["k"] for r in DL.tail(d, 2)] == ["nov19", "nov20"]
+    DL.append(d, {"t_ms": ms(11, 20, 9), "k": "nov20b"}, ms(11, 20, 9))  # the first line after deploy, the same day
+    assert (d / "decisions-legacy-2026-07-01-2026-11-20.jsonl").read_text().count("\n") == 3
+    DL.append(d, {"t_ms": ms(11, 21), "k": "nov21"}, ms(11, 21))
+    assert [r["k"] for r in DL.iter_all(d)] == ["jul1", "nov18", "nov20a", "nov20b", "nov21"]
+    assert [r["k"] for r in DL.tail(d, 3)] == ["nov20a", "nov20b", "nov21"]
+    DL.compact(d, ms(11, 21) + 400 * DAY * 1000)  # a year later
+    assert (d / "decisions-legacy-2026-07-01-2026-11-20.jsonl").exists() and [r["k"] for r in DL.iter_all(d)][:3] == ["jul1", "nov18", "nov20a"]
 
 
-def test_a_split_cut_short_is_finished_at_the_next_rotation(tmp_path):
+def test_two_processes_rotating_at_once_rename_once_and_lose_nothing(tmp_path):
+    """The dashboard's allocator and `python -m ctb.allocator once` append to the same log. Both start at the first line
+    of a new day, with the rename slowed down to widen the race: one rename, every line once."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
     from ctb import decision_log as DL
 
     d = tmp_path / "allocator"
     d.mkdir()
-    day = 86_400_000
-    t0 = (int(T0 * 1000) // day) * day
-    (d / "decisions.jsonl.rotating").write_text(json.dumps({"t_ms": t0 + 1000, "k": "a"}) + "\n")  # a crash left it
-    (d / "decisions.jsonl").write_text(json.dumps({"t_ms": t0 + day + 1000, "k": "b"}) + "\n")
-    DL.append(d, {"t_ms": t0 + 2 * day + 1000, "k": "c"}, t0 + 2 * day + 1000)
-    assert [r["k"] for r in DL.iter_all(d)] == ["a", "b", "c"] and not (d / "decisions.jsonl.rotating").exists()
+    now = int(T0 * 1000)
+    yesterday = now - DAY * 1000
+    DL.append(d, {"t_ms": yesterday, "k": "y"}, yesterday)
+    go = tmp_path / "go"
+    script = f"""
+import json, os, sys, time
+from pathlib import Path
+sys.path.insert(0, {str(Path(A.__file__).parents[1])!r})
+from ctb import decision_log as DL
+real = DL._replace
+DL._replace = lambda a, b: (time.sleep(0.2), real(a, b))[1]
+while not os.path.exists({str(go)!r}):
+    time.sleep(0.005)
+for i in range(20):
+    DL.append(Path({str(d)!r}), {{"t_ms": {now} + i, "k": sys.argv[1] + str(i)}}, {now} + i)
+"""
+    procs = [subprocess.Popen([sys.executable, "-c", script, name]) for name in ("a", "b")]
+    go.write_text("")
+    assert [p.wait(timeout=60) for p in procs] == [0, 0]
+    archived = sorted(p.name for p in d.iterdir() if DL.DATED_RE.match(p.name) or DL.LEGACY_RE.match(p.name))
+    assert archived == [f"decisions-{DL.utc_day(yesterday)}.jsonl"]  # renamed once, nothing else renamed
+    keys = [r["k"] for r in DL.iter_all(d)]
+    assert keys[0] == "y" and sorted(keys[1:]) == sorted([f"a{i}" for i in range(20)] + [f"b{i}" for i in range(20)])
+    assert DL._read_day(d)["day"] == DL.utc_day(now)
 
 
-# ---------------------------------------------------------------- archiving never stands in the way of a decision
-@pytest.mark.parametrize("step", ["replace", "split", "gzip", "fsync", "unlink"])
-def test_a_failing_rotation_never_stops_a_weights_run(root, monkeypatch, step):
+@pytest.mark.parametrize("step", ["rename", "day_record"])
+def test_a_failing_rename_never_stops_a_weights_run(root, monkeypatch, step):
     from ctb import decision_log as DL
 
     DL._failures.clear()
@@ -362,16 +389,12 @@ def test_a_failing_rotation_never_stops_a_weights_run(root, monkeypatch, step):
     d.mkdir(exist_ok=True)
     put(d / "control.json", {"enabled": True, "interval_min": 60})
     now = int(T0 * 1000)
-    three = now - 3 * DAY * 1000
-    (d / f"decisions-{DL.utc_day(three)}.jsonl").write_text(json.dumps({"t_ms": three, "k": "old"}) + "\n")  # something to gzip
-    (d / "decisions.jsonl").write_text(json.dumps({"t_ms": now - DAY * 1000, "k": "yesterday"}) + "\n")  # due for rotation
-    boom = OSError(5, f"{step} failed")
+    DL.append(d, {"t_ms": now - DAY * 1000, "k": "yesterday"}, now - DAY * 1000)  # due for its rename
 
     def fail(*a, **k):
-        raise boom
+        raise OSError(5, f"{step} failed")
 
-    target = {"replace": "_replace", "split": "_split", "gzip": "_gzip", "fsync": "_fsync", "unlink": "_unlink"}[step]
-    monkeypatch.setattr(DL, target, fail)
+    monkeypatch.setattr(DL, {"rename": "_replace", "day_record": "_write_day"}[step], fail)
     llm = FakeDecider(answers({"carry": 0.6, "trend": 0.6, "xsmom": 0.6}))
     a = make(root, llm)
     asyncio.run(a._tick())  # a weights run (none was ever set)
@@ -381,8 +404,10 @@ def test_a_failing_rotation_never_stops_a_weights_run(root, monkeypatch, step):
     assert json.loads((d / "state.json").read_text())["last_weights_ms"] == now
     status = json.loads((d / "status.json").read_text())
     assert status["last_decision_ms"] == now and "decision log rotation failed" in status["last_error"] and f"{step} failed" in status["last_error"]
-    b = make(root, llm)
-    assert len(b.budget.calls) == 1  # the restart's budget seed counts the one attempt once
+    assert len(make(root, llm).budget.calls) == 1  # the restart's budget seed counts the one attempt once
+    monkeypatch.undo()
+    DL.append(d, {"t_ms": now + 1, "k": "next"}, now + 1)  # the next line retries and succeeds
+    assert DL.rotation_error(d) is None and [r.get("k") for r in DL.iter_all(d)][-1] == "next"
     DL._failures.clear()
 
 
@@ -413,27 +438,24 @@ def test_a_damaged_archive_is_skipped_by_every_reader(root, damage):
     assert P.newest_with(d, "core")["core"] == {"carry": 0.4}
 
 
-def test_a_gzip_cut_short_leaves_the_archive_and_its_source_intact(tmp_path, monkeypatch):
-    import gzip as gz
-
+def test_a_compaction_cut_short_leaves_the_plain_archive_as_it_was(tmp_path, monkeypatch):
     from ctb import decision_log as DL
 
     d = tmp_path / "allocator"
     d.mkdir()
-    (d / "decisions-2027-01-10.jsonl.gz").write_bytes(gz.compress(b'{"t_ms":1,"k":"a"}\n'))
     src = d / "decisions-2027-01-10.jsonl"
-    src.write_text('{"t_ms":2,"k":"b"}\n')
+    src.write_text('{"t_ms":1,"k":"a"}\n{"t_ms":2,"k":"b"}\n')
 
     def fail(*a, **k):
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(DL, "_fsync", fail)
+    monkeypatch.setattr(DL.shutil, "copyfileobj", fail)
     with pytest.raises(OSError):
         DL._gzip(src)
-    assert src.exists() and [r["k"] for r in DL._lines(d / "decisions-2027-01-10.jsonl.gz")] == ["a"] and not list(d.glob(".*.tmp"))
+    assert src.exists() and not list(d.glob(".*.tmp")) and not (d / "decisions-2027-01-10.jsonl.gz").exists()
     monkeypatch.undo()
     DL._gzip(src)
-    assert not src.exists() and [r["k"] for r in DL._lines(d / "decisions-2027-01-10.jsonl.gz")] == ["a", "b"]
+    assert not src.exists() and [r["k"] for r in DL.iter_all(d)] == ["a", "b"]
 
 
 def test_a_switched_off_flat_book_is_recorded_without_exposure(root):
