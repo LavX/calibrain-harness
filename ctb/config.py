@@ -135,6 +135,7 @@ class Settings:
     allocator_p_window_h: float = _f("CTB_ALLOCATOR_P_WINDOW_H", 24.0)     # p = mean of the decider's answers from the last N hours
     allocator_p_window: int = _i("CTB_ALLOCATOR_P_WINDOW", 5000)           # upper cap on how many answers are kept and averaged (not the window)
     allocator_p_min_fresh: int = _i("CTB_ALLOCATOR_P_MIN_FRESH", 12)       # fewer fresh answers than this: no p (no veto, no decider forecast)
+    allocator_full_input_every: int = _i("CTB_ALLOCATOR_FULL_INPUT_EVERY", 60)  # a routine poll logs its full model input every Nth time
     allocator_vol_cap: float = _f("CTB_ALLOCATOR_VOL_CAP", 0.10)           # portfolio volatility cap, annual
     allocator_buffer: float = _f("CTB_ALLOCATOR_BUFFER", 0.10)             # a weight change under this is not made
     allocator_step_up: float = _f("CTB_ALLOCATOR_STEP_UP", 0.25)           # weight rises at most this much per day

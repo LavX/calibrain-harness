@@ -39,3 +39,28 @@ def test_a_dry_run_or_a_failed_poll_writes_no_answer(root):
     decide(make(root, FakeDecider(answers({"carry": 0.6, "trend": 0.6, "xsmom": 0.6}))), dry_run=True)
     decide(make(root, FakeDecider(KairosError("rate_limited", "slow down"))))
     assert not (root / "allocator" / "answers.jsonl").exists()
+
+
+# ---------------------------------------------------------------- the full model input in decisions.jsonl
+def test_routine_polls_keep_the_full_input_only_every_nth_time_weights_runs_and_errors_always(root):
+    from dataclasses import replace
+
+    from ctb.kairos.client import KairosError
+
+    put_state = {"peaks": {}, "history": {}, "last_weights_ms": int((SLOT - DAY + 60) * 1000)}  # weights set: polls are refreshes
+    (root / "allocator").mkdir(exist_ok=True)
+    (root / "allocator" / "state.json").write_text(json.dumps(put_state))
+    a = make(root, FakeDecider(answers({"carry": 0.6, "trend": 0.6, "xsmom": 0.6})))
+    a.calc = replace(a.calc, full_input_every=3)
+    for _ in range(4):
+        decide(a, trigger="schedule")
+    lines = jl(root / "allocator" / "decisions.jsonl")
+    assert [("inputs" in x, x.get("inputs_omitted", False)) for x in lines] == [(False, True), (False, True), (True, False), (False, True)]
+    assert all(x["weights_mode"] == "refresh" and x["state_bytes"]["total"] > 0 and x["answers"]["p"] for x in lines)
+    decide(a, trigger="decide_now")  # a weights run
+    assert "inputs" in jl(root / "allocator" / "decisions.jsonl")[-1]
+    b = make(root, FakeDecider(KairosError("rate_limited", "slow down")))  # an error: always
+    b.calc = replace(b.calc, full_input_every=3)
+    decide(b, trigger="schedule")
+    last = jl(root / "allocator" / "decisions.jsonl")[-1]
+    assert "slow down" in last["error"] and "inputs" in last

@@ -28,7 +28,8 @@ Files under the live root (CTB_LIVE_ROOT, default <repo>/data/live):
   <id>/control.json          read by the runner; this module writes enabled/weight/set_by/reason
   allocator/control.json     written by the dashboard: {"enabled", "interval_min", "decide_now"}
   allocator/status.json      written here (see Allocator.status)
-  allocator/decisions.jsonl  one line per decision (also risk-floor actions and failed attempts)
+  allocator/decisions.jsonl  one line per decision (also risk-floor actions and failed attempts); the full model input
+                             only on weights runs, errors and every CTB_ALLOCATOR_FULL_INPUT_EVERY-th routine poll
   allocator/answers.jsonl    one slim line per decider answer (issued_ms, horizon_start_ms, maturity_ms, question_version,
                              model, p): what the decider scoring reads; never the model input
   allocator/state.json       equity samples and peaks, so P&L windows and drawdown survive restarts, the
@@ -396,6 +397,7 @@ class Calc:
     p_window: int = 5000        # upper cap on the answers kept and averaged; the window itself is p_window_h
     p_window_h: float = 24.0    # p is the mean of the answers from the last this many hours, at any polling interval
     p_min_fresh: int = 12       # with fewer fresh answers p is None: the veto does not fire, the decider is no forecaster
+    full_input_every: int = 60  # a routine poll (no weights, no error) keeps its full model input in the log every Nth time
     stale_h: float = 36.0
     weights_utc: tuple[int, int] = (23, 50)
     rules: M.RuleParams = M.RuleParams()
@@ -418,7 +420,8 @@ class Calc:
         return Calc(gamma=s.allocator_gamma, horizon_days=s.allocator_horizon_days, cost_bp=s.allocator_cost_bp,
                     carry_cost_bp=s.allocator_carry_cost_bp, sharpe_cap=s.allocator_sharpe_cap, decider_k=s.allocator_decider_k,
                     p_window=max(1, s.allocator_p_window), p_window_h=max(0.01, s.allocator_p_window_h),
-                    p_min_fresh=max(1, s.allocator_p_min_fresh), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
+                    p_min_fresh=max(1, s.allocator_p_min_fresh), full_input_every=max(1, s.allocator_full_input_every),
+                    stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
                     rules=M.RuleParams(vol_cap=s.allocator_vol_cap, buffer=s.allocator_buffer, step_up=s.allocator_step_up,
                                        veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, veto_live=s.allocator_veto_live,
                                        explore_floor=floor),
@@ -832,6 +835,17 @@ class Allocator:
     # ---- computed layer: forecast, decider history, schedule
     def load_forecast(self, now_ms: int) -> Forecast:
         return read_forecast(self.root, now_ms, self.calc.stale_h)
+
+    def _slim_routine_poll(self, record: dict[str, Any], routine: bool) -> None:
+        """A routine poll (an hourly or minutely refresh with no error) logs its full model input only every
+        full_input_every-th time; its answers are in answers.jsonl and the line keeps state_bytes. Weights runs and errors
+        always keep it."""
+        st = self._state()
+        st["polls"] = int(_num(st.get("polls")) or 0) + 1
+        self._dirty = True
+        if routine and st["polls"] % self.calc.full_input_every:
+            record.pop("inputs", None)
+            record["inputs_omitted"] = True
 
     def _log_answer(self, now_ms: int, qset: str | None, p: dict[str, float]) -> None:
         """One slim line per decider answer in allocator/answers.jsonl: each p is the probability that the strategy's unit
@@ -1394,6 +1408,7 @@ class Allocator:
             infeasible = self._cap_infeasible(venues) if kind != "refresh" else self._state().get("cap_error")
             record["error"] = _join_errors(record["error"], infeasible, not_applied)
             if not dry_run:
+                self._slim_routine_poll(record, kind == "refresh" and not error and not not_applied)
                 append_jsonl(self.dir / "decisions.jsonl", record)
                 if kind != "refresh":
                     self._state()["cap_error"] = infeasible
