@@ -110,7 +110,7 @@ export async function headerAuto(doc: StratDoc, on: boolean, venue = "BYBIT·DEM
     if (!confirm(`A kill is pending for ${pending.map((s) => s.name || s.label).join(", ")} on ${venue}. Turning AUTO-TRADE on cancels it for them: if the runner has not started closing yet, their positions will not be closed and they trade from them. Cancel the kill and turn AUTO-TRADE on?`)) return;
   } else if (!confirm(msg)) return;
   try {
-    await post("/api/strategies/auto", { enabled: on, ...(pending.length ? { cancel_kill: true } : {}) });
+    await post("/api/strategies/auto", { enabled: on, ...(pending.length ? { cancel_kill: pending.map((s) => s.id) } : {}) });
   } catch (e: any) {
     alert(e.message);
   }

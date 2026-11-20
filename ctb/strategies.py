@@ -377,7 +377,8 @@ class StrategyService:
         reg = self.registry()
         self._write_allocator(enabled=self.mode(reg) == "llm")
 
-    def _write(self, e: Entry, *, refuse_if_kill: bool = False, derive: Callable[[dict], dict] | None = None, **changes: Any) -> None:
+    def _write(self, e: Entry, *, refuse_if_kill: bool = False, require_kill: bool = False, derive: Callable[[dict], dict] | None = None,
+               **changes: Any) -> None:
         """Merge changes into the strategy's control.json (unknown keys the runner may use are kept), atomically, under the
         file's lock (ctb.control_lock, shared with the allocator). refuse_if_kill re-checks the kill flag inside the lock, so
         an enable that awaited (systemctl) in between cannot switch on over a kill written meanwhile; derive computes changes
@@ -389,6 +390,8 @@ class StrategyService:
                 if not self._is_flat(e):
                     raise StrategyError(409, KILL_PENDING_MSG.format(names=e.label), detail={"kill_pending": [e.id]})
                 changes = {**changes, "flatten": False}  # a stale flag on a flat book: nothing to keep open, nothing to cancel
+            if require_kill and cur.get("flatten") is not True:  # checked here, at the write: the runner may have just cleared it
+                raise StrategyError(409, f"no kill is pending for {e.label}")
             ctl = {**cur, "enabled": self._enabled(e), "flatten": bool(cur.get("flatten")), "reset_latch": bool(cur.get("reset_latch")),
                    **(derive(cur) if derive else {}), **changes, "updated_ms": int(self.clock() * 1000)}
             try:
@@ -528,10 +531,13 @@ class StrategyService:
         if self.mode(reg) == "bot":
             raise StrategyError(409, "the auto-trade mode is PER-SYMBOL BOT. Switch the mode to LLM DECIDES or MANUAL first.")
 
-    async def auto(self, enabled: bool, ids: list[str] | None, *, llm_trading: bool, venue: str, cancel_kill: bool = False) -> dict[str, Any]:
+    async def auto(self, enabled: bool, ids: list[str] | None, *, llm_trading: bool, venue: str,
+                   cancel_kill: bool | list[str] = False) -> dict[str, Any]:
         """The header switch. LLM DECIDES: the allocator on (and the runner running), or the allocator off and every strategy paused.
         MANUAL: the selected strategies on (owner-locked, runner running), or every strategy off. In MANUAL a selected strategy with a
-        pending kill is refused unless cancel_kill (the allocator itself never switches on a strategy with a pending kill)."""
+        pending kill is refused unless cancel_kill names it (a list of the ids the owner confirmed; True means every target); a
+        kill on any other target is refused, also when it lands while the runner is being started (rechecked at the write). The
+        allocator itself never switches on a strategy with a pending kill."""
         reg = self.registry()
         mode = self.mode(reg)
         if mode == "bot":
@@ -553,8 +559,9 @@ class StrategyService:
             self._may_trade(reg, e, llm_trading=llm_trading, venue=venue)
             if mode == "manual" and not (self.root / e.id).is_dir():
                 raise StrategyError(409, f"{self.root / e.id} does not exist: the runner has not created {e.label} yet")
+        cancel_ids = {e.id for e in targets} if cancel_kill is True else set(cancel_kill or [])
         if mode == "manual":
-            self._refuse_if_kill_pending(targets, cancel_kill)
+            self._refuse_if_kill_pending([e for e in targets if e.id not in cancel_ids], False)
         if mode == "llm" and not self.allocator_available:
             raise StrategyError(409, "the LLM allocator is not installed in this build (ctb.allocator); use MANUAL")
         await self._ensure_running([e.unit for e in targets if e.unit])
@@ -562,7 +569,7 @@ class StrategyService:
             self._write_allocator(enabled=True)
         else:
             for e in targets:
-                self._write_owner(e, True, cancel_kill=cancel_kill)
+                self._write_owner(e, True, cancel_kill=e.id in cancel_ids)
         self._cache = None
         return {"ok": True, "enabled": [e.id for e in targets]}
 
@@ -717,10 +724,9 @@ class StrategyService:
             self._refuse_if_kill_pending([e], cancel_kill)
             self._write(e, refuse_if_kill=not cancel_kill, owner_lock=False, set_by="llm", reason="unlocked: the LLM decides at its next decision",
                         **({"flatten": False} if cancel_kill else {}))
-        elif action == "cancel_kill":
-            if not self._kill_pending(e):
-                raise StrategyError(409, f"no kill is pending for {e.label}")
-            self._write(e, flatten=False, reason="kill cancelled by the owner: positions stay open")
+        elif action == "cancel_kill":  # cleared, and the strategy paused and owner-locked, as the page's confirm says
+            self._write(e, require_kill=True, flatten=False, enabled=False, owner_lock=True, set_by="owner",
+                        reason="kill cancelled by the owner: positions stay open, paused")
         else:
             if not (e.unit and is_active(await unit_state(self.run, e.unit))):
                 raise StrategyError(409, f"the runner ({e.unit or 'unit unknown'}) is not running, so nobody would act on a {action}. Start it first.")

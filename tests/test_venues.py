@@ -423,7 +423,10 @@ def test_manual_header_switch_does_not_cancel_a_pending_kill(roots, tmp_path):
         run(svc.auto(True, ["carry", "trend"], llm_trading=False, venue="demo"))
     assert e.value.status == 409 and sorted(e.value.detail["kill_pending"]) == ["carry", "trend"]
     assert all(ctl(roots[0], i)["flatten"] is True and ctl(roots[0], i)["enabled"] is False for i in ("carry", "trend"))
-    run(svc.auto(True, ["carry"], llm_trading=False, venue="demo", cancel_kill=True))
+    with pytest.raises(st.StrategyError) as e:  # the confirm named carry only: trend's kill is not cancelled with it
+        run(svc.auto(True, ["carry", "trend"], llm_trading=False, venue="demo", cancel_kill=["carry"]))
+    assert e.value.detail["kill_pending"] == ["trend"] and ctl(roots[0], "carry")["flatten"] is True
+    run(svc.auto(True, ["carry"], llm_trading=False, venue="demo", cancel_kill=["carry"]))
     assert ctl(roots[0], "carry")["enabled"] is True and ctl(roots[0], "carry")["flatten"] is False
     assert ctl(roots[0], "trend")["flatten"] is True  # not selected: its kill goes on
 
@@ -443,6 +446,16 @@ def test_unlock_and_cancel_kill(roots, tmp_path):
     assert c["flatten"] is False and c["enabled"] is False and c["owner_lock"] is True  # positions stay open, still paused
     with pytest.raises(st.StrategyError):
         run(svc.act("carry", "cancel_kill", llm_trading=False, venue="demo"))  # nothing pending any more
+
+
+def test_cancelling_a_flatten_pauses_and_locks_the_strategy(roots, tmp_path):
+    okx = roots[1]
+    svc = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).service("okx-demo")
+    (okx / "trend" / "control.json").write_text(json.dumps({"enabled": True, "weight": 1.0, "owner_lock": False, "set_by": "llm"}))
+    run(svc.act("trend", "flatten", llm_trading=False, venue="demo"))  # an enabled strategy with a FLATTEN request
+    run(svc.act("trend", "cancel_kill", llm_trading=False, venue="demo"))
+    c = ctl(okx, "trend")
+    assert c["flatten"] is False and c["enabled"] is False and c["owner_lock"] is True  # as the confirm says
 
 
 def test_the_allocator_never_switches_on_a_strategy_with_a_pending_kill(roots):
@@ -759,6 +772,8 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             assert {x["venue"]: x["ok"] for x in body["venues"]} == {"bybit-demo": False, "okx-demo": True, "deribit-test": False}
             assert ctl(roots[1], "trend")["flatten"] is True
             assert (await c.post("/api/venues/okx-demo/strategies/trend/unlock", json={})).status == 409
+            r = await c.post("/api/venues/okx-demo/strategies/trend/enable", data="{oops", headers={"Content-Type": "application/json"})
+            assert r.status == 400  # a malformed cancel_kill body is not read as "no"
             for bad in ("{not json", ""):  # a malformed or empty body is the client's error: 400, not 500
                 r = await c.post("/api/venues/okx-demo/runner/start", data=bad, headers={"Content-Type": "application/json"})
                 assert r.status == 400 and "not valid JSON" in (await r.json())["error"]
@@ -918,3 +933,34 @@ def test_enable_clears_a_stale_flag_on_a_flat_book_without_cancel(roots, tmp_pat
     run(h.service("okx-demo").act("longvol", "enable", llm_trading=False, venue="demo"))  # no cancel_kill needed: nothing to keep open
     c = ctl(okx, "longvol")
     assert c["enabled"] is True and c["flatten"] is False
+
+
+def test_api_kill_turns_the_bots_trading_off_even_when_the_venue_has_not_started(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from ctb.server import make_app
+
+    class Engine:
+        s = SimpleNamespace(trading_enabled=True, public_view=lambda: {})
+        db = SimpleNamespace(event=lambda *a: a, one=lambda *a: None)
+        executor = None
+
+        async def start(self): ...
+        async def stop(self): ...
+        def emit(self, *a): ...
+
+    monkeypatch.setenv("CTB_VENUE", "demo")
+    svc = st.StrategyService(tmp_path / "nothing", run=FakeSystemd(), clock=lambda: NOW, extra_units=(), dashboard_account="demo-main")
+    svc._mode = "manual"  # the strategies own the account, but bybit-demo has not started
+    eng = Engine()
+    app = make_app(eng, hub=V.VenueHub.single(svc, state=tmp_path / "state"))
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+
+    async def go():
+        async with TestClient(TestServer(app)) as c:
+            r = await c.post("/api/kill", json={})
+            return r.status, await r.json()
+
+    status, body = run(go())
+    assert status == 409 and "has not started" in body["error"] and body["bot_auto_trade"] == "off" and eng.s.trading_enabled is False

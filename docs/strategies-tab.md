@@ -126,7 +126,10 @@ A pending kill (`flatten: true`) ends in one of two ways only: the runner, once 
 (`research/live/runner.py` `_flatten_clear`: it writes `enabled: false, flatten: false`), or the owner cancels it. The
 card switch, the MANUAL header switch and UNLOCK TO LLM answer 409 "a kill is pending" for such a strategy unless the
 request carries `cancel_kill: true`, which the page sends only after a confirm that says that, if the runner has not
-started closing yet, the positions will not be closed (closes already sent still land). The card also has CANCEL KILL (`/strategies/{sid}/cancel_kill`: flatten cleared, still paused and owner-locked).
+started closing yet, the positions will not be closed (closes already sent still land). The card also has CANCEL KILL (`/strategies/{sid}/cancel_kill`: flatten cleared, and the strategy paused and
+owner-locked, also when it was an enabled strategy's FLATTEN request). The MANUAL header switch takes `cancel_kill` as the
+list of ids the confirm named; any other target with a pending kill is refused, also when the kill lands while the runner
+is being started (rechecked at the write).
 The allocator never switches on a strategy whose control.json has `flatten: true` (it logs why and skips it). A decision
 that was still running when the allocator was paused (AUTO-TRADE OFF, or a switch to MANUAL or PER-SYMBOL BOT) writes only
 what reduces risk (switching off, a lower weight); the decision feed marks the rest "allocator paused during the decision". The "kill

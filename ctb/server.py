@@ -128,12 +128,11 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             return None
 
     async def cancel_kill(req: web.Request) -> bool:
-        """The explicit owner choice to cancel a pending kill, sent by the page only after a confirm that says the
-        positions will NOT be closed."""
-        try:
-            body = await req.json()
-        except ValueError:
+        """The explicit owner choice to cancel a pending kill, sent by the page only after a confirm. No body means no; a
+        malformed body is the client's error (the middleware answers 400)."""
+        if not req.can_read_body:
             return False
+        body = await req.json()
         return isinstance(body, dict) and body.get("cancel_kill") is True
 
     async def bot_kill(ex: Any, reason: str) -> dict[str, Any]:
@@ -484,7 +483,9 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         ids = body.get("ids")
         try:
             return j(await strat.auto(bool(body.get("enabled")), [str(i) for i in ids] if isinstance(ids, list) else None,
-                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name(), cancel_kill=body.get("cancel_kill") is True))
+                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name(),
+                                      cancel_kill=([str(i) for i in body["cancel_kill"]] if isinstance(body.get("cancel_kill"), list)
+                                                   else body.get("cancel_kill") is True)))
         except strat_mod.StrategyError as exc:
             return refused(exc)
 
@@ -537,15 +538,13 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     @routes.post("/api/kill")
     async def kill(_: web.Request) -> web.Response:
         if strat.owns_account():  # the runner owns the positions: flatten through its books, never behind its back
+            s.trading_enabled = False  # whatever the venue answers, the per-symbol bot's auto-trade goes off with a KILL
             try:  # alias of /api/venues/bybit-demo/kill: written always, confirmed only when the runner is up and fresh
                 out = await hub.kill(hub.primary_id)
             except strat_mod.StrategyError as exc:
-                if exc.detail:  # the flags were written: the bot's auto-trade goes off with them, and the answer says so
-                    s.trading_enabled = False
-                    exc.detail["bot_auto_trade"] = "off"
+                exc.detail["bot_auto_trade"] = "off"
                 engine.emit("event", engine.db.event("warn", "killed", f"kill: {exc.message}"))
                 return refused(exc)
-            s.trading_enabled = False
             done = out["flattening"]
             engine.emit("event", engine.db.event("warn", "killed", f"kill switch: allocator paused, strategies flattening: {', '.join(done)}"))
             return j({**out, "ok": True, "flattening": done, "bot_auto_trade": "off"})
