@@ -29,6 +29,8 @@ Files under the live root (CTB_LIVE_ROOT, default <repo>/data/live):
   allocator/control.json     written by the dashboard: {"enabled", "interval_min", "decide_now"}
   allocator/status.json      written here (see Allocator.status)
   allocator/decisions.jsonl  one line per decision (also risk-floor actions and failed attempts)
+  allocator/answers.jsonl    one slim line per decider answer (issued_ms, horizon_start_ms, maturity_ms, question_version,
+                             model, p): what the decider scoring reads; never the model input
   allocator/state.json       equity samples and peaks, so P&L windows and drawdown survive restarts, the
                              decider's last answers (p_hist) and when weights were last set
   forecast/latest.json       written by the prediction layer (read only here)
@@ -132,6 +134,9 @@ def read_json(path: Path) -> Any:
 
 def _join_errors(*parts: str | None) -> str | None:
     return "; ".join(p for p in parts if p) or None
+
+
+ANSWER_HORIZON_MS = 24 * 3_600_000  # the question set asks about the next 24 hours
 
 
 def write_json_atomic(path: Path, obj: Any) -> None:
@@ -828,6 +833,13 @@ class Allocator:
     def load_forecast(self, now_ms: int) -> Forecast:
         return read_forecast(self.root, now_ms, self.calc.stale_h)
 
+    def _log_answer(self, now_ms: int, qset: str | None, p: dict[str, float]) -> None:
+        """One slim line per decider answer in allocator/answers.jsonl: each p is the probability that the strategy's unit
+        book return over [horizon_start_ms, maturity_ms] is positive (the question's next 24 hours from the poll)."""
+        append_jsonl(self.dir / "answers.jsonl", {
+            "issued_ms": now_ms, "horizon_start_ms": now_ms, "maturity_ms": now_ms + ANSWER_HORIZON_MS,
+            "question_version": qset or QUESTION_SET_VERSION, "model": self.model, "p": {sid: round(float(v), 6) for sid, v in p.items()}})
+
     def _push_p(self, p: dict[str, float], now_ms: int) -> None:
         hist = self._state()["p_hist"]
         for sid, v in p.items():
@@ -1306,6 +1318,7 @@ class Allocator:
             p_new = (extra.get("answers") or {}).get("p") or {}
             if p_new and not dry_run:
                 self._push_p(p_new, now_ms)
+                self._log_answer(now_ms, extra.get("qset"), p_new)
             fresh = self.p_fresh(ids, p_new if dry_run else None, now_ms)
             p_now = {sid: v for sid, (v, _) in fresh.items()}
             weights_run = trigger != "schedule" or self.weights_due(now_ms)
