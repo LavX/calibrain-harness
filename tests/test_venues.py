@@ -243,6 +243,31 @@ def test_unit_times_come_as_unix_seconds_with_a_fallback():
     assert u["active"] == "active" and u["since_s"] is None and u["since"].startswith("Fri")
 
 
+def test_an_empty_strategies_json_is_not_started(roots, tmp_path):
+    (roots[1] / "strategies.json").write_text("[]")
+    h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
+    v = run(h.summary())["venues"][1]
+    assert v["presence"] == "absent" and "lists no strategy" in v["presence_text"] and v["kill"]["available"] is False
+    with pytest.raises(st.StrategyError) as e:
+        run(h.kill("okx-demo"))
+    assert "has not started" in e.value.message and e.value.detail == {}
+
+
+def test_a_never_traded_idle_strategy_is_flagged_after_a_day_not_at_once(roots, tmp_path):
+    p = roots[1] / "longvol" / "control.json"  # idle: no position, no target, never traded
+    for age_h, flagged in ((1, False), (25, True)):
+        p.write_text(json.dumps({"enabled": True, "weight": 1.0, "owner_lock": True, "updated_ms": int((NOW - age_h * 3600) * 1000)}))
+        alerts = run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).summary())["alerts"]
+        assert any(a["strategy"] == "longvol" and a["kind"] == "idle" for a in alerts) is flagged, age_h
+
+
+def test_exchange_position_size_is_unsigned(roots, tmp_path):
+    acct = {**ACCOUNT, "positions": [{**ACCOUNT["positions"][0], "size": -0.05}]}
+    row = next(r for r in run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(acct))["venues"][0]["positions"]
+               if r["source"] == "exchange")
+    assert row["size"] == 0.05 and row["side"] == "short"
+
+
 def test_presence_error_fails_closed(roots, tmp_path):
     (roots[1] / "strategies.json").write_text("{broken")
     doc = run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).summary())
@@ -730,6 +755,9 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             assert {x["venue"]: x["ok"] for x in body["venues"]} == {"bybit-demo": False, "okx-demo": True, "deribit-test": False}
             assert ctl(roots[1], "trend")["flatten"] is True
             assert (await c.post("/api/venues/okx-demo/strategies/trend/unlock", json={})).status == 409
+            for bad in ("{not json", ""):  # a malformed or empty body is the client's error: 400, not 500
+                r = await c.post("/api/venues/okx-demo/runner/start", data=bad, headers={"Content-Type": "application/json"})
+                assert r.status == 400 and "not valid JSON" in (await r.json())["error"]
             r = await c.post("/api/venues/okx-demo/strategies/trend/enable", json={})  # its kill is pending
             assert r.status == 409 and (await r.json())["kill_pending"] == ["trend"]
             assert (await c.post("/api/venues/okx-demo/strategies/trend/enable", json={"cancel_kill": True})).status == 200

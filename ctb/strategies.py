@@ -312,7 +312,7 @@ def control_view(ctl: dict, st: dict | None) -> dict[str, Any]:
     return {"enabled": bool(ctl["enabled"]) if "enabled" in ctl else (st["enabled"] if st else False),
             "weight": _num(ctl.get("weight")), "set_by": ctl.get("set_by") if ctl.get("set_by") in ("llm", "owner") else None,
             "owner_lock": bool(ctl.get("owner_lock")), "reason": str(ctl["reason"])[:500] if ctl.get("reason") else None,
-            "flatten_pending": bool(ctl.get("flatten")), "reset_pending": bool(ctl.get("reset_latch"))}
+            "flatten_pending": bool(ctl.get("flatten")), "reset_pending": bool(ctl.get("reset_latch")), "updated_ms": _num(ctl.get("updated_ms"))}
 
 
 class StrategyService:

@@ -94,7 +94,7 @@ bybit-demo must be listed: the allocator, the predictions panel and the per-symb
 `/api/strategies` (and its actions) are aliases of `/api/venues/bybit-demo/...`. Unset, the dashboard has one venue,
 bybit-demo at `CTB_LIVE_ROOT`, as before. Each venue has a presence: **live** (unit active, a status.json fresher than
 3 min), **stale** (unit active, every status.json older), **stopped** (unit not active), **absent** (no root or no
-strategies.json, or no known unit and no status.json yet: "not started") and **error** (strategies.json unusable).
+strategies.json, an empty one, or no known unit and no status.json yet: "not started") and **error** (strategies.json unusable).
 Two venues may not share a root (refused at startup, like a malformed entry). A strategy whose own unit is down while the
 venue is up raises a "unit down" alert. Unit start times are read as unix seconds and shown in UTC.
 
@@ -106,8 +106,8 @@ KILL always records the owner's intent: it pauses the allocator (bybit-demo), an
 (owner-locked) with its flatten flag set. It then answers 200 only when every written strategy's runner unit is active and
 its status.json is fresh (checked per strategy, since units can be per strategy). Otherwise it answers 409 "written, NOT
 confirmed" naming the strategies nobody may be acting for yet: a hung or restarting runner reads the flags when it comes
-back. A failed write answers 500 with what was and was not written. The flags are written before anything else is read
-(systemd, status files), and a strategy with no known runner unit is never reported confirmed. Neither is a latched strategy: the runner skips a
+back. A failed write answers 500 with what was and was not written. The flags are written before any systemd call (only
+strategies.json and the status files are read first, to tell a venue that has not started), and a strategy with no known runner unit is never reported confirmed. Neither is a latched strategy: the runner skips a
 latched strategy before it reads `flatten`, so its kill runs only after the latch is reset (the answer, the preview and
 a critical alert say so). A strategy listed in
 strategies.json without a directory is named as not flagged. F1's KILL button applies the same per-strategy test, so its
@@ -123,8 +123,8 @@ button) is the bybit-demo kill in LLM DECIDES and MANUAL.
 A pending kill (`flatten: true`) ends in one of two ways only: the runner, once flat, clears the flag itself
 (`research/live/runner.py` `_flatten_clear`: it writes `enabled: false, flatten: false`), or the owner cancels it. The
 card switch, the MANUAL header switch and UNLOCK TO LLM answer 409 "a kill is pending" for such a strategy unless the
-request carries `cancel_kill: true`, which the page sends only after a confirm that says the positions will NOT be
-closed. The card also has CANCEL KILL (`/strategies/{sid}/cancel_kill`: flatten cleared, still paused and owner-locked).
+request carries `cancel_kill: true`, which the page sends only after a confirm that says that, if the runner has not
+started closing yet, the positions will not be closed (closes already sent still land). The card also has CANCEL KILL (`/strategies/{sid}/cancel_kill`: flatten cleared, still paused and owner-locked).
 The allocator never switches on a strategy whose control.json has `flatten: true` (it logs why and skips it). The "kill
 pending" alert shows only while the book still holds positions (or is switched on); flat and paused is done.
 UNLOCK TO LLM is refused on an owner-controlled venue (no allocator).

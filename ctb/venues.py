@@ -116,11 +116,13 @@ def utc_day(now_s: float) -> str:
 
 
 def presence(cfg: VenueConfig, *, has_registry: bool, reg_error: str | None, units: list[dict], statuses: list[dict | None],
-             now_ms: float) -> tuple[str, str | None]:
+             now_ms: float, n_strategies: int | None = None) -> tuple[str, str | None]:
     """(state, why). `units` are the unit states of the runner unit(s) this venue's strategies name (or its configured unit);
     `statuses` the cleaned status.json of each strategy."""
     if not cfg.root.is_dir() or not has_registry:
         return "absent", f"not started: no strategies.json under {cfg.root}"
+    if n_strategies == 0 and not reg_error:
+        return "absent", "not started: strategies.json lists no strategy"
     if reg_error:
         return "error", reg_error
     if not units and not any(statuses):
@@ -232,7 +234,8 @@ def exchange_positions(account: dict, strategies: list[dict]) -> list[dict]:
             names = held.setdefault(p.get("symbol", ""), [])
             if s["name"] not in names:
                 names.append(s["name"])
-    out = [{"symbol": p.get("symbol", ""), "market": "linear", "side": p.get("side", ""), "size": _num(p.get("size")),
+    out = [{"symbol": p.get("symbol", ""), "market": "linear", "side": p.get("side", ""),
+            "size": abs(_num(p.get("size"))) if _num(p.get("size")) is not None else None,  # the side carries the sign
             "entry": _num(p.get("entry")), "mark": _num(p.get("mark")), "upnl": _num(p.get("upnl")),
             "held_by": held.get(p.get("symbol", ""), []), "legs": None, "source": "exchange"} for p in account.get("positions") or []]
     # the exchange feed holds USDT linear positions only (bybit_rest.positions): the books' spot legs are kept next to it
@@ -271,6 +274,7 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
         "last_error": st.get("last_error") if st else None,
         "updated_ms": st.get("updated_ms") if st else None, "last_rebalance_ms": st.get("last_rebalance_ms") if st else None,
         "last_trade_ms": last_trade, "trades_today": st.get("trades_today") if st else None,
+        "control_ms": ctl.get("updated_ms"),  # the last switch or weight change: an idle clock for a strategy that never traded
     }
 
 
@@ -315,10 +319,12 @@ def alerts(v: dict, now_ms: float) -> list[dict]:
             add("crit", "unit_down", f"runner unit {s.get('unit') or '(unknown)'} is not active: nothing trades or flattens this strategy", sid, name)
         elif p == "no_data" and pres == "live":
             add("warn", "no_data", "no status.json yet", sid, name)
-        elif p == "idle":
+        elif p == "idle":  # idle for a day: since its last trade, or (never traded) since its control last changed
             last = s.get("last_trade_ms")
-            if last is None or now_ms - last > IDLE_ALERT_S * 1000:
-                since = "no trade yet" if last is None else f"last trade {int((now_ms - last) / 3_600_000)} h ago"
+            ref = last if last is not None else s.get("control_ms")
+            if ref is None or now_ms - ref > IDLE_ALERT_S * 1000:
+                since = (f"last trade {int((now_ms - last) / 3_600_000)} h ago" if last is not None
+                         else "no trade yet" + (f", switched on {int((now_ms - ref) / 3_600_000)} h ago" if ref is not None else ""))
                 add("warn", "idle", f"enabled but holds nothing and wants nothing ({since})", sid, name)
         elif err and p in ("running", "paused"):
             if re.search(r"rejected|given up|not tradeable|restricted", err, re.I):
@@ -522,7 +528,7 @@ class VenueHub:
         wanted = entry_units or ([cfg.unit] if cfg.unit else [])
         units = [u for u in doc["runners"] if u.get("unit") in wanted]
         pres, why = presence(cfg, has_registry=has_registry, reg_error=doc.get("error"), units=units,
-                             statuses=[s.get("status") for s in doc["strategies"]], now_ms=now_ms)
+                             statuses=[s.get("status") for s in doc["strategies"]], now_ms=now_ms, n_strategies=len(doc["strategies"]))
         today = [r for r in rows if r["pnl_today"] is not None]
 
         def total(key: str) -> float | None:  # the known values summed; None when none is known (never a made-up zero)
@@ -608,6 +614,8 @@ class VenueHub:
         reg = svc.registry()
         if reg.error:
             raise S.StrategyError(409, kill_refusal(cfg, "error", reg.error))
+        if not reg.entries:  # an empty strategies.json: nothing to flag, same as presence() "not started"
+            raise S.StrategyError(409, kill_refusal(cfg, "absent", None))
         # the same "not started" test as presence(): no runner unit known and no strategy has written a status yet
         if not (any(e.unit for e in reg.entries) or cfg.unit) and not any(S.read_json(cfg.root / e.id / "status.json") for e in reg.entries):
             raise S.StrategyError(409, kill_refusal(cfg, "absent", None))

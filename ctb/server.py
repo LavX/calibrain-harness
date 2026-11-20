@@ -96,7 +96,10 @@ async def same_origin_only(request: web.Request, handler):
             return j({"error": "cross-origin request refused"}, 403)
         if not request.content_type.startswith("application/json"):
             return j({"error": "Content-Type must be application/json"}, 415)
-    return await handler(request)
+    try:
+        return await handler(request)
+    except json.JSONDecodeError:  # a handler's `await req.json()` on a malformed or empty body: the client's error, not ours
+        return j({"error": "the request body is not valid JSON"}, 400)
 
 
 VENUE_SAMPLE_S = 60.0  # the venue sampler: 00:00 UTC baselines and sparklines fill even with no browser open
