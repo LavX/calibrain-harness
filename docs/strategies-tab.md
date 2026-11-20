@@ -11,8 +11,8 @@ The header has a mode selector next to AUTO-TRADE. Exactly one mode trades the d
 
 | Mode | Who decides | AUTO-TRADE switch |
 | --- | --- | --- |
-| LLM DECIDES | the LLM allocator (`ctb/allocator.py`) picks which strategies trade and their weight | on: allocator on and runner started; off: allocator paused and every strategy off (positions stay open, but the drawdown floor still closes a book 15% below its peak) |
-| MANUAL | you, per card (the allocator is paused) | on: the strategies ticked "in header set" are switched on and the runner started; off: all off |
+| LLM DECIDES | the LLM allocator (`ctb/allocator.py`) picks which strategies trade and their weight | on: allocator on and runner started; off: allocator paused and every strategy off (positions stay open, but the drawdown floor still closes a book 15% below its peak, except books you switched on by hand, which the floor does not touch) |
+| MANUAL | you, per card (the allocator is paused) | on: the strategies ticked "in header set" are switched on (owner-locked) and the runner started; off: all off. The drawdown floor does not touch owner-locked books, so in MANUAL it protects nothing the header switch or a card turned on |
 | PER-SYMBOL BOT | the older per-symbol LLM bot | the existing switch (`/api/trading`) |
 
 With no `strategies.json` and no allocator the selector is hidden and the header behaves as before.
