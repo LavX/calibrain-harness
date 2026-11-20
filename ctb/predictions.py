@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import allocator_math as M
+from . import decision_log as DL
 from .strategies import live_root, load_registry, read_json
 
 GO_LIVE = os.environ.get("CTB_GO_LIVE_DATE") or "2026-11-19"  # the first day the live book trades; P&L comparisons start here
@@ -94,6 +95,16 @@ def read_last_with(path: Path, key: str, max_bytes: int = DECISIONS_READ_BYTES) 
         if isinstance(rec, dict) and rec.get(key):  # a non-empty value: a "held" line has an empty core
             return rec
     return None
+
+
+def newest_with(alloc: Path, key: str) -> dict | None:
+    """The newest decision line with a non-empty `key`: the current decisions.jsonl, else the newest archive that is not
+    compressed (after the daily rotation the last weights line is usually in yesterday's file)."""
+    line = read_last_with(alloc / DL.LOG, key)
+    if line is None:
+        newest = next((p for _, p in reversed(DL.archives(alloc)) if not p.name.endswith(".gz")), None)
+        line = read_last_with(newest, key) if newest is not None else None
+    return line
 
 
 def read_returns(path: Path) -> dict[str, float]:
@@ -328,7 +339,7 @@ def build(root: Path, now_s: float, go_live: str = GO_LIVE) -> dict[str, Any]:
     regime = read_json(root / "regime" / "latest.json")
     fc = read_json(root / "forecast" / "latest.json")
     scores = read_json(root / "forecast" / "scores.json")
-    line = read_last_with(root / "allocator" / "decisions.jsonl", "core")
+    line = newest_with(root / "allocator", "core")
     ids = list(labels)
     for src in ((fc or {}).get("strategies"), (line or {}).get("core"), (scores or {}).get("loss")):
         if isinstance(src, dict):

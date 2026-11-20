@@ -29,7 +29,8 @@ Files under the live root (CTB_LIVE_ROOT, default <repo>/data/live):
   allocator/control.json     written by the dashboard: {"enabled", "interval_min", "decide_now"}
   allocator/status.json      written here (see Allocator.status)
   allocator/decisions.jsonl  one line per decision (also risk-floor actions and failed attempts); the full model input
-                             only on weights runs, errors and every CTB_ALLOCATOR_FULL_INPUT_EVERY-th routine poll
+                             only on weights runs, errors and every CTB_ALLOCATOR_FULL_INPUT_EVERY-th routine poll.
+                             Rotated daily (ctb/decision_log.py): decisions-<day>.jsonl, older days gzipped, 90 days kept
   allocator/answers.jsonl    one slim line per decider answer (issued_ms, horizon_start_ms, maturity_ms, question_version,
                              model, p): what the decider scoring reads; never the model input
   allocator/state.json       equity samples and peaks, so P&L windows and drawdown survive restarts, the
@@ -88,6 +89,7 @@ import aiohttp
 
 from . import allocator_context as X
 from . import allocator_math as M
+from . import decision_log as DL
 from .config import ROOT, Settings
 from . import strategies as S
 from .control_lock import locked
@@ -801,7 +803,7 @@ class Allocator:
     def _seed_budget(self) -> None:
         """The hourly request budget has to survive restarts: count the model attempts already logged."""
         cutoff = self.clock() - 3600
-        for row in tail_jsonl(self.dir / "decisions.jsonl", 200):
+        for row in DL.tail(self.dir, 200):
             t = _num(row.get("t_ms"))
             if t and t / 1000 > cutoff:
                 for _ in range(int(row.get("attempts") or 0)):
@@ -1298,7 +1300,7 @@ class Allocator:
             not_applied = self._write_failures(venues, now_ms, dry_run)
             record["error"] = _join_errors(record["error"], not_applied)
             if not dry_run:
-                append_jsonl(self.dir / "decisions.jsonl", record)
+                DL.append(self.dir, record, now_ms)
                 self.last_error = record["error"]
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
@@ -1409,7 +1411,7 @@ class Allocator:
             record["error"] = _join_errors(record["error"], infeasible, not_applied)
             if not dry_run:
                 self._slim_routine_poll(record, kind == "refresh" and not error and not not_applied)
-                append_jsonl(self.dir / "decisions.jsonl", record)
+                DL.append(self.dir, record, now_ms)
                 if kind != "refresh":
                     self._state()["cap_error"] = infeasible
                 self.last_error = _join_errors(error, not_applied)  # forecast and persistent cap errors are added by write_status
@@ -1716,7 +1718,7 @@ class Allocator:
                         "skipped_paused": [x for x in self._paused_skips if x in applied], "risk_floor": todo, "attempts": 0,
                         "write_failed": {k: e for k, e in failed.items() if k},
                         "error": f"drawdown floor not applied, tried again every tick ({txt})" if failed else None}
-                append_jsonl(self.dir / "decisions.jsonl", last)
+                DL.append(self.dir, last, now_ms)
             self.floor_errors = errs
             if last is not None or self._dirty:
                 self._save_state()
@@ -1725,7 +1727,7 @@ class Allocator:
     # ---- status
     def cost_usd_today(self, now_ms: int) -> float:
         day0 = now_ms - now_ms % DAY_MS
-        return round(sum(_num(r.get("cost_usd")) or 0.0 for r in tail_jsonl(self.dir / "decisions.jsonl", 500)
+        return round(sum(_num(r.get("cost_usd")) or 0.0 for r in DL.tail(self.dir, 500)
                          if (_num(r.get("t_ms")) or 0) >= day0), 6)
 
     def status(self) -> dict[str, Any]:
@@ -1736,7 +1738,7 @@ class Allocator:
 
     def decisions(self, limit: int = 50) -> list[dict[str, Any]]:
         """Newest first."""
-        return list(reversed(tail_jsonl(self.dir / "decisions.jsonl", max(1, min(limit, 500)))))
+        return list(reversed(DL.tail(self.dir, max(1, min(limit, 500)))))
 
     def write_status(self, now_ms: int, *, last_decision_ms: int | None = None, paused: bool = False) -> None:
         ctl = self.control()
@@ -1872,7 +1874,7 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
     per: dict[str, dict[str, Any]] = {}
     best_stats = {"n": 0, "correct": 0, "p_realised": 0.0}
     pending, unlabelled = 0, {"flat": 0, "no_equity": 0}
-    for d in tail_jsonl(alloc / "decisions.jsonl", 5000):
+    for d in DL.tail(alloc, 5000):
         ans = d.get("answers")
         if d.get("qset") not in (SCORED_QSETS if qset is None else (qset,)) or d.get("error") or d.get("dry_run") or not isinstance(ans, dict):
             continue

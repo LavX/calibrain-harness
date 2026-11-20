@@ -64,3 +64,41 @@ def test_routine_polls_keep_the_full_input_only_every_nth_time_weights_runs_and_
     decide(b, trigger="schedule")
     last = jl(root / "allocator" / "decisions.jsonl")[-1]
     assert "slow down" in last["error"] and "inputs" in last
+
+
+# ---------------------------------------------------------------- the daily rotation of decisions.jsonl
+def test_decisions_rotate_daily_with_gzip_and_keep_90_days(tmp_path):
+    from ctb import decision_log as DL
+
+    d = tmp_path / "allocator"
+    day0 = DAY * (int(T0) // DAY)
+    for k in range(95):  # one line a day at 12:00 UTC, 95 days
+        DL.append(d, {"t_ms": (day0 + k * DAY + 12 * 3600) * 1000, "k": k}, (day0 + k * DAY + 12 * 3600) * 1000)
+    names = sorted(p.name for p in d.iterdir())
+    days = [m.group(1) for m in map(DL.ARCHIVE_RE.match, names) if m]
+    assert "decisions.jsonl" in names and len(days) == 90  # 94 days archived, the 4 older than 90 days deleted
+    plain = [n for n in names if n.startswith("decisions-") and not n.endswith(".gz")]
+    assert plain == [f"decisions-{days[-1]}.jsonl"]  # every older day is gzipped, the newest archive stays plain
+    assert [r["k"] for r in DL.tail(d, 3)] == [92, 93, 94]  # the feed reads across the rotation
+    assert [r["k"] for r in DL.iter_all(d)] == list(range(4, 95))
+
+
+def test_the_allocator_feed_and_cost_read_across_midnight(root):
+    clock = Clock(SLOT - 60)  # 23:49 UTC
+    a = make(root, FakeDecider(answers({"carry": 0.6, "trend": 0.6, "xsmom": 0.6})), clock=clock)
+    decide(a, trigger="decide_now")
+    clock.t = SLOT + 30 * 60  # 00:20 UTC the next day
+    decide(a, trigger="schedule")
+    d = root / "allocator"
+    assert sorted(p.name for p in d.iterdir() if p.name.startswith("decisions")) == ["decisions-" + A.time.strftime("%Y-%m-%d", A.time.gmtime(SLOT - 60)) + ".jsonl", "decisions.jsonl"]
+    assert len(a.decisions(10)) == 2 and len(jl(d / "decisions.jsonl")) == 1
+
+
+def test_the_predictions_panel_finds_yesterdays_weights_line_after_the_rotation(tmp_path):
+    from ctb import predictions as P
+
+    d = tmp_path / "allocator"
+    d.mkdir()
+    (d / "decisions-2027-01-14.jsonl").write_text(json.dumps({"t_ms": 1, "core": {"trend": 0.4}}) + "\n")
+    (d / "decisions.jsonl").write_text(json.dumps({"t_ms": 2, "weights_mode": "refresh"}) + "\n")
+    assert P.newest_with(d, "core")["core"] == {"trend": 0.4}
