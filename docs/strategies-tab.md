@@ -11,8 +11,8 @@ The header has a mode selector next to AUTO-TRADE. Exactly one mode trades the d
 
 | Mode | Who decides | AUTO-TRADE switch |
 | --- | --- | --- |
-| LLM DECIDES | the LLM allocator (`ctb/allocator.py`) picks which strategies trade and their weight | on: allocator on and runner started; off: allocator paused and every strategy off |
-| MANUAL | you, per card (the allocator is paused) | on: the strategies ticked "in header set" are switched on and the runner started; off: all off |
+| LLM DECIDES | the LLM allocator (`ctb/allocator.py`) picks which strategies trade and their weight | on: allocator on and runner started; off: allocator paused and every strategy off (positions stay open, but the drawdown floor still closes a book 15% below its peak, except books you switched on by hand, which the floor does not touch) |
+| MANUAL | you, per card (the allocator is paused) | on: the strategies ticked "in header set" are switched on (owner-locked) and the runner started; off: all off. The drawdown floor does not touch owner-locked books, so in MANUAL it protects nothing the header switch or a card turned on |
 | PER-SYMBOL BOT | the older per-symbol LLM bot | the existing switch (`/api/trading`) |
 
 With no `strategies.json` and no allocator the selector is hidden and the header behaves as before.
@@ -86,9 +86,22 @@ CTB_LIVE_ROOTS=bybit-demo=<root>,okx-demo=<root>,deribit-test=<root>,bitget-demo
 | Venue id | Label | Unit | Currency | Controlled by |
 | --- | --- | --- | --- | --- |
 | bybit-demo | BYBIT·DEMO | calibrain-live.service | USDT | the LLM allocator |
-| okx-demo | OKX·DEMO | calibrain-live-okx.service | USDT | the owner |
-| deribit-test | DERIBIT·TEST | calibrain-live-deribit.service | USDC | the owner |
-| bitget-demo | BITGET·DEMO | calibrain-live-bitget.service | USDT | the owner |
+| okx-demo | OKX·DEMO | calibrain-live-okx.service | USDT | the LLM allocator |
+| deribit-test | DERIBIT·TEST | calibrain-live-deribit.service | USDC | the LLM allocator |
+| bitget-demo | BITGET·DEMO | calibrain-live-bitget.service | USDT | the LLM allocator |
+
+Every venue is the LLM allocator's unless `CTB_ALLOCATOR_VENUES` (comma-separated venue ids, default every configured
+venue) leaves it out; a left-out venue is the owner's. The allocator makes one decision per strategy (on bybit-demo's
+books, forecasts and decider) and applies it to each venue it controls whose runner lists that strategy, under that
+venue's own risk rules: the 10% vol cap over that venue's strategies, the 15% drawdown floor per (venue, strategy) book,
+the +0.25 daily step from a day anchor per (venue, strategy), the exploration floor per (venue, strategy), and on every
+write the owner lock, a pending kill and the allocator's pause (only risk-reducing writes while paused). The header
+AUTO-TRADE switch and the mode apply to every allocator venue: OFF pauses their strategies, ON in LLM DECIDES starts
+their runners (ON in MANUAL switches only the bybit-demo header set). KILL stays per venue. F7's HAND TO ALLOCATOR
+(`POST /api/venues/{vid}/hand-to-allocator`, body `{"cancel_kill": true}` to cancel pending kills) clears the owner
+locks on a venue's strategies so the allocator decides them at its next weights run. A strategy without an owner lock
+is the allocator's from its first tick (the drawdown floor can cut it at once); see docs/allocator.md "Venues" for the
+step from the day anchor and the vol cap, which uses bybit-demo's forecast for every venue (an approximation elsewhere).
 
 bybit-demo must be listed: the allocator, the predictions panel and the per-symbol bot's guard stay bound to it, and
 `/api/strategies` (and its actions) are aliases of `/api/venues/bybit-demo/...`. Unset, the dashboard has one venue,

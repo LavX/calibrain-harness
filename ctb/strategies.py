@@ -291,7 +291,13 @@ def is_active(st: dict[str, Any]) -> bool:
 
 # ------------------------------------------------------------------------------------------------ service
 DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "skipped_kill_pending",
-                 "skipped_paused", "risk_floor", "error")
+                 "skipped_paused", "risk_floor", "write_failed", "error", "venue", "venue_label", "venues")
+
+
+def _write_errors(raw: Any) -> list[dict[str, Any]]:
+    return [{"venue": str(e.get("venue") or ""), "venue_label": str(e.get("venue_label") or e.get("venue") or ""),
+             "strategy": str(e["strategy"]) if e.get("strategy") else None, "error": str(e.get("error") or "")[:300], "t_ms": _num(e.get("t_ms"))}
+            for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)][:50]
 
 
 def clean_allocator(status: dict | None, control: dict | None, decisions: list[dict]) -> dict[str, Any]:
@@ -304,7 +310,10 @@ def clean_allocator(status: dict | None, control: dict | None, decisions: list[d
                **{k: _num(status.get(k)) for k in ("last_decision_ms", "next_decision_ms", "cost_usd_today", "last_weights_ms",
                                                    "next_weights_ms", "updated_ms")},
                "weights_mode": status.get("weights_mode") if isinstance(status.get("weights_mode"), str) else None,
-               "last_error": str(status["last_error"])[:500] if status.get("last_error") else None}
+               "last_error": str(status["last_error"])[:500] if status.get("last_error") else None,
+               # the failed writes of the drawdown floor and of the last decision, per (venue, strategy): the venue alerts name them
+               "risk_floor_errors": _write_errors(status.get("risk_floor_errors")),
+               "decision_write_errors": _write_errors(status.get("decision_write_errors"))}
     ctl = {"enabled": bool(control and control.get("enabled")), "interval_min": int(control["interval_min"]) if control and isinstance(control.get("interval_min"), int) else None,
            "decide_now_pending": bool(control and control.get("decide_now"))}
     return {"status": stt, "control": ctl, "decisions": [{k: d.get(k) for k in DECISION_KEYS} for d in decisions]}
@@ -709,7 +718,7 @@ class StrategyService:
             self._write_owner(e, False)
         elif action == "unlock":
             if not self.has_allocator:
-                raise StrategyError(409, "this venue is controlled by the owner: there is no LLM allocator to hand the strategy to")
+                raise StrategyError(409, "this venue is controlled by the owner (CTB_ALLOCATOR_VENUES leaves it out): there is no LLM allocator to hand the strategy to")
             self._refuse_if_kill_pending([e], cancel_kill)
             self._write(e, refuse_if_kill=not cancel_kill, owner_lock=False, set_by="llm", reason="unlocked: the LLM decides at its next decision",
                         **({"flatten": False} if cancel_kill else {}))
@@ -727,6 +736,40 @@ class StrategyService:
                 self._write(e, reset_latch=True)
         self._cache = None
         return {"ok": True, "action": action}
+
+    def hand_to_allocator(self, cancel_kill: bool = False) -> dict[str, Any]:
+        """Owner action: hand every strategy of this venue to the LLM allocator (owner_lock cleared, set_by llm). The
+        allocator sets their weights at its next weights run. A strategy with a pending kill is refused unless cancel_kill,
+        as for UNLOCK TO LLM; the others are handed all the same, and the answer says which were refused."""
+        if not self.has_allocator:
+            raise StrategyError(409, "this venue is not controlled by the LLM allocator (CTB_ALLOCATOR_VENUES leaves it out)")
+        reg = self.registry()
+        if reg.error:
+            raise StrategyError(409, f"strategies.json is unusable: {reg.error}")
+        handed: list[str] = []
+        already: list[str] = []
+        refused: dict[str, str] = {}
+        for e in reg.entries:
+            if not (self.root / e.id).is_dir():
+                refused[e.id] = "no directory: the runner has not created it yet"
+                continue
+            ctl = self._control(e)
+            if ctl.get("owner_lock") is not True and ctl.get("set_by") == "llm":
+                already.append(e.id)
+                continue
+            try:
+                self._write(e, refuse_if_kill=not cancel_kill, owner_lock=False, set_by="llm",
+                            reason="handed to the LLM allocator by the owner: it decides at its next weights run",
+                            **({"flatten": False} if cancel_kill else {}))
+                handed.append(e.id)
+            except StrategyError as exc:
+                refused[e.id] = exc.message
+        self._cache = None
+        out = {"ok": not refused, "handed": handed, "already": already, "refused": refused}
+        if refused:
+            raise StrategyError(409, f"handed to the allocator: {', '.join(handed) or 'none'}; refused: "
+                                     + "; ".join(f"{k} ({v})" for k, v in refused.items()), detail=out)
+        return out
 
     async def allocator_act(self, action: str, interval_min: Any = None) -> dict[str, Any]:
         """Allocator panel: decide now, or set the interval (minutes)."""

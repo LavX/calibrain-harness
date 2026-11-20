@@ -131,6 +131,9 @@ export function CommandBar() {
   const hasModes = !!strat && (strat.strategies.length > 0 || strat.allocator?.available);
   const mode = modeOf(strat);
   const allocVenue = venues?.venues.find((v) => v.id === venues.primary)?.label || "BYBIT·DEMO";
+  // the header switch applies to every venue the LLM allocator controls, not only the allocator venue
+  const otherVenues = (venues?.venues || []).filter((v) => v.id !== venues?.primary && v.controlled_by === "allocator" && v.presence !== "absent").map((v) => v.label);
+  const allVenues = [allocVenue, ...otherVenues].join(", ");
   const onKill = async () => {
     if (mode === "bot") {
       if (confirm(`KILL the per-symbol bot: close all its positions on ${botVenue}, cancel its orders and switch its AUTO-TRADE off?`)) {
@@ -144,8 +147,8 @@ export function CommandBar() {
   const autoTip = mode === "unknown" ? "Loading the strategies' state: the switch works once it is known" : mode === "bot"
     ? `Allow the per-symbol bot to place orders on ${botVenue}`
     : mode === "llm"
-      ? `${allocVenue} only (the allocator venue). On: the LLM allocator decides which strategies trade there and how much. Off: the allocator pauses and every ${allocVenue} strategy is paused; positions stay open (use KILL to close them). Other venues are switched per strategy on F7.`
-      : `${allocVenue} only. On: the strategies in the header set (F7) are switched on. Off: every ${allocVenue} strategy is paused; positions stay open (use KILL to close them).`;
+      ? `Every venue the LLM allocator controls (${allVenues}). On: the allocator decides which strategies trade there and how much. Off: the allocator pauses and every strategy there is paused; positions stay open, except that the 15% drawdown floor still closes a book that falls 15% below its peak. It does not touch a book you switched by hand (owner-locked). Use KILL to close everything.`
+      : `On: the strategies in the ${allocVenue} header set (F7) are switched on and locked as yours. Off: every strategy on ${allVenues} is paused; positions stay open. The drawdown floor does not touch a book you switched on by hand, so in MANUAL it does not protect the books this switch turned on. Use KILL to close everything.`;
 
   return (
     <header className="cmdbar">
@@ -170,8 +173,8 @@ export function CommandBar() {
         )}
         <label className="arm" data-tip={autoTip}>
           <input type="checkbox" disabled={mode === "unknown"} checked={mode === "bot" ? !!ov?.settings.trading_enabled : !!strat?.auto_on}
-            onChange={(e) => (mode === "bot" ? onTrading(e.target.checked) : strat && headerAuto(strat, e.target.checked, allocVenue))} />
-          <span className="arm-box" /><span>AUTO-TRADE{mode !== "bot" && mode !== "unknown" ? ` · ${allocVenue}` : ""}</span>
+            onChange={(e) => (mode === "bot" ? onTrading(e.target.checked) : strat && headerAuto(strat, e.target.checked, allocVenue, otherVenues))} />
+          <span className="arm-box" /><span>AUTO-TRADE{mode !== "bot" && mode !== "unknown" ? ` · ${otherVenues.length ? `${otherVenues.length + 1} VENUES` : allocVenue}` : ""}</span>
         </label>
         <button className="kbtn" onClick={() => setState({ modal: { kind: "keys" } })}>KEYS</button>
         <span data-tip={mode === "bot" ? `Close the per-symbol bot's positions on ${botVenue}, cancel its orders, stop its trading` : !venues ? "Loading the venues: KILL ALL works once they are known (F1 has per-venue KILL)" : "KILL ALL: pause and flag to flatten every venue that has started (per-venue KILL is on F1). The answer says, per venue, whether the runner confirms."}>

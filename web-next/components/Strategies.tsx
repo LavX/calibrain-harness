@@ -23,7 +23,14 @@ type Strat = {
   id: string; name: string; label: string; pnl_today?: number | null; pnl_today_since_ms?: number | null; pnl_today_since?: string | null; unit: string | null; account: string; status: Status | null; pill: string; control: Control;
   trades: Trade[]; equity_history: [number, number][]; runner_active: boolean;
 };
-type Decision = { t_ms: number; model: string; trigger?: string; risk_floor?: string[]; error?: string | null; weights: Record<string, number>; enabled: Record<string, boolean>; reasoning: string; applied: Record<string, boolean> | null; skipped_owner_lock: string[] | null; skipped_kill_pending?: string[] | null; skipped_paused?: string[] | null };
+type Decision = { t_ms: number; model: string; trigger?: string; risk_floor?: string[]; error?: string | null; weights: Record<string, number>; enabled: Record<string, boolean>; reasoning: string; applied: Record<string, boolean> | null; skipped_owner_lock: string[] | null; skipped_kill_pending?: string[] | null; skipped_paused?: string[] | null;
+  venue?: string; venue_label?: string; venues?: Record<string, VenueDecision> };
+/** One venue's part of an allocator decision: what was written per strategy, and why not. */
+type VenueDecision = {
+  label: string; managed: boolean; weights?: Record<string, number>; enabled?: Record<string, boolean>; applied?: Record<string, boolean>;
+  skipped_owner_lock?: string[]; skipped_kill_pending?: string[]; skipped_paused?: string[]; risk_floor?: string[]; note?: string;
+  write_failed?: Record<string, string>; error?: string;
+};
 type Allocator = {
   available: boolean;
   status: { state: string; model: string | null; last_decision_ms: number | null; next_decision_ms: number | null; last_error: string | null; cost_usd_today: number | null } | null;
@@ -34,7 +41,7 @@ type Runner = { unit: string; load: string; active: string; since?: string; sinc
 export type StratDoc = {
   mode: "llm" | "manual" | "bot"; auto_on: boolean; error: string | null; root: string; venue: string; llm_trading_enabled: boolean;
   allocator: Allocator; runners: Runner[]; strategies: Strat[]; auto_set: string[] | null;
-  venue_id: string; venue_label: string; ccy: string; controlled_by: "allocator" | "owner"; allocator_venue: boolean;
+  venue_id: string; venue_label: string; ccy: string; controlled_by: "allocator" | "owner"; allocator_venue: boolean; allocator_managed?: boolean;
   dashboard_account: string | null;
 };
 
@@ -75,8 +82,8 @@ export async function switchMode(from: string, to: string, doc?: StratDoc | null
       : "The per-symbol bot trades another account, so nothing of the strategies changes: the LLM allocator and the BYBIT·DEMO strategies keep running as they are. Only the header mode changes. Other venues are not affected."
     : from === "bot"
       ? "The per-symbol bot's AUTO-TRADE is turned off first."
-      : to === "manual" ? "The LLM allocator is paused. Strategies stay as they are and you switch them per card."
-        : "When AUTO-TRADE is on, the allocator decides which BYBIT·DEMO strategies trade and how much. Strategies you switched by hand stay locked until you unlock them.";
+      : to === "manual" ? "The LLM allocator is paused: it makes no decisions. Strategies stay as they are and you switch them per card. In MANUAL the drawdown floor protects nothing you switch on: the header switch and the cards lock every book they turn on as yours, and the floor never touches a locked book. Only a book still unlocked is closed when it falls 15% below its peak. Use KILL or FLATTEN to close the others."
+        : "When AUTO-TRADE is on, the allocator decides which strategies trade on every venue it controls and how much. Strategies you switched by hand stay locked until you unlock them.";
   if (to === "bot") {
     const typed = prompt(`Switch the auto-trade mode to PER-SYMBOL BOT?\n\n${what}\n\nType BOT to confirm.`);
     if ((typed || "").trim().toUpperCase() !== "BOT") return;
@@ -96,13 +103,14 @@ function manualSet(doc: StratDoc): string[] {
 }
 
 /** Header AUTO-TRADE switch in LLM DECIDES or MANUAL mode: the allocator venue only. */
-export async function headerAuto(doc: StratDoc, on: boolean, venue = "BYBIT·DEMO") {
+export async function headerAuto(doc: StratDoc, on: boolean, venue = "BYBIT·DEMO", others: string[] = []) {
+  const everywhere = others.length ? ` and on ${others.join(", ")}` : "";
   const set = doc.mode === "manual" ? manualSet(doc) : doc.strategies.map((s) => s.id);
   const msg = on
     ? doc.mode === "llm"
-      ? `Turn AUTO-TRADE on for ${venue}? The LLM allocator will decide which strategies trade there and how much. The strategy runner is started if needed. Other venues are not affected.`
-      : `Turn AUTO-TRADE on for ${set.join(", ") || "no strategy"} on ${venue}? The strategy runner is started if needed. Other venues are not affected.`
-    : `Turn AUTO-TRADE off for ${venue}? ${doc.mode === "llm" ? "The allocator pauses and every" : "Every"} ${venue} strategy is paused: it places no new orders. Positions stay open (use KILL to close them).`;
+      ? `Turn AUTO-TRADE on for ${venue}${everywhere}? The LLM allocator will decide which strategies trade there and how much. Their strategy runners are started if needed.`
+      : `Turn AUTO-TRADE on for ${set.join(", ") || "no strategy"} on ${venue}? The strategy runner is started if needed. Each of them is locked as yours, so the 15% drawdown floor does not protect it: only KILL or FLATTEN closes it.${others.length ? ` On ${others.join(", ")} nothing changes in MANUAL: switch their strategies per card.` : ""}`
+    : `Turn AUTO-TRADE off for ${venue}${everywhere}? ${doc.mode === "llm" ? "The allocator pauses and every" : "Every"} strategy there is paused: it places no new orders. ${doc.mode === "llm" ? "Positions stay open, except that the 15% drawdown floor still closes a book that falls 15% below its peak. It does not touch a book you switched by hand (owner-locked). Use KILL to close everything." : "Positions stay open. The 15% drawdown floor does not touch a book you switched on by hand, and in MANUAL that is every book the header switch or a card turned on: those are not protected. It still closes any other book that falls 15% below its peak. Use KILL to close everything."}`;
   // a status showing no position does not prove a book flat: every pending kill is named and needs the owner's cancel
   const pending = on && doc.mode === "manual" ? doc.strategies.filter((s) => set.includes(s.id) && s.control.flatten_pending) : [];
   if (pending.length) {
@@ -162,7 +170,8 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
     setBusy(false);
     await reloadAll(doc.venue_id);
   };
-  const lockTxt = doc.allocator_venue ? " Your choice is locked: the LLM allocator will not change it until you unlock it." : "";
+  const byAllocator = doc.controlled_by === "allocator";
+  const lockTxt = byAllocator ? " Your choice is locked: the LLM allocator will not change it until you unlock it." : "";
   const open_n = st?.positions.length ?? 0;
   // A pending kill ends when the runner, flat, clears it, or when the owner cancels it here, never as a side effect.
   const cancelTxt = `A kill is pending for ${s.label} on ${venue}${open_n ? ` and ${open_n} positions are still open` : " (its last status shows no position, which does not prove the book flat)"}. Cancel the kill? If the runner has not started closing yet, the positions will not be closed.`;
@@ -195,7 +204,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
         <span className="ph-r" data-tip={s.label}>{venue} · {s.unit || "no unit"}{s.account ? ` · account ${s.account}` : ""}</span></div>
       <div className="pb">
         <div className="strat-actions">
-          <label className="arm" data-tip={`Auto trade: on = the runner places this strategy's orders on ${venue}, off = it stops placing new orders and keeps its positions open.${doc.allocator_venue ? " Flipping it by hand locks it against the LLM allocator." : ""}`}>
+          <label className="arm" data-tip={`Auto trade: on = the runner places this strategy's orders on ${venue}, off = it stops placing new orders and keeps its positions open.${byAllocator ? " Flipping it by hand locks it against the LLM allocator." : ""}`}>
             <input type="checkbox" checked={c.enabled} disabled={busy || mode === "bot"} onChange={(e) => flip(e.target.checked)} />
             <span className="arm-box" /><span>AUTO TRADE</span>
           </label>
@@ -217,7 +226,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
           <span className="muted" data-tip="The weight the runner applied (status.json); the request in control.json follows when it differs">WEIGHT</span> <b className="w">{isNum(st?.weight) ? fx(st!.weight, 2) : NA}</b>
           {isNum(c.weight) && (!isNum(st?.weight) || Math.abs(Number(c.weight) - Number(st!.weight)) >= 0.005) && <span className="amb" data-tip="control.json asks for this; the runner applies it at its next loop"> (requested {fx(c.weight, 2)})</span>}
           <span className="muted"> · set by</span> <b className="w">{(st?.set_by || c.set_by) === "llm" ? "LLM allocator" : (st?.set_by || c.set_by) === "owner" ? "owner" : NA}</b>
-          {doc.allocator_venue && c.owner_lock && (
+          {byAllocator && c.owner_lock && (
             <>
               <span className="tag amb">OWNER LOCK</span>
               <button className="kbtn" disabled={busy} onClick={unlock} data-tip="Hand this strategy back to the LLM allocator at its next decision">UNLOCK TO LLM</button>
@@ -330,12 +339,15 @@ function AllocatorPanel({ doc }: { doc: StratDoc }) {
         <div className="ph sub"><span className="code">FEED</span>Decisions<span className="ph-r">last {a.decisions.length}</span></div>
         {a.decisions.length ? (
           <table className="t">
-            <thead><tr><th>Time</th><th>Weights</th><th>Reasoning</th></tr></thead>
+            <thead><tr><th>Time</th><th>Weights · {doc.venue_label}</th><th>Other venues</th><th>Reasoning</th></tr></thead>
             <tbody>{a.decisions.map((d) => (
               <tr key={d.t_ms}><td>{dt(d.t_ms / 1000)}</td>
-                <td className="wrap">{Object.entries(d.weights || {}).map(([id, w]) => (
+                <td className="wrap">{d.venue && d.venue !== doc.venue_id ? <span className="muted">see {d.venue_label}</span> : Object.entries(d.weights || {}).map(([id, w]) => (
                   <div key={id}><span className="amb" data-tip={id}>{names.get(id) || id}</span> {fx(w, 2)}{d.enabled?.[id] === false ? " (off)" : ""}{d.skipped_owner_lock?.includes(id) ? " (owner lock, not applied)" : ""}{d.skipped_kill_pending?.includes(id) ? " (kill pending, not switched on)" : ""}{d.skipped_paused?.includes(id) ? " (allocator paused during the decision, not applied)" : ""}</div>
                 ))}</td>
+                <td className="wrap">{d.venue && d.venue !== doc.venue_id && (
+                  <div><span className="amb">{d.venue_label}:</span> {Object.entries(d.weights || {}).filter(([id]) => d.risk_floor?.includes(id)).map(([id, w]) => `${names.get(id) || id} ${fx(w, 2)}`).join(", ")} <span className="muted">(risk floor)</span></div>
+                )}<VenueLines d={d} names={names} primary={doc.venue_id} /></td>
                 <td className="wrap">{d.error && <div className="dn">failed: {d.error}</div>}{d.risk_floor?.length ? <div className="amb">risk floor: {d.risk_floor.join(", ")}</div> : null}{d.reasoning}<span className="muted"> {d.trigger ? `(${d.trigger})` : ""}</span></td></tr>
             ))}</tbody>
           </table>
@@ -343,6 +355,41 @@ function AllocatorPanel({ doc }: { doc: StratDoc }) {
       </div>
     </section>
   );
+}
+
+/** Per venue (other than the allocator venue) what one decision wrote, and why a strategy was not written. */
+function VenueLines({ d, names, primary }: { d: Decision; names: Map<string, string>; primary: string }) {
+  const others = Object.entries(d.venues || {}).filter(([vid]) => vid !== primary);
+  if (!others.length) return null;
+  return <>{others.map(([vid, v]) => {
+    const why = (id: string) => v.write_failed?.[id] ? "write failed" : v.skipped_owner_lock?.includes(id) ? "owner lock" : v.skipped_kill_pending?.includes(id) ? "kill pending"
+      : v.skipped_paused?.includes(id) ? "allocator paused" : v.risk_floor?.includes(id) ? "risk floor" : v.applied?.[id] ? "written" : "unchanged";
+    return (
+      <div key={vid}><span className="muted">{v.label}:</span>{" "}
+        {v.note ? <span className={v.error ? "dn" : "muted"}>{v.note}{v.error ? `: ${v.error}` : ""}</span> : Object.entries(v.weights || {}).map(([id, w], i) => (
+          <span key={id}>{i ? ", " : ""}{names.get(id) || id} {fx(w, 2)} <span className="muted">({why(id)})</span></span>))}
+      </div>
+    );
+  })}</>;
+}
+
+/** Owner action: clear the owner locks on every strategy of this venue, so the LLM allocator decides them. */
+function HandToAllocator({ doc }: { doc: StratDoc }) {
+  const [busy, setBusy] = useState(false);
+  const go = async () => {
+    const locked = doc.strategies.filter((s) => s.control.owner_lock).map((s) => s.name || s.id);
+    if (!confirm(`Hand ${locked.join(", ")} on ${doc.venue_label} to the LLM allocator? Their owner locks are cleared; the allocator sets their weights at its next weights run (DECIDE NOW, or 23:50 UTC) under this venue's own risk rules. A strategy with a pending kill is refused.`)) return;
+    setBusy(true);
+    try {
+      const r = await post(`/api/venues/${encodeURIComponent(doc.venue_id)}/hand-to-allocator`);
+      alert(`Handed to the allocator: ${r.handed.join(", ") || "none"}${r.already.length ? `; already its: ${r.already.join(", ")}` : ""}`);
+    } catch (e: any) {
+      alert(e.message);
+    }
+    setBusy(false);
+    await reloadAll(doc.venue_id);
+  };
+  return <button className="kbtn amber" disabled={busy} onClick={go} data-tip="Clear the owner locks on this venue's strategies: the LLM allocator decides them from its next weights run">HAND TO ALLOCATOR</button>;
 }
 
 function RunnerBar({ doc }: { doc: StratDoc }) {
@@ -424,7 +471,10 @@ export function StrategiesView() {
         <span className="code">STRATEGIES</span><VenueTabs venues={venues} sel={sel} /><b>{doc.venue_label}</b>
         {doc.allocator_venue
           ? <span className="muted">mode <b className="w">{MODE_LABEL[doc.mode]}</b> · AUTO-TRADE <b className="w">{doc.auto_on ? "ON" : "OFF"}</b> · orders go to {doc.venue_label} only</span>
-          : <span className="muted">controlled by the owner (no allocator) · orders go to {doc.venue_label} only · settles in {doc.ccy}</span>}
+          : doc.controlled_by === "allocator"
+            ? <span className="muted">controlled by the LLM allocator (its decision per strategy, this venue&apos;s own risk rules) · orders go to {doc.venue_label} only · settles in {doc.ccy}</span>
+            : <span className="muted">controlled by the owner (CTB_ALLOCATOR_VENUES leaves it out) · orders go to {doc.venue_label} only · settles in {doc.ccy}</span>}
+        {!doc.allocator_venue && doc.controlled_by === "allocator" && doc.strategies.some((s) => s.control.owner_lock) && <HandToAllocator doc={doc} />}
         {v && v.presence !== "live" && <span className={`vbadge ${PRESENCE[v.presence]?.[1] || "bad"}`} data-tip={v.presence_text || undefined}>{PRESENCE[v.presence]?.[0] || v.presence}</span>}
         <button className="kbtn" onClick={() => reloadAll(isPrimary ? undefined : sel)}>REFRESH</button>
       </div>

@@ -25,6 +25,39 @@ Layout under the live root (`CTB_LIVE_ROOT`, default `data/live`; on aurora4
 | `allocator/state.json` | allocator | equity samples and peaks for the P&L windows and the drawdown floor, the decider's last answers (`p_hist`), `last_weights_ms` |
 | `forecast/latest.json`, `regime/latest.json` | prediction layer (`research/live/forecast.py`, `regime.py`) | read only here; contract in `live-status-contract.md` revision 3 |
 
+## Venues
+
+The allocator lives in the bybit-demo root (its control, status, decisions and state files, and the forecast and regime
+it reads) and makes one decision per strategy there. It applies that decision to every venue in `CTB_LIVE_ROOTS` that it
+controls (`CTB_ALLOCATOR_VENUES`, default all) and whose runner's strategies.json lists the strategy; a strategy a venue
+does not list is never written there, and a strategy no decision covers (not on bybit-demo, or left unanswered by the
+decision model) is held at that venue's own allocation. Each venue is its own
+account: the vol cap is computed over that venue's strategies, the drawdown floor, the day anchor of the daily step and
+the exploration floor are per (venue, strategy), and every write checks that venue's owner lock and pending kill and the
+allocator's pause. `state.json` keys peaks, history and the day anchor as `<venue>/<strategy>` (files from before are
+migrated on load: their keys become `bybit-demo/<id>`, values unchanged; `keys_version` 2). The decider's answers
+(`p_hist`) stay per strategy. A decision line keeps bybit-demo's fields at the top level and adds `venues`: per venue the
+weights, what was written, and the owner-lock, kill-pending, paused and risk-floor skips. A risk-floor line names its venue.
+
+Things to know before handing a venue over:
+- A venue's control.json without `owner_lock` is the allocator's from its first tick: the drawdown floor (every tick,
+  30 s, also while the allocator is paused) can cut a book more than 15% below its peak at once.
+- HAND TO ALLOCATOR keeps the current enabled and weight; the next weights run (DECIDE NOW, or 23:50 UTC) sets them. The
+  day anchor is the weight at that day's first weights run, so a cut lands at once and an increase is capped at +0.25 per
+  day from the anchor (computed mode; the decider-only fallback steps at most 0.5 per decision).
+- The vol cap of every venue is computed from bybit-demo's forecast (sigma and covariance of Bybit's return series) over
+  that venue's strategies. For another exchange it is an approximation: its fills, symbols and margin currency differ.
+- The drawdown floor keeps running while the allocator is paused (AUTO-TRADE OFF, MANUAL, PER-SYMBOL BOT, a bybit-demo
+  KILL): pausing stops decisions, not the floor on books that are still open. The floor never touches an owner-locked
+  book, and in MANUAL every book the header switch or a card turned on is owner-locked: there it protects none of them.
+- Each (venue, strategy) stands alone in the floor: a control.json that cannot be written (a read-only directory, a full
+  disk) is logged, named in the feed and in `status.json` (`last_error`, `risk_floor_errors`), and raised as a red
+  FLOOR FAILED alert for that venue and strategy; the floor goes on with the other books and tries again every tick.
+- A decision does the same: a write that fails on one book (or a venue that fails as a whole) leaves that book as it was
+  and is named in the decision's `error`, `write_failed` in its venue part, `status.json` (`last_error`,
+  `decision_write_errors`) and a red WRITE FAILED alert. The decision line is still written and the next decision is
+  still an interval away: a failed write never makes the allocator ask the model again at once.
+
 ## Rules enforced in code
 
 - A weight moves at most 0.5 per decision.

@@ -3,10 +3,13 @@ from ctb.allocator import Current
 
 class _A:
     from ctb.allocator import Allocator as _Alloc
+    from ctb.allocator import AllocVenue as _Venue
     _day_anchor = _Alloc._day_anchor
+    vk = _Alloc.vk
 
     def __init__(self):
         self.st = {}
+        self.primary = self._Venue("bybit-demo", None, "BYBIT·DEMO")  # the anchor is keyed per (venue, strategy)
 
     def _state(self):
         return self.st

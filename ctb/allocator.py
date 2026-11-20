@@ -44,6 +44,16 @@ Hard rules, enforced in code whatever the model says:
   - invalid model output is retried once, then the current allocation is kept and the error logged.
 (The step limit, the floor and owner_lock apply after the probability mapping as well.)
 
+Venues (CTB_LIVE_ROOTS, ctb/venues.py): the decision is made once per STRATEGY (core weight, shadow tilt, decider p,
+veto, regime, forecasts are venue-independent; the model sees the allocator venue's books, bybit-demo) and applied to
+every venue the allocator manages (CTB_ALLOCATOR_VENUES, default all configured venues) whose strategies.json lists
+that strategy; a strategy a venue's runner does not list is never written there. Each venue is its own account, so the
+risk rules run per venue: the portfolio vol cap over that venue's strategies, the drawdown floor per (venue, strategy)
+book, the daily step-up from a day anchor per (venue, strategy), the exploration floor per (venue, strategy), and every
+write's owner_lock, flatten and pause checks. State keys are "<venue>/<strategy>" (older files are migrated on load:
+the bybit-only keys become "bybit-demo/<id>", values unchanged). The decision record's top-level fields stay the
+allocator venue's; "venues" holds, per venue, what was written or skipped and why.
+
 No orders are placed here. The only network calls are the model and Bybit public market data.
 
 CLI:  python -m ctb.allocator once [--dry-run]   |   run   |   score   |   reset-peak [id ...]
@@ -74,6 +84,7 @@ import aiohttp
 from . import allocator_context as X
 from . import allocator_math as M
 from .config import ROOT, Settings
+from . import strategies as S
 from .control_lock import locked
 from .kairos.allocator_prompt import REASONING_MAX_CHARS, build_messages, build_schema, retry_messages
 from .kairos.allocator_questions import (BEST_QID, NONE_ID, QUESTION_SET_VERSION, SCORED_QSETS, MappingParams, batches,
@@ -92,6 +103,17 @@ DAY_MS = 86_400_000
 SAMPLE_EVERY_MS = 10 * 60_000       # equity samples kept for the P&L windows
 HISTORY_MS = 8 * DAY_MS
 ALLOCATOR_ID = "allocator"
+PRIMARY_VENUE = "bybit-demo"  # the venue whose root holds the allocator's own files and whose books the model sees
+STATE_KEYS_VERSION = 2          # state.json keys peaks/history/day_anchor per "<venue>/<strategy>"
+
+
+@dataclass(frozen=True)
+class AllocVenue:
+    """One venue the allocator applies its per-strategy decision to. managed False: computed and logged, never written."""
+    id: str
+    root: Path
+    label: str
+    managed: bool = True
 
 
 def live_root() -> Path:
@@ -104,6 +126,10 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+
+
+def _join_errors(*parts: str | None) -> str | None:
+    return "; ".join(p for p in parts if p) or None
 
 
 def write_json_atomic(path: Path, obj: Any) -> None:
@@ -233,6 +259,9 @@ class Decision:
     reasoning: str
     confidence: float | None
     derive_enabled: tuple[str, ...] = ()  # ids whose enabled flag follows their final weight (decision model mapping)
+    # ids the decision model left unanswered (decider-only mapping): their weights are the decision venue's own allocation,
+    # kept; every other venue keeps its own allocation for them too
+    held: tuple[str, ...] = ()
 
 
 def validate_decision(raw: Any, ids: list[str]) -> Decision:
@@ -663,10 +692,16 @@ class Allocator:
                  budget: RateBudget | None = None, clock: Callable[[], float] = time.time,
                  default_interval_min: int = 60, max_step: float = 0.5, dd_floor_pct: float = 15.0,
                  flatten_on_floor: bool = True, tick_s: float = 30.0, mode: str | None = None,
-                 params: MappingParams | None = None, max_questions: int | None = None, calc: Calc | None = None):
+                 params: MappingParams | None = None, max_questions: int | None = None, calc: Calc | None = None,
+                 venues: list[AllocVenue] | None = None):
         # mode "decider": llm.ask(state, questions) answers alloc-v1.0; mode "chat": llm.ask_json(messages, schema) answers a JSON
         # allocation. Unset: chat when the client has ask_json, else decider (create_allocator always sets it).
         self.root = Path(root)
+        # the first venue is the allocator venue (its root is self.root); without a list, that venue alone, as before
+        self.venues: list[AllocVenue] = venues or [AllocVenue(PRIMARY_VENUE, self.root, "BYBIT·DEMO")]
+        if Path(self.venues[0].root) != self.root:
+            raise ValueError("the first venue must be the allocator's own root")
+        self.primary = self.venues[0]
         self._kill_skips: list[str] = []  # the last _apply: strategies not switched on because a kill is pending
         self._paused_skips: list[str] = []  # the last _apply: not written because the allocator was paused meanwhile
         self.llm = llm
@@ -689,6 +724,12 @@ class Allocator:
         self._stop = asyncio.Event()
         self._busy = asyncio.Lock()
         self.last_error: str | None = None
+        # "<venue>/<strategy>": the drawdown floor's last failed write ({venue, venue_label, strategy, error, t_ms}). Rebuilt
+        # by every risk check: an entry stays while the write keeps failing and goes once it succeeds or is no longer needed.
+        self.floor_errors: dict[str, dict[str, Any]] = {}
+        # the same for the last decision's writes (and a venue the decision could not handle at all); rebuilt by every
+        # decision that is not a dry run, so an entry stays until a later decision writes that book
+        self.decision_errors: dict[str, dict[str, Any]] = {}
         self.state_cache: dict[str, Any] | None = None
         self._dirty = False
         self._seed_budget()
@@ -709,12 +750,24 @@ class Allocator:
                 "interval_min": int(iv) if iv and iv >= 1 else self.default_interval_min,
                 "decide_now": bool(c.get("decide_now"))}
 
-    def strategies(self) -> list[dict[str, Any]]:
-        listed = read_json(self.root / "strategies.json")
-        rows = [r for r in listed if isinstance(r, dict) and isinstance(r.get("id"), str)] if isinstance(listed, list) else []
+    def vk(self, vid: str, sid: str) -> str:
+        """The state key of one (venue, strategy) book."""
+        return f"{vid}/{sid}"
+
+    def strategies(self, venue: AllocVenue | None = None) -> list[dict[str, Any]]:
+        """The strategies a venue's runner lists (strategies.json). Only the allocator venue falls back to its directories
+        (older roots): another venue's strategy is written only when its runner lists it."""
+        venue = venue or self.primary
+        if venue is not self.primary:
+            # the dashboard's registry rules (ids, units, duplicates): an unusable file writes nothing on that venue, and an
+            # id can never reach outside the venue's root
+            reg = S.load_registry(venue.root)
+            return [] if reg.error else [{"id": e.id, "label": e.label} for e in reg.entries]
+        listed = read_json(venue.root / "strategies.json")
+        rows = [r for r in listed if isinstance(r, dict) and isinstance(r.get("id"), str) and S.ID_RE.fullmatch(r["id"])] if isinstance(listed, list) else []
         if not rows and self.root.is_dir():
             rows = [{"id": p.name, "label": p.name} for p in sorted(self.root.iterdir())
-                    if p.is_dir() and p.name != ALLOCATOR_ID and (p / "status.json").exists()]
+                    if p.is_dir() and p.name != ALLOCATOR_ID and S.ID_RE.fullmatch(p.name) and (p / "status.json").exists()]
         return [r for r in rows if r["id"] != ALLOCATOR_ID]
 
     def _seed_budget(self) -> None:
@@ -733,8 +786,23 @@ class Allocator:
             self.state_cache = s if isinstance(s, dict) else {}
             self.state_cache.setdefault("peaks", {})
             self.state_cache.setdefault("history", {})
-            self.state_cache.setdefault("p_hist", {})   # the decider's last answers per strategy: [[t_ms, p], ...]
+            self.state_cache.setdefault("p_hist", {})   # the decider's last answers per strategy: [[t_ms, p], ...] (venue-independent)
+            self._migrate_keys(self.state_cache)
         return self.state_cache
+
+    def _migrate_keys(self, st: dict[str, Any]) -> None:
+        """Older state.json files key peaks, history and the day anchor by strategy id alone (the allocator venue's books).
+        They become "<allocator venue>/<id>", values unchanged, so the allocator venue's weights do not move."""
+        if st.get("keys_version") == STATE_KEYS_VERSION:
+            return
+        pv = self.primary.id
+        for k in ("peaks", "history"):
+            st[k] = {(key if "/" in key else self.vk(pv, key)): v for key, v in (st.get(k) or {}).items()}
+        da = st.get("day_anchor")
+        if isinstance(da, dict) and isinstance(da.get("w"), dict):
+            da["w"] = {(key if "/" in key else self.vk(pv, key)): v for key, v in da["w"].items()}
+        st["keys_version"], st["primary_venue"] = STATE_KEYS_VERSION, pv
+        self._dirty = True
 
     # ---- computed layer: forecast, decider history, schedule
     def load_forecast(self, now_ms: int) -> Forecast:
@@ -763,69 +831,72 @@ class Allocator:
         last = _num(self._state().get("last_weights_ms"))
         return last is None or last < latest_weights_slot_ms(now_ms, *self.calc.weights_utc)
 
-    def observe(self, sid: str, equity: float | None, start_equity: float | None, now_ms: int) -> bool:
-        """Track the peak and keep sparse equity samples. Returns True when the state changed."""
+    def observe(self, key: str, equity: float | None, start_equity: float | None, now_ms: int) -> bool:
+        """Track the peak and keep sparse equity samples of one (venue, strategy) book. Returns True when the state changed."""
         if equity is None:
             return False
         st = self._state()
         changed = False
-        peak = st["peaks"].get(sid)
+        peak = st["peaks"].get(key)
         new_peak = max(equity, start_equity or 0.0, peak or 0.0)
         if peak is None or new_peak > peak:
-            st["peaks"][sid] = new_peak
+            st["peaks"][key] = new_peak
             changed = True
-        hist = st["history"].setdefault(sid, [])
+        hist = st["history"].setdefault(key, [])
         if not hist or now_ms - hist[-1][0] >= SAMPLE_EVERY_MS:
             hist.append([now_ms, equity])
-            st["history"][sid] = [p for p in hist if now_ms - p[0] <= HISTORY_MS]
+            st["history"][key] = [p for p in hist if now_ms - p[0] <= HISTORY_MS]
             changed = True
         return changed
 
-    def _pnl_window(self, sid: str, equity: float | None, window_ms: int, now_ms: int) -> float | None:
+    def _pnl_window(self, key: str, equity: float | None, window_ms: int, now_ms: int) -> float | None:
         if equity is None:
             return None
-        older = [p for p in self._state()["history"].get(sid, []) if p[0] <= now_ms - window_ms]
+        older = [p for p in self._state()["history"].get(key, []) if p[0] <= now_ms - window_ms]
         if not older or older[-1][1] <= 0:
             return None
         return _r(100 * (equity / older[-1][1] - 1), 2)
 
-    def drawdown_pct(self, sid: str, status: dict[str, Any]) -> float | None:
+    def drawdown_pct(self, key: str, status: dict[str, Any]) -> float | None:
+        """One (venue, strategy) book's drawdown from its peak, from that venue's status equity."""
         eq = _num(status.get("equity_usdt"))
         if eq is None:
             return None
-        peak = max(self._state()["peaks"].get(sid) or 0.0, _num(status.get("start_equity_usdt")) or 0.0,
+        peak = max(self._state()["peaks"].get(key) or 0.0, _num(status.get("start_equity_usdt")) or 0.0,
                    _num(status.get("peak_equity_usdt")) or 0.0, eq)
         return 100 * (peak - eq) / peak if peak > 0 else None
 
     # ---- context
-    def strategy_context(self, row: dict[str, Any], now_ms: int) -> tuple[dict[str, Any], Current]:
+    def strategy_context(self, row: dict[str, Any], now_ms: int, venue: AllocVenue | None = None) -> tuple[dict[str, Any], Current]:
+        venue = venue or self.primary
         sid = row["id"]
-        status = read_json(self.root / sid / "status.json")
+        key = self.vk(venue.id, sid)
+        status = read_json(venue.root / sid / "status.json")
         status = status if isinstance(status, dict) else {}
-        ctl = read_json(self.root / sid / "control.json")
+        ctl = read_json(venue.root / sid / "control.json")
         ctl = ctl if isinstance(ctl, dict) else {}
         eq = _num(status.get("equity_usdt"))
-        if self.observe(sid, eq, _num(status.get("start_equity_usdt")), now_ms):
+        if self.observe(key, eq, _num(status.get("start_equity_usdt")), now_ms):
             self._dirty = True
-        dd = self.drawdown_pct(sid, status)
+        dd = self.drawdown_pct(key, status)
         w = _num(ctl.get("weight"))
         weight = 0.0 if w is None else min(1.0, max(0.0, w))  # nothing decided yet means off, as in the runner
         enabled = ctl.get("enabled", status.get("enabled", True)) is not False
         lock = ctl.get("owner_lock") is True
-        trades = tail_jsonl(self.root / sid / "trades.jsonl", 5000)
+        trades = tail_jsonl(venue.root / sid / "trades.jsonl", 5000)
         t_ms = [x for x in (_num(t.get("t_ms")) for t in trades) if x is not None]
         positions = [p for p in (status.get("positions") or []) if isinstance(p, dict)]
         targets = [t for t in (status.get("targets") or []) if isinstance(t, dict)]
         upd = _num(status.get("updated_ms"))
-        hist = self._state()["history"].get(sid) or []
+        hist = self._state()["history"].get(key) or []
         ctx = {
             "label": row.get("label") or status.get("label") or sid,
             "state": status.get("state") or "unknown",
             "status_age_s": None if upd is None else max(0, round((now_ms - upd) / 1000)),
             "enabled": enabled, "weight": round(weight, 3), "owner_lock": lock, "set_by": ctl.get("set_by"),
             "equity_usdt": _r(eq, 2), "start_equity_usdt": _r(_num(status.get("start_equity_usdt")), 2),
-            "pnl_1d_pct": self._pnl_window(sid, eq, DAY_MS, now_ms),
-            "pnl_7d_pct": self._pnl_window(sid, eq, 7 * DAY_MS, now_ms),
+            "pnl_1d_pct": self._pnl_window(key, eq, DAY_MS, now_ms),
+            "pnl_7d_pct": self._pnl_window(key, eq, 7 * DAY_MS, now_ms),
             "pnl_since_start_pct": _r(_num(status.get("pnl_pct")), 2),
             "history_hours": round((now_ms - hist[0][0]) / 3_600_000, 1) if hist else 0,
             "drawdown_pct": _r(dd, 2),
@@ -974,7 +1045,8 @@ class Allocator:
                              "best": None if best is None else {k: round(v, 4) for k, v in best.items()}},
                  "unanswered": [q for q in qs if q not in parsed], "issues": issues_all[:6] if len(parsed) < len(qs) else []}
         decision = Decision(weights, enabled, summary[:REASONING_MAX_CHARS], round(sum(conf) / len(conf), 3) if conf else None,
-                            derive_enabled=tuple(sid for sid in ids if not mapping[sid]["held"]))
+                            derive_enabled=tuple(sid for sid in ids if not mapping[sid]["held"]),
+                            held=tuple(sid for sid in ids if mapping[sid]["held"]))
         return decision, cost, attempts, extra
 
     async def _ask_chat(self, ctx: dict[str, Any], ids: list[str], labels: dict[str, str]) -> tuple[Decision, float, int, dict[str, Any]]:
@@ -1001,10 +1073,13 @@ class Allocator:
         raise AllocatorError(f"invalid model output after one retry: {problem}")
 
     # ---- applying
-    def _write_control(self, sid: str, enabled: bool, weight: float, reason: str, flatten_on_zero: bool, now_ms: int) -> bool:
-        """Read-modify-write one strategy's control.json. Returns False when the owner locked it
-        (checked again here, right before the write)."""
-        path = self.root / sid / "control.json"
+    def _write_control(self, sid: str, enabled: bool, weight: float, reason: str, flatten_on_zero: bool, now_ms: int,
+                       root: Path | None = None) -> bool:
+        """Read-modify-write one strategy's control.json on one venue's root. Returns False when the owner locked it
+        (checked again here, right before the write), when a kill is pending and this would switch it on, or when the
+        allocator was paused meanwhile and this does not reduce risk. The pause is the allocator's own control: it applies
+        to every venue."""
+        path = (root or self.root) / sid / "control.json"
         with locked(path):  # one read-modify-write at a time per file, shared with the dashboard (ctb.control_lock)
             ctl = read_json(path)
             ctl = ctl if isinstance(ctl, dict) else {}
@@ -1033,7 +1108,12 @@ class Allocator:
         return True
 
     def _apply(self, plan: Plan, current: dict[str, Current], reasons: dict[str, str], now_ms: int, *,
-               refresh_reasons: bool = False) -> dict[str, bool]:
+               refresh_reasons: bool = False, venue: AllocVenue | None = None,
+               errors: dict[str, str] | None = None) -> dict[str, bool]:
+        """Write the plan into each strategy's control.json on one venue. With errors given, a failed write (an unwritable
+        directory, a full disk) is logged and recorded there as "<Type>: message" and the other strategies are still written;
+        without it the failure propagates as before."""
+        venue = venue or self.primary
         applied: dict[str, bool] = {}
         self._kill_skips = []  # filled by _write_control: strategies not switched on because a kill is pending
         self._paused_skips = []  # and those not written because the allocator was paused while the decision ran
@@ -1043,31 +1123,41 @@ class Allocator:
                 continue
             unchanged = plan.enabled[sid] == c.enabled and abs(plan.weights[sid] - c.weight) < 1e-9
             if unchanged and refresh_reasons:
-                ctl = read_json(self.root / sid / "control.json")
+                ctl = read_json(venue.root / sid / "control.json")
                 unchanged = isinstance(ctl, dict) and ctl.get("reason") == reasons[sid][:REASONING_MAX_CHARS]  # new text for the card
             if unchanged:
                 applied[sid] = False  # nothing to tell the runner; keep control.json (and its reason) as is
                 continue
-            applied[sid] = self._write_control(sid, plan.enabled[sid], plan.weights[sid], reasons[sid],
-                                               self.flatten_on_floor and sid in plan.floored, now_ms)
+            try:
+                applied[sid] = self._write_control(sid, plan.enabled[sid], plan.weights[sid], reasons[sid],
+                                                   self.flatten_on_floor and sid in plan.floored, now_ms, root=venue.root)
+            except Exception as exc:  # noqa: BLE001 - only when the caller collects errors (the drawdown floor)
+                if errors is None:
+                    raise
+                errors[sid] = f"{type(exc).__name__}: {exc}"[:300]
+                applied[sid] = False
         return applied
 
-    def _day_anchor(self, current: dict[str, "Current"], now_ms: int, *, persist: bool = True) -> dict[str, "Current"]:
+    def _day_anchor(self, current: dict[str, "Current"], now_ms: int, *, persist: bool = True,
+                    venue: AllocVenue | None = None) -> dict[str, "Current"]:
         """The step limit and the buffer count from the weights at the first weights run of the UTC day, so
-        repeated DECIDE NOW presses cannot ratchet a weight up by more than one step per day."""
+        repeated DECIDE NOW presses cannot ratchet a weight up by more than one step per day. Keyed per
+        (venue, strategy): each venue's book steps from its own anchor."""
+        venue = venue or self.primary
         day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
         st = self._state()
         anchor = st.get("day_anchor") if isinstance(st.get("day_anchor"), dict) else {}
         if anchor.get("day") != day:
-            anchor = {"day": day, "w": {sid: c.weight for sid, c in current.items()}}
+            anchor = {"day": day, "w": {}}
             if persist:
                 st["day_anchor"] = anchor
-                self._save_state()
-        w = anchor.get("w") or {}
+        w = anchor.setdefault("w", {})
         for sid, c in current.items():
-            if sid not in w:
-                w[sid] = c.weight
-        return {sid: replace(c, weight=float(w[sid])) for sid, c in current.items()}
+            if self.vk(venue.id, sid) not in w:
+                w[self.vk(venue.id, sid)] = c.weight
+        if persist:
+            self._save_state()
+        return {sid: replace(c, weight=float(w[self.vk(venue.id, sid)])) for sid, c in current.items()}
 
     def _save_state(self) -> None:
         self._dirty = False
@@ -1117,8 +1207,11 @@ class Allocator:
                         if sid in explored:
                             reasons[sid] += f" | demo minimum {plan.weights[sid]:.2f}"
             applied: dict[str, bool] = {}
-            if plan and not dry_run:
-                applied = self._apply(plan, current, reasons, now_ms)
+            failed: dict[str, str] = {}
+            if plan and not dry_run and self.primary.managed:
+                applied = self._apply(plan, current, reasons, now_ms, errors=failed)
+            venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, explored,
+                                                          {"write_failed": failed} if failed else None)}
             record.update({
                 "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {},
                 "reasoning": decision.reasoning if decision else "", "confidence": decision.confidence if decision else None,
@@ -1131,9 +1224,14 @@ class Allocator:
                 "explore_floor": explored,
                 "error": error, "dry_run": dry_run,
             })
+            for v in self.venues[1:]:  # the same per-strategy decision, under each venue's own rules
+                venues[v.id] = self._other_venue(v, lambda v=v: self._legacy_venue(v, decision, now_ms, dry_run))
+            record["venues"] = venues
+            not_applied = self._write_failures(venues, now_ms, dry_run)
+            record["error"] = _join_errors(record["error"], not_applied)
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
-                self.last_error = error
+                self.last_error = record["error"]
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
@@ -1192,8 +1290,11 @@ class Allocator:
                     else:
                         reasons[sid] = calc_out["reasons"][sid] if calc_out else why
             applied: dict[str, bool] = {}
-            if plan and not dry_run:
-                applied = self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed")
+            failed: dict[str, str] = {}
+            if plan and not dry_run and self.primary.managed:
+                applied = self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed", errors=failed)
+            venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, None,
+                                                          {"write_failed": failed} if failed else None)}
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1220,12 +1321,133 @@ class Allocator:
                     "w_final": plan.weights if plan else {}, "steps": calc_out["steps"], "reasons": reasons, "clipped": calc_out["clipped"],
                     "no_forecast": calc_out["held"],
                 })
+            for v in self.venues[1:]:  # the same forecasts and decider p, each venue's own books, anchor and rules
+                venues[v.id] = self._other_venue(v, lambda v=v: self._computed_venue(v, fc, kind, why, p_new, now_ms, dry_run, decided_ids=ids))
+            record["venues"] = venues
+            # only a weights run rewrites every book: an hourly refresh or a held run leaves earlier failures standing
+            not_applied = self._write_failures(venues, now_ms, dry_run, replace=kind == "computed")
+            record["error"] = _join_errors(record["error"], not_applied)
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
-                self.last_error = error
+                self.last_error = _join_errors(error, not_applied)  # the forecast's error is said by write_status, as before
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
+
+    def _other_venue(self, v: AllocVenue, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        """One other venue's part of a decision. Anything that goes wrong there (beyond a single write, which _apply keeps
+        per strategy) is that venue's error: the decision, its record and the other venues go on."""
+        try:
+            return run()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("allocator: decision on %s failed", v.id)
+            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "nothing applied (error)",
+                    "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+    def _write_failures(self, venues: dict[str, dict[str, Any]], now_ms: int, dry_run: bool, replace: bool = True) -> str | None:
+        """What a decision could not apply: every write that failed and every venue that failed, as one line for the
+        decision's error (None when all went through). Unless a dry run, also kept in decision_errors: status.json and the
+        venue alerts show them until a later decision that sets the weights (replace) writes those books."""
+        found: dict[str, dict[str, Any]] = {}
+        for vid, vr in venues.items():
+            label = vr.get("label") or vid
+            for sid, err in (vr.get("write_failed") or {}).items():
+                found[self.vk(vid, sid)] = {"venue": vid, "venue_label": label, "strategy": sid, "error": err, "t_ms": now_ms}
+            if vr.get("error"):
+                found[self.vk(vid, "*")] = {"venue": vid, "venue_label": label, "strategy": None, "error": vr["error"], "t_ms": now_ms}
+        if not dry_run:
+            for key, e in found.items():
+                if self.decision_errors.get(key, {}).get("error") != e["error"]:
+                    log.error("allocator: decision on %s %s not applied: %s", e["venue"], e["strategy"] or "(venue)", e["error"])
+            self.decision_errors = found if replace else {**self.decision_errors, **found}
+        if not found:
+            return None
+        txt = "; ".join(f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in found.values())
+        return f"control.json not written, kept as it was ({txt})"
+
+    def _venue_record(self, v: AllocVenue, plan: Plan | None, current: dict[str, Current], reasons: dict[str, str],
+                      applied: dict[str, bool], explored: list[str] | None = None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """What the feed shows for one venue: per strategy the weight, whether it was written, and why not (read right after
+        that venue's _apply: the skip lists are that call's)."""
+        return {"label": v.label, "managed": v.managed, "strategies": list(current),
+                "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {}, "applied": applied,
+                "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
+                "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                "skipped_paused": [x for x in self._paused_skips if x in applied],
+                "risk_floor": plan.floored if plan else [], "explore_floor": explored or [], "reasons": reasons, **(extra or {})}
+
+    def _floor_reason(self, v: AllocVenue, c: Current) -> str:
+        where = "" if v is self.primary else f"{v.label} "  # the allocator venue keeps its old wording
+        return f"risk floor: {where}book {c.drawdown_pct:.1f}% below its peak, weight forced to 0"
+
+    def _legacy_venue(self, v: AllocVenue, decision: Decision | None, now_ms: int, dry_run: bool) -> dict[str, Any]:
+        """The decider-only (or chat) decision on another venue: its strategies that the decision covers take the decided
+        weight under that venue's step limit, drawdown floor, exploration floor and owner locks; the others are held at this
+        venue's own allocation: a strategy the decision venue does not list, and one the decision model left unanswered
+        (its decided weight is only the decision venue's current allocation, kept)."""
+        current = self._read_current(now_ms, v)
+        if not current:
+            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "no usable strategies.json (missing or invalid): nothing applied"}
+        decided = [s for s in current if decision is not None and s in decision.weights and s not in decision.held]
+        sub = None if decision is None else Decision(
+            {s: decision.weights[s] if s in decided else current[s].weight for s in current},
+            {s: decision.enabled[s] if s in decided else current[s].enabled for s in current},
+            decision.reasoning, decision.confidence, derive_enabled=tuple(s for s in decision.derive_enabled if s in decided))
+        plan = resolve(current, sub, max_step=self.max_step, dd_floor_pct=self.dd_floor_pct)
+        explored = apply_explore_floor(plan, {s: current[s] for s in decided}, self._explore_floor()) if decision else []
+        reasons: dict[str, str] = {}
+        for sid, c in current.items():
+            if sid in plan.floored:
+                reasons[sid] = self._floor_reason(v, c)
+            elif decision is None:
+                reasons[sid] = "kept (allocator error)"
+            elif sid not in decided and sid in decision.held:
+                reasons[sid] = "no decision: the decision model gave no valid answer for it, held"
+            elif sid not in decided:
+                reasons[sid] = f"no decision: strategy not on the decision venue ({self.primary.label}), held"
+            else:
+                reasons[sid] = decision.reasoning + (f" | demo minimum {plan.weights[sid]:.2f}" if sid in explored else "")
+        writable = {s: c for s, c in current.items() if s in decided or s in plan.floored or decision is None}
+        failed: dict[str, str] = {}
+        applied = self._apply(plan, writable, reasons, now_ms, venue=v, errors=failed) if not dry_run and v.managed else {}
+        applied.update({s: False for s in current if s not in writable})
+        return self._venue_record(v, plan, current, reasons, applied, explored, {"write_failed": failed} if failed else None)
+
+    def _computed_venue(self, v: AllocVenue, fc: Forecast, kind: str, why: str, p_new: dict[str, float], now_ms: int,
+                        dry_run: bool, decided_ids: list[str] | None = None) -> dict[str, Any]:
+        """The computed weights on another venue: the same forecasts and decider p per strategy, that venue's own books,
+        day anchor, vol cap over its strategies, drawdown floor, exploration floor and owner locks. Only strategies the
+        decision venue lists (decided_ids) are computed; a strategy only this venue lists is held (no decision covers it),
+        whatever the forecast file holds for it."""
+        current = self._read_current(now_ms, v)
+        if not current:
+            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "no usable strategies.json (missing or invalid): nothing applied"}
+        ids = list(current)
+        covered = [s for s in ids if decided_ids is None or s in decided_ids]
+        calc_out: dict[str, Any] | None = None
+        decision: Decision | None = None
+        if kind == "computed" and covered:
+            anchored = self._day_anchor({s: current[s] for s in covered}, now_ms, persist=not dry_run, venue=v)
+            p_now = self.p_means(covered, p_new if dry_run else None)
+            calc_out = compute_weights(covered, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+            decision = Decision({**{s: current[s].weight for s in ids}, **calc_out["w_final"]}, {sid: current[sid].enabled for sid in ids},
+                                " | ".join(calc_out["reasons"][sid] for sid in covered), None, derive_enabled=tuple(calc_out["opt"]))
+        plan = resolve(current, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct)
+        held = f"no decision: strategy not on the decision venue ({self.primary.label}), held"
+        reasons = {sid: (self._floor_reason(v, c) if sid in plan.floored
+                         else held if sid not in covered else (calc_out["reasons"][sid] if calc_out else why))
+                   for sid, c in current.items()}
+        # a held strategy (no decision covers it) is not written at all; only the drawdown floor may still cut it
+        writable = {s: c for s, c in current.items() if s in covered or s in plan.floored}
+        failed: dict[str, str] = {}
+        applied = (self._apply(plan, writable, reasons, now_ms, refresh_reasons=kind == "computed", venue=v, errors=failed)
+                   if not dry_run and v.managed else {})
+        applied.update({s: False for s in current if s not in writable})
+        extra = {"core": {k: round(x, 6) for k, x in calc_out["core"].items()},
+                 "w_target": {k: round(x, 6) for k, x in calc_out["w_target"].items()}, "steps": calc_out["steps"]} if calc_out else {}
+        if failed:
+            extra["write_failed"] = failed
+        return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:
         """The demo minimum weight (CTB_ALLOCATOR_EXPLORE_FLOOR) on the venues it applies to, else 0."""
@@ -1238,35 +1460,60 @@ class Allocator:
         except Exception:  # noqa: BLE001 - an unreadable setting must not stop the allocator
             return 0.0
 
-    def _read_current(self, now_ms: int) -> dict[str, Current]:
+    def _read_current(self, now_ms: int, venue: AllocVenue | None = None) -> dict[str, Current]:
         out: dict[str, Current] = {}
-        for r in self.strategies():
-            out[r["id"]] = self.strategy_context(r, now_ms)[1]
+        for r in self.strategies(venue):
+            out[r["id"]] = self.strategy_context(r, now_ms, venue)[1]
         return out
 
     async def risk_check(self) -> dict[str, Any] | None:
         """The drawdown floor on its own, no model: runs every tick so a bad book is cut within
-        seconds of the runner reporting it, not at the next hourly decision."""
+        seconds of the runner reporting it, not at the next hourly decision. Each (venue, strategy) stands alone: a write
+        that fails (or a venue that cannot be read) is logged, kept in floor_errors (status.json and the venue alerts show
+        it), named in the feed when it is new, and the floor goes on with the other books; the next tick tries again."""
         async with self._busy:
             now_ms = self.now_ms()
-            current = self._read_current(now_ms)
-            plan = resolve(current, None, max_step=self.max_step, dd_floor_pct=self.dd_floor_pct)
-            todo = [s for s in plan.floored if current[s].weight > 0 or current[s].enabled]
-            if not todo:
-                if self._dirty:
-                    self._save_state()
-                return None
-            reasons = {s: f"risk floor: book {current[s].drawdown_pct:.1f}% below its peak, weight forced to 0" for s in todo}
-            partial = Plan({s: plan.enabled[s] for s in todo}, {s: plan.weights[s] for s in todo}, todo, [], [])
-            applied = self._apply(partial, {s: current[s] for s in todo}, reasons, now_ms)
-            record = {"t_ms": now_ms, "model": "risk-floor", "trigger": "risk", "weights": plan.weights, "enabled": plan.enabled,
-                      "reasoning": "; ".join(reasons.values()), "inputs": {"drawdown_pct": {s: _r(current[s].drawdown_pct, 2) for s in todo}},
-                      "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock,
-                      "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
-                "skipped_paused": [x for x in self._paused_skips if x in applied], "risk_floor": todo, "attempts": 0}
-            append_jsonl(self.dir / "decisions.jsonl", record)
-            self._save_state()
-            return record
+            last: dict[str, Any] | None = None
+            prev, errs = self.floor_errors, {}
+            for v in self.venues:  # each venue's books against their own peaks
+                if not v.managed:
+                    continue
+                failed: dict[str, str] = {}
+                try:
+                    current = self._read_current(now_ms, v)
+                    plan = resolve(current, None, max_step=self.max_step, dd_floor_pct=self.dd_floor_pct)
+                    todo = [s for s in plan.floored if current[s].weight > 0 or current[s].enabled]
+                    if not todo:
+                        continue
+                    reasons = {s: self._floor_reason(v, current[s]) for s in todo}
+                    partial = Plan({s: plan.enabled[s] for s in todo}, {s: plan.weights[s] for s in todo}, todo, [], [])
+                    applied = self._apply(partial, {s: current[s] for s in todo}, reasons, now_ms, venue=v, errors=failed)
+                except Exception as exc:  # noqa: BLE001 - this venue's books could not even be read: the others still run
+                    todo, applied, plan, reasons = [], {}, None, {}
+                    failed[""] = f"{type(exc).__name__}: {exc}"[:300]
+                new = False
+                for sid, err in failed.items():
+                    key = self.vk(v.id, sid or "*")
+                    errs[key] = {"venue": v.id, "venue_label": v.label, "strategy": sid or None, "error": err, "t_ms": now_ms}
+                    if prev.get(key, {}).get("error") != err:
+                        new = True
+                        log.error("allocator: drawdown floor on %s %s failed: %s", v.id, sid or "(reading the venue)", err)
+                if failed and not new and not any(applied.values()):
+                    continue  # the same failure as last tick and nothing written: the alert and status.json already say it
+                txt = "; ".join(f"{sid or 'reading the venue'}: {err}" for sid, err in failed.items())
+                last = {"t_ms": now_ms, "model": "risk-floor", "trigger": "risk", "venue": v.id, "venue_label": v.label,
+                        "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {},
+                        "reasoning": "; ".join(reasons.values()), "inputs": {"drawdown_pct": {s: _r(current[s].drawdown_pct, 2) for s in todo}},
+                        "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
+                        "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                        "skipped_paused": [x for x in self._paused_skips if x in applied], "risk_floor": todo, "attempts": 0,
+                        "write_failed": {k: e for k, e in failed.items() if k},
+                        "error": f"drawdown floor not applied, tried again every tick ({txt})" if failed else None}
+                append_jsonl(self.dir / "decisions.jsonl", last)
+            self.floor_errors = errs
+            if last is not None or self._dirty:
+                self._save_state()
+            return last
 
     # ---- status
     def cost_usd_today(self, now_ms: int) -> float:
@@ -1293,6 +1540,9 @@ class Allocator:
         last_dec = (self.decisions(1) or [{}])[0]
         fc = self.load_forecast(now_ms) if self.mode == "decider" else None
         err = self.last_error or (fc.error if fc else None)  # an unusable forecast is an error; a missing one is a mode
+        floor = [f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in self.floor_errors.values()]
+        if floor:  # the drawdown floor could not cut a book: said even while paused
+            err = "; ".join(([err] if err else []) + [f"drawdown floor could not write control.json ({'; '.join(floor)})"])
         weights_mode = {None: "chat", "missing": "decider-only", "fresh": "computed"}.get(fc.state if fc else None, "held")
         nxt_w = None if fc is None or fc.state == "missing" or paused else latest_weights_slot_ms(now_ms, *self.calc.weights_utc) + DAY_MS
         write_json_atomic(self.dir / "status.json", {
@@ -1303,6 +1553,8 @@ class Allocator:
             "last_reasoning": last_dec.get("reasoning") or None, "last_confidence": last_dec.get("confidence"),
             "weights_mode": weights_mode, "forecast": fc.info() if fc else None,
             "last_weights_ms": _num(self._state().get("last_weights_ms")), "next_weights_ms": nxt_w,
+            "risk_floor_errors": list(self.floor_errors.values()),
+            "decision_write_errors": list(self.decision_errors.values()),
         })
 
     # ---- loop
@@ -1311,8 +1563,8 @@ class Allocator:
 
     async def run(self) -> None:
         """The loop the dashboard server starts as a task. Wakes every tick_s: the drawdown floor
-        always runs; a model decision runs when the interval has passed or decide_now is set; nothing
-        changes while allocator/control.json says enabled false."""
+        always runs, on every managed venue, also while paused; a model decision runs when the interval has passed or
+        decide_now is set, and none runs while allocator/control.json says enabled false."""
         log.info("allocator running: model %s, root %s", self.model, self.root)
         while not self._stop.is_set():
             try:
@@ -1329,10 +1581,13 @@ class Allocator:
     async def _tick(self) -> None:
         now_ms = self.now_ms()
         ctl = self.control()
+        # The drawdown floor runs on every managed venue every tick, paused or not: it only cuts (the paused rule in
+        # _write_control lets a risk-reducing write through). A pause (AUTO-TRADE OFF, MANUAL, PER-SYMBOL BOT, a bybit-demo
+        # KILL) stops decisions, never the floor on books that are still open.
+        await self.risk_check()
         if not ctl["enabled"]:
             self.write_status(now_ms, paused=True)
             return
-        await self.risk_check()
         st = read_json(self.dir / "status.json") or {}
         last = _num(st.get("last_decision_ms"))
         due = last is None or now_ms >= last + ctl["interval_min"] * 60_000
@@ -1350,25 +1605,28 @@ class Allocator:
         else:
             self.write_status(now_ms)
 
-    def reset_peak(self, ids: list[str] | None = None) -> list[str]:
-        """Forget a book's peak (and samples) so the drawdown floor measures from now. Owner action,
-        for a strategy that was cut by the floor and is being restarted on purpose."""
+    def reset_peak(self, ids: list[str] | None = None, venue: AllocVenue | None = None) -> list[str]:
+        """Forget a (venue, strategy) book's peak (and samples) so the drawdown floor measures from now. Owner action,
+        for a strategy that was cut by the floor and is being restarted on purpose. Default: the allocator venue."""
+        venue = venue or self.primary
         st = self._state()
         done = []
-        for r in self.strategies():
+        for r in self.strategies(venue):
             if ids and r["id"] not in ids:
                 continue
-            if st["peaks"].pop(r["id"], None) is not None:
+            if st["peaks"].pop(self.vk(venue.id, r["id"]), None) is not None:
                 done.append(r["id"])
-            st["history"].pop(r["id"], None)
+            st["history"].pop(self.vk(venue.id, r["id"]), None)
         self._save_state()
         return done
 
 
 # ---------------------------------------------------------------------------------- wiring and CLI
-def create_allocator(session: aiohttp.ClientSession, root: Path | str | None = None, spec: ModelSpec | None = None) -> Allocator:
+def create_allocator(session: aiohttp.ClientSession, root: Path | str | None = None, spec: ModelSpec | None = None,
+                     venues: list[AllocVenue] | None = None) -> Allocator:
     """What the dashboard server calls: an Allocator on the harness's aiohttp session. The model is
-    allocator_spec(): a decision model by default, a chat model when CTB_ALLOCATOR_MODEL says so."""
+    allocator_spec(): a decision model by default, a chat model when CTB_ALLOCATOR_MODEL says so. venues: the venues it
+    applies its decision to, the allocator venue (root) first (ctb.venues.VenueHub.allocator_venues)."""
     spec = spec or allocator_spec()
     try:
         rph = int(os.environ.get("CTB_ALLOCATOR_MAX_RPH", "12"))
@@ -1383,7 +1641,7 @@ def create_allocator(session: aiohttp.ClientSession, root: Path | str | None = N
     else:
         llm, mode = make_client(spec, session, timeout_s=timeout), "decider"
     return Allocator(root or live_root(), llm, BybitMarket(session), model=model_display(spec), budget=RateBudget(rph),
-                     mode=mode, params=params)
+                     mode=mode, params=params, venues=venues)
 
 
 # ---------------------------------------------------------------------------------- scoring
@@ -1400,7 +1658,9 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
     strategy deploys; a book held below min_weight cannot be labelled and is counted as flat."""
     alloc = Path(root) / ALLOCATOR_ID
     now_ms = now_ms or int(time.time() * 1000)
-    hist = (read_json(alloc / "state.json") or {}).get("history", {})
+    state = read_json(alloc / "state.json") or {}
+    hist = state.get("history", {})
+    pv = state.get("primary_venue") or PRIMARY_VENUE  # the decisions are the allocator venue's: its keys, or legacy plain ids
     h_ms, tol = horizon_h * 3_600_000, tol_min * 60_000
     per: dict[str, dict[str, Any]] = {}
     best_stats = {"n": 0, "correct": 0, "p_realised": 0.0}
@@ -1417,7 +1677,7 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
         returns: dict[str, float] = {}
         for sid, p in (ans.get("p") or {}).items():
             e0 = _num((strategies.get(sid) or {}).get("equity_usdt"))
-            e1 = _equity_at(hist.get(sid, []), t + h_ms, tol)
+            e1 = _equity_at(hist.get(f"{pv}/{sid}") or hist.get(sid, []), t + h_ms, tol)
             w = _num((d.get("weights") or {}).get(sid)) or 0.0
             if w < min_weight:
                 unlabelled["flat"] += 1
@@ -1496,10 +1756,17 @@ def _jprint(obj: Any) -> None:
 async def _main(args: argparse.Namespace) -> int:
     from .config import load_dotenv
     load_dotenv()
+    from .venues import allocator_venues_of, configs_from_env
+    # the same venues the dashboard gives the allocator (CTB_LIVE_ROOTS, CTB_ALLOCATOR_VENUES); --root overrides bybit-demo's
+    venues = allocator_venues_of(configs_from_env(), args.root)
     async with aiohttp.ClientSession() as session:
-        alloc = create_allocator(session, args.root)
+        alloc = create_allocator(session, venues[0].root, venues=venues)
         if args.cmd == "reset-peak":
-            print("peaks reset:", ", ".join(alloc.reset_peak(args.ids or None)) or "none")
+            venue = next((v for v in alloc.venues if v.id == args.venue), None)
+            if venue is None:
+                print(f"unknown or unmanaged venue {args.venue!r}", file=sys.stderr)
+                return 2
+            print("peaks reset:", ", ".join(alloc.reset_peak(args.ids or None, venue=venue)) or "none")
             return 0
         if args.cmd == "score":
             _jprint(score_decisions(alloc.root, horizon_h=args.horizon_h, qset=args.qset))
@@ -1551,6 +1818,7 @@ def main(argv: list[str] | None = None) -> int:
     sc.add_argument("--qset", choices=list(SCORED_QSETS), help="score one question set only (default: both, same questions)")
     rp = sub.add_parser("reset-peak", help="restart a book's drawdown measurement from now")
     rp.add_argument("ids", nargs="*")
+    rp.add_argument("--venue", default=PRIMARY_VENUE, help="the venue whose books to reset (default bybit-demo)")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:

@@ -477,17 +477,41 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
 
     @routes.post("/api/strategies/auto")
     async def strategies_auto(req: web.Request) -> web.Response:
-        """Header switch in LLM DECIDES / MANUAL mode: the allocator or the selected strategies on (and the runner running), or all off."""
+        """Header switch in LLM DECIDES / MANUAL mode: the allocator or the selected strategies on (and the runner running), or all off.
+        It applies to every venue the allocator controls: OFF pauses their strategies too, ON in LLM DECIDES starts their runners."""
         body = await req.json()
         body = body if isinstance(body, dict) else {}
         ids = body.get("ids")
+        enabled = bool(body.get("enabled"))
         try:
-            return j(await strat.auto(bool(body.get("enabled")), [str(i) for i in ids] if isinstance(ids, list) else None,
-                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name(),
-                                      cancel_kill=([str(i) for i in body["cancel_kill"]] if isinstance(body.get("cancel_kill"), list)
-                                                   else body.get("cancel_kill") is True)))
+            out = await strat.auto(enabled, [str(i) for i in ids] if isinstance(ids, list) else None,
+                                   llm_trading=bool(s.trading_enabled), venue=venue_mod.name(),
+                                   cancel_kill=([str(i) for i in body["cancel_kill"]] if isinstance(body.get("cancel_kill"), list)
+                                                else body.get("cancel_kill") is True))
+        except strat_mod.StrategyError as exc:
+            if enabled:
+                return refused(exc)
+            out = {"ok": False, "error": exc.message}  # OFF must still reach the other venues
+        out["venues"] = await hub.auto_others(enabled, strat.mode(strat.registry()))
+        # every venue was tried; any that was not switched (and the allocator venue's own failure) is an error the page shows
+        failed = {vid: msg for vid, msg in out["venues"].items() if msg.startswith("refused")}
+        if failed or out.get("ok") is False:
+            parts = ([f"{hub.config(hub.primary_id).label}: {out['error']}"] if out.get("ok") is False else []) + \
+                    [f"{hub.config(vid).label}: {msg}" for vid, msg in failed.items()]
+            return j({**out, "ok": False, "error": f"AUTO-TRADE {'ON' if enabled else 'OFF'} did not reach every venue: " + "; ".join(parts)}, 409)
+        return j(out)
+
+    @routes.post("/api/venues/{vid}/hand-to-allocator")
+    async def hand_to_allocator(req: web.Request) -> web.Response:
+        """Owner action: clear owner_lock on every strategy of the venue so the LLM allocator decides them (refused, per
+        strategy, while a kill is pending unless cancel_kill)."""
+        cancel = await cancel_kill(req)
+        try:
+            out = hub.service(req.match_info["vid"]).hand_to_allocator(cancel_kill=cancel)
         except strat_mod.StrategyError as exc:
             return refused(exc)
+        engine.emit("event", engine.db.event("warn", "allocator", f"{req.match_info['vid']} handed to the LLM allocator: {', '.join(out['handed']) or 'none'}"))
+        return j(out)
 
     @routes.get("/api/allocator")
     async def allocator_status(req: web.Request) -> web.Response:
@@ -961,7 +985,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         # The LLM allocator (docs/allocator.md). attach_allocator first writes allocator/control.json from the mode, because the
         # loop treats a missing file as enabled: it writes strategy controls only in LLM DECIDES (control enabled true).
         try:
-            alloc = alloc_mod.create_allocator(engine.session, root=strat.root)
+            alloc = alloc_mod.create_allocator(engine.session, root=strat.root, venues=hub.allocator_venues())
             strat.attach_allocator(alloc)
             app_["allocator"] = alloc
             app_["allocator_task"] = asyncio.create_task(alloc.run())
