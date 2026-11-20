@@ -1403,20 +1403,20 @@ class Allocator:
         """The covariance of the given books for the final vol cap: the forecast in use when it has them, else the last known
         sigma and covariance (state.json risk_model). A pair with no known covariance counts as independent, like
         compute_weights. A book with no known sigma at all gets the largest known one (said in the notes). None when no
-        sigma is known for any book."""
+        sigma is known for any strategy."""
         rm = self._state().get("risk_model") if isinstance(self._state().get("risk_model"), dict) else {}
         data = (fc.data if fc is not None and fc.state == "fresh" else None) or {}
         fstrat = data.get("strategies") if isinstance(data.get("strategies"), dict) else {}
         stored = rm.get("sigma_d") if isinstance(rm.get("sigma_d"), dict) else {}
         notes: dict[str, str] = {}
         sigma: dict[str, float | None] = {}
-        for sid in ids:
+        for sid in dict.fromkeys([*ids, *fstrat, *stored]):
             f = fstrat.get(sid)
             v = _num(f.get("sigma_d")) if isinstance(f, dict) else None
             if v is None or v <= 0:
                 old = stored.get(sid)
                 v = _num(old[0]) if isinstance(old, list) and old else None
-                if v is not None and v > 0:
+                if v is not None and v > 0 and sid in ids:
                     notes[sid] = "last known volatility"
             sigma[sid] = v if v is not None and v > 0 else None
         known = [v for v in sigma.values() if v is not None]
