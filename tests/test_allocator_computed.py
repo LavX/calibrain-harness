@@ -235,6 +235,30 @@ def test_the_veto_live_switch_decides_whether_the_veto_moves_live_weights(root, 
         assert "decider veto in shadow only: would cap at 0.10" in ctl(root, "trend")["reason"]
 
 
+@pytest.mark.parametrize("mu, previous, shadow_weight, veto_shadow", [
+    (0.002, 0.8, 0.4, {"trend": 0.4}),
+    (-0.002, 0.5, CORE * 0.5, {}),
+])
+def test_shadow_veto_uses_the_shadow_weight_when_the_live_tilt_is_off(root, mu, previous, shadow_weight, veto_shadow):
+    f = forecast(T0 - 3600, kappa=0.0)
+    f["strategies"]["trend"]["mu"] = {"base": mu}
+    f["weights_k"]["trend"] = {"base": 1.0, "decider": 0.0}
+    put(root / "forecast" / "latest.json", f)
+    put(root / "trend" / "control.json", {**ctl(root, "trend"), "weight": previous})
+    calc = A.Calc.from_settings(replace(Settings(), allocator_veto_live=False, allocator_p_min_fresh=1))
+
+    rec = decide(make(root, FakeDecider(answers({"carry": 0.5, "trend": 0.2, "xsmom": 0.5})), calc=calc), trigger="decide_now")
+
+    assert rec["w_final"]["trend"] == pytest.approx(CORE, abs=1e-4)
+    assert ctl(root, "trend")["weight"] == pytest.approx(CORE, abs=1e-4)
+    assert rec["shadow_w_target"]["trend"] == pytest.approx(shadow_weight, abs=1e-6)
+    assert rec["veto_shadow"] == veto_shadow
+    assert ("decider veto in shadow only" in rec["reasons"]["trend"]) is bool(veto_shadow)
+    step = next(step for step in rec["steps"] if step["step"] == "veto")
+    assert step["shadow_changed"] == list(veto_shadow)
+    assert step["shadow_after"] == rec["shadow_w_target"]
+
+
 def test_the_veto_switch_defaults_to_live():
     assert Settings().allocator_veto_live is True and A.Calc.from_settings(Settings()).rules.veto_live is True
     w, steps = M.apply_rules(["a"], {"a": 0.6}, {"a": 0.4}, [[0.0]], {"a": 0.2}, M.RuleParams(explore_floor=0.0, veto_live=False))

@@ -557,13 +557,16 @@ def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str,
     final, steps = M.apply_rules(opt, w_target, {sid: w_prev[sid] for sid in opt}, cov, {sid: p.get(sid) for sid in opt}, calc.rules,
                                  floored=[sid for sid in opt if current[sid].drawdown_pct is not None and current[sid].drawdown_pct > dd_floor_pct], locked=[sid for sid in opt if current[sid].owner_lock])
     reasons = {sid: f"{sid}: held at {w_prev[sid]:.2f} ({why})" for sid, why in held.items()}
-    veto = next((st for st in steps if st["step"] == "veto"), {})
     veto_shadow: dict[str, float] = {}
     if not calc.rules.veto_live:  # the veto lives in the shadow only: the shadow tilted book takes it, the live one does not
-        for sid in veto.get("shadow_changed") or []:
+        for sid in opt:
             cap = calc.rules.veto_factor * w_prev[sid]
-            veto_shadow[sid] = round(cap, 6)
-            shadow_w[sid] = min(shadow_w[sid], cap)
+            if p.get(sid) is not None and p[sid] < calc.rules.veto_p and shadow_w[sid] > cap:
+                veto_shadow[sid] = round(cap, 6)
+                shadow_w[sid] = cap
+        veto_step = next(step for step in steps if step["step"] == "veto")
+        veto_step["shadow_after"] = {sid: round(weight, 6) for sid, weight in shadow_w.items()}
+        veto_step["shadow_changed"] = list(veto_shadow)
     for sid in opt:
         binding = [st["step"] for st in steps if sid in st["changed"]]
         reasons[sid] = M.reason_line(sid, core[sid], tau[sid], sr[sid], w_target[sid], final[sid], binding, regime, tilt.kappa, shadow_tau[sid])
