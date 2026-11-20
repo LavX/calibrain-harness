@@ -115,9 +115,11 @@ after a KILL is not flattened again by the kill's flag. UNLOCK TO LLM is refused
 P&L today uses the harness's own 00:00 UTC baseline, one small JSON file per venue under the harness data directory
 (next to the database: `data/venues/baseline-<vid>.json`). A background task samples every minute, so the file is
 written within a minute of midnight while the dashboard runs and survives restarts; when the dashboard was down at
-midnight the page says "since HH:MM UTC" instead. On bybit-demo the account's USDT equity is sampled too, and the
-account's unrealised P&L minus the books' is shown as "unattributed". Other venues show sums over their books until the
-runner publishes `<root>/account.json` (read when it exists). The MANUAL header set is kept in the same directory
+midnight the page says "since HH:MM UTC" instead. There is no account-level P&L today on bybit-demo: the USDT coin's
+equity drops when a spot leg is bought with USDT, which is not a loss. The account line shows the USDT equity apart from
+all collateral, and "unattributed" compares like with like: the exchange's derivatives unrealised P&L minus the books'
+perp and future legs (spot legs excluded); it is unknown when any leg's uPnL is unknown. Other venues show sums over their
+books until the runner publishes `<root>/account.json` (read when it exists). The MANUAL header set is kept in the same directory
 (`auto-set-bybit-demo.json`), not in the browser.
 
 ## Files (the contract with the runner)

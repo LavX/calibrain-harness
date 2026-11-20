@@ -23,9 +23,9 @@ and its status.json is fresh; otherwise 409 "written, NOT confirmed" names the s
 (a hung or crash-looping runner reads the flags when it comes back). Only a venue that has not started (no root or no
 strategies.json) or whose strategies.json is unusable is refused with nothing written.
 
-P&L today: the harness keeps its own 00:00 UTC baseline per venue (the first sample of each UTC day, from the status
-files and, on bybit-demo, the account's USDT equity) in a small JSON file under its data directory, so the number
-survives a restart. A background task samples every minute; when the harness was down at midnight the baseline is the
+P&L today: the harness keeps its own 00:00 UTC baseline per venue (the first sample of each UTC day, from the books'
+equity in the status files) in a small JSON file under its data directory, so the number survives a restart. There is no
+account-level P&L today: the USDT coin's equity moves when a spot leg is bought with USDT, which is not a loss. A background task samples every minute; when the harness was down at midnight the baseline is the
 first sample after it came back, and the page says since when.
 """
 
@@ -149,6 +149,16 @@ def strategy_liveness(cfg: VenueConfig, view: dict, runners: list[dict], now_ms:
     return True, "runner up, status fresh"
 
 
+def _sum_known(vals: list[float | None]) -> float | None:
+    """Sum, or None when any value is unknown (an unknown leg must not read as zero)."""
+    return None if any(v is None for v in vals) else float(sum(vals))  # type: ignore[arg-type]
+
+
+def _derivative(p: dict) -> bool:
+    """A perp or future leg, the kind the exchange's unrealised P&L covers (a spot leg's value sits in the coin balance)."""
+    return str(p.get("market", "")).lower() != "spot"
+
+
 def _signed(side: str, qty: float) -> float:
     return -abs(qty) if side.lower() in ("short", "sell") else abs(qty)
 
@@ -224,7 +234,8 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
         "targets_n": sum(1 for t in st["targets"] if t.get("target_qty")) if st else None,
         "equity": eq, "start_equity": st.get("start_equity_usdt") if st else None, "pnl": st.get("pnl_usdt") if st else None,
         "pnl_today": pnl_today, "pnl_today_since_ms": b.get("t_ms") if b and pnl_today is not None else None,
-        "unrealised": sum(p["upnl_usdt"] for p in st["positions"] if p.get("upnl_usdt") is not None) if st else None,
+        "unrealised": _sum_known([p.get("upnl_usdt") for p in st["positions"]]) if st else None,
+        "unrealised_derivatives": _sum_known([p.get("upnl_usdt") for p in st["positions"] if _derivative(p)]) if st else None,
         "last_error": st.get("last_error") if st else None,
         "updated_ms": st.get("updated_ms") if st else None, "last_rebalance_ms": st.get("last_rebalance_ms") if st else None,
         "last_trade_ms": last_trade, "trades_today": st.get("trades_today") if st else None,
@@ -274,9 +285,8 @@ def alerts(v: dict, now_ms: float) -> list[dict]:
 
 # ------------------------------------------------------------------------------------------------ baselines
 class Baselines:
-    """The persisted 00:00 UTC sample per venue: {"day", "t_ms", "strategies": {id: {"equity", "t_ms"}},
-    "account": {"usdt_equity", "t_ms"} | null}. Written once per UTC day, topped up when a strategy or the account
-    first appears later that day. Survives restarts (a file per venue under the harness's data directory)."""
+    """The persisted 00:00 UTC sample per venue: {"day", "t_ms", "strategies": {id: {"equity", "t_ms"}}}. Written once
+    per UTC day, topped up when a strategy first appears later that day (with its own t_ms). Survives restarts (a file per venue under the harness's data directory)."""
 
     def __init__(self, directory: Path) -> None:
         self.dir = directory
@@ -288,19 +298,16 @@ class Baselines:
         doc = S.read_json(self.path(vid))
         return doc if doc and doc.get("day") == utc_day(now_s) else None
 
-    def sample(self, vid: str, now_s: float, equities: dict[str, float], account_equity: float | None) -> dict:
+    def sample(self, vid: str, now_s: float, equities: dict[str, float]) -> dict:
         day, now_ms = utc_day(now_s), int(now_s * 1000)
         doc = self.get(vid, now_s)
         changed = doc is None
         if doc is None:
-            doc = {"day": day, "t_ms": now_ms, "strategies": {}, "account": None}
+            doc = {"day": day, "t_ms": now_ms, "strategies": {}}
         for sid, eq in equities.items():
             if eq is not None and sid not in doc["strategies"]:
                 doc["strategies"][sid] = {"equity": eq, "t_ms": now_ms}
                 changed = True
-        if account_equity is not None and not doc.get("account"):
-            doc["account"] = {"usdt_equity": account_equity, "t_ms": now_ms}
-            changed = True
         if changed:
             try:
                 self.dir.mkdir(parents=True, exist_ok=True)
@@ -371,7 +378,7 @@ class VenueHub:
         cfg, svc = self.config(vid), self.service(vid)
         doc = dict(await svc.snapshot(force=force))
         now = self.clock()
-        base = self._sample(cfg, doc, account, now)
+        base = self._sample(cfg, doc, now)
         rows = {r["id"]: r for r in (strategy_row(v, base, now * 1000) for v in doc["strategies"])}
         doc["strategies"] = [{**v, "pnl_today": rows[v["id"]]["pnl_today"], "pnl_today_since_ms": rows[v["id"]]["pnl_today_since_ms"]}
                              for v in doc["strategies"]]
@@ -388,13 +395,11 @@ class VenueHub:
         accounts = {s.get("account") for s in doc["strategies"]}
         return account if mine is None or not accounts or mine in accounts else None
 
-    def _sample(self, cfg: VenueConfig, doc: dict, account: dict | None, now: float) -> dict | None:
+    def _sample(self, cfg: VenueConfig, doc: dict, now: float) -> dict | None:
         equities = {v["id"]: v["status"]["equity_usdt"] for v in doc["strategies"] if v.get("status")}
-        acct = self._account_for(cfg, doc, account)
-        usdt = _num((acct or {}).get("wallet", {}).get("usdt_equity")) if acct else None
-        if not equities and usdt is None:
+        if not any(e is not None for e in equities.values()):
             return self.baselines.get(cfg.id, now)
-        return self.baselines.sample(cfg.id, now, equities, usdt)
+        return self.baselines.sample(cfg.id, now, equities)
 
     async def summary(self, account: dict | None = None) -> dict[str, Any]:
         """GET /api/venues: per venue presence, books, account, today's P&L, strategies and netted positions, plus the alerts."""
@@ -414,7 +419,7 @@ class VenueHub:
         now_ms = now * 1000
         has_registry = (cfg.root / "strategies.json").is_file()
         doc = await svc.snapshot(force=force)
-        base = self._sample(cfg, doc, account, now) if has_registry else None
+        base = self._sample(cfg, doc, now) if has_registry else None
         rows = [strategy_row(v, base, now_ms) for v in doc["strategies"]]
         entry_units = list(dict.fromkeys(s["unit"] for s in doc["strategies"] if s.get("unit")))
         wanted = entry_units or ([cfg.unit] if cfg.unit else [])
@@ -423,32 +428,38 @@ class VenueHub:
                              statuses=[s.get("status") for s in doc["strategies"]], now_ms=now_ms)
         known = [r for r in rows if r["equity"] is not None]
         today = [r for r in rows if r["pnl_today"] is not None]
-        unreal = [r["unrealised"] for r in rows if r["unrealised"] is not None]
-        books = {"equity": sum(r["equity"] for r in known) if known else None,
-                 "start": sum(r["start_equity"] for r in rows if r["start_equity"] is not None) if rows else None,
-                 "pnl": sum(r["pnl"] for r in rows if r["pnl"] is not None) if rows else None,
-                 "unrealised": sum(unreal) if unreal else None,
+
+        def total(key: str) -> float | None:  # the known values summed; None when none is known (never a made-up zero)
+            vals = [r[key] for r in rows if r[key] is not None]
+            return float(sum(vals)) if vals else None
+
+        books = {"equity": total("equity"), "start": total("start_equity"), "pnl": total("pnl"),
+                 # unrealised: unknown as soon as one leg's uPnL is unknown
+                 "unrealised": _sum_known([r["unrealised"] for r in rows]) if rows else None,
+                 "unrealised_derivatives": _sum_known([r["unrealised_derivatives"] for r in rows]) if rows else None,
+                 # strategies whose equity or P&L is unknown: the sums above leave them out, the page says "partial"
+                 "incomplete": [r["name"] for r in rows if r["equity"] is None or r["pnl"] is None],
                  "legs": sum(r["positions_n"] or 0 for r in rows)}
         since_ms = min((r["pnl_today_since_ms"] for r in today if r["pnl_today_since_ms"] is not None), default=None)
         acct = self._account_for(cfg, doc, account)
         account_block = None
         if acct:
             w = acct["wallet"]
-            ab = (base or {}).get("account") or {}
-            usdt = _num(w.get("usdt_equity"))
-            acc_unreal = _num(w.get("unrealized_pnl"))
+            acc_unreal = _num(w.get("unrealized_pnl"))  # the USDT coin's unrealised P&L: perps and futures only
+            books_deriv = books["unrealised_derivatives"]
             account_block = {
-                "source": "exchange", "ccy": "USDT", "equity": usdt, "collateral_usd": _num(w.get("equity")),
-                "available": _num(w.get("available")), "unrealised": acc_unreal,
-                "pnl_today": (usdt - ab["usdt_equity"]) if usdt is not None and _num(ab.get("usdt_equity")) is not None else None,
-                "pnl_today_since": since_label(ab.get("t_ms"), now) if ab else None,
-                "unattributed": (acc_unreal - books["unrealised"]) if acc_unreal is not None and books["unrealised"] is not None else None,
+                "source": "exchange", "ccy": "USDT", "equity": _num(w.get("usdt_equity")), "collateral_usd": _num(w.get("equity")),
+                "available": _num(w.get("available")), "unrealised": acc_unreal, "books_unrealised": books_deriv,
+                # no account P&L today: the USDT coin's equity drops when a spot leg is bought, which is not a loss
+                "pnl_today": None, "pnl_today_since": None,
+                # like with like: the exchange's derivatives uPnL minus the books' perp and future legs' uPnL
+                "unattributed": (acc_unreal - books_deriv) if acc_unreal is not None and books_deriv is not None else None,
                 "positions_n": len(acct.get("positions") or []), "last_sync": acct.get("last_sync"),
             }
         elif has_registry and (extra := S.read_json(cfg.root / "account.json")):
             eq, start = _num(extra.get("equity")), _num(extra.get("day_start_equity"))
             account_block = {"source": "account.json", "ccy": str(extra.get("ccy") or cfg.ccy), "equity": eq, "collateral_usd": None,
-                             "available": _num(extra.get("available")), "unrealised": _num(extra.get("unrealised")),
+                             "available": _num(extra.get("available")), "unrealised": _num(extra.get("unrealised")), "books_unrealised": None,
                              "pnl_today": (eq - start) if eq is not None and start is not None else None,
                              "pnl_today_since": "since the runner's day start" if start is not None else None,
                              "unattributed": None, "positions_n": None, "last_sync": _num(extra.get("updated_ms"))}

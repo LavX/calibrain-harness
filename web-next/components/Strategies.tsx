@@ -404,7 +404,7 @@ export function StrategiesView() {
       {doc.allocator_venue && (doc.allocator.available || doc.mode === "llm") && <AllocatorPanel doc={doc} />}
       {doc.allocator_venue && <PredictionsPanel />}
       {doc.allocator_venue && <ScoreboardPanel />}
-      {v && v.account && <div className="muted strat-help">{doc.venue_label} account: USDT equity {money(v.account.equity, v.account.ccy)} · unrealised {smoney(v.account.unrealised, v.account.ccy)}</div>}
+      {v && v.account && <div className="muted strat-help">{doc.venue_label} account: {v.account.ccy} equity {money(v.account.equity, v.account.ccy)} · {v.account.source === "exchange" ? "derivatives unrealised" : "unrealised"} {smoney(v.account.unrealised, v.account.ccy)}</div>}
       <div className="strat-grid">
         {doc.strategies.map((s) => (
           <Card key={s.id} s={s} doc={doc} inSet={set.includes(s.id)} toggleSet={() => toggleSet(s.id)} />

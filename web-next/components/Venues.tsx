@@ -22,13 +22,16 @@ export type VStrat = {
 export type VPos = { symbol: string; market: string; side: string; size: number | null; entry: number | null; mark: number | null; upnl: number | null; held_by: string[]; legs: number | null };
 export type VAccount = {
   source: "exchange" | "account.json"; ccy: string; equity: number | null; collateral_usd: number | null; available: number | null; unrealised: number | null;
+  /** the books' perp and future legs' uPnL, the like-for-like figure the exchange's unrealised is compared with */
+  books_unrealised: number | null;
+  /** only from a runner's account.json (its own day start); never computed from the exchange's USDT coin equity */
   pnl_today: number | null; pnl_today_since: string | null; unattributed: number | null; positions_n: number | null; last_sync: number | null;
 };
 export type Venue = {
   id: string; label: string; ccy: string; controlled_by: "allocator" | "owner"; root: string; unit: string | null;
   presence: "live" | "stale" | "stopped" | "absent" | "error"; presence_text: string | null; updated_ms: number | null;
   counts: { running: number; idle: number; paused: number; abnormal: number; total: number };
-  books: { equity: number | null; start: number | null; pnl: number | null; unrealised: number | null; legs: number };
+  books: { equity: number | null; start: number | null; pnl: number | null; unrealised: number | null; unrealised_derivatives: number | null; incomplete: string[]; legs: number };
   pnl_today: number | null; pnl_today_partial: boolean; pnl_today_since: string | null;
   account: VAccount | null; strategies: VStrat[]; positions: VPos[];
   /** available: KILL writes the flags (every venue that has started); ok: and the runner would act on them now. */
@@ -157,7 +160,7 @@ function VenueStrip({ doc }: { doc: VenuesDoc }) {
           <tr key={v.id} className={grey}>
             <td className="sym" data-tip={`${v.root}${v.unit ? `\nunit ${v.unit}` : ""}`}>{v.label}</td>
             <td><Presence v={v} at={doc.generated_at} /></td>
-            <td className="r">{off ? NA : money(v.books.equity, v.ccy)}</td>
+            <td className="r" data-tip={v.books.incomplete.length ? `Leaves out ${v.books.incomplete.join(", ")}: equity or P&L unknown` : undefined}>{off ? NA : money(v.books.equity, v.ccy)}{v.books.incomplete.length > 0 && <span className="muted"> (partial)</span>}</td>
             <td className={`r ${off ? "" : ud(v.pnl_today)}`} data-tip={v.pnl_today_since ? `${v.pnl_today_since}${v.pnl_today_partial ? "; some strategies have no sample yet" : ""}` : "no 00:00 UTC sample yet"}>
               {off ? NA : smoney(v.pnl_today, v.ccy)}{v.pnl_today_partial && <span className="muted"> (partial)</span>}</td>
             <td className={`r ${off ? "" : ud(v.books.pnl)}`}>{off ? NA : smoney(v.books.pnl, v.ccy)}</td>
@@ -183,12 +186,11 @@ function AccountRow({ v }: { v: Venue }) {
     <tr className="acct-row">
       <td colSpan={8}>
         <span className="muted">{v.label} account{a.source === "account.json" ? " (runner's account.json)" : ""}:</span>{" "}
-        USDT equity <b className="w">{money(a.equity, a.ccy)}</b>
+        {a.ccy} equity <b className="w">{money(a.equity, a.ccy)}</b>
         {isNum(a.collateral_usd) && <span data-tip="Bybit totalEquity: every coin in the unified account, valued in USD. Not the strategies' money."> · all collateral {money(a.collateral_usd, "USD")}</span>}
-        {" · "}unrealised <span className={ud(a.unrealised)}>{smoney(a.unrealised, a.ccy)}</span>
-        {isNum(a.unattributed) && <span data-tip="Account unrealised minus the books' unrealised: positions or price differences no strategy book accounts for"> (books {smoney(v.books.unrealised, v.ccy)}, unattributed <span className={ud(a.unattributed)}>{sg(a.unattributed, 2)}</span>)</span>}
-        {" · "}account P&amp;L today <span className={ud(a.pnl_today)}>{smoney(a.pnl_today, a.ccy)}</span>
-        {a.pnl_today_since && <span className="muted"> {a.pnl_today_since}</span>}
+        {" · "}<span data-tip={a.source === "exchange" ? "The exchange's unrealised P&L on perps and futures (spot legs are in the coin balances)" : undefined}>{a.source === "exchange" ? "derivatives unrealised" : "unrealised"}</span> <span className={ud(a.unrealised)}>{smoney(a.unrealised, a.ccy)}</span>
+        {a.source === "exchange" && <span data-tip="Like with like: the exchange's derivatives unrealised minus the books' perp and future legs' unrealised. Unknown when any leg's uPnL is unknown."> (books&apos; perp legs {smoney(a.books_unrealised, v.ccy)}, unattributed <span className={ud(a.unattributed)}>{sg(a.unattributed, 2)}</span>)</span>}
+        {a.source === "account.json" && <>{" · "}P&amp;L today <span className={ud(a.pnl_today)}>{smoney(a.pnl_today, a.ccy)}</span>{a.pnl_today_since && <span className="muted"> {a.pnl_today_since}</span>}</>}
       </td>
     </tr>
   );

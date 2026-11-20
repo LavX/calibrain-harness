@@ -279,17 +279,49 @@ def test_since_label_says_when_the_baseline_was_taken():
     assert V.since_label(midnight * 1000 + 3 * 3600_000, midnight + 4 * 3600).startswith("since 03:00 UTC")
 
 
-def test_bybit_account_block_reports_usdt_separately_and_the_unattributed_gap(roots, tmp_path):
-    acct = {"wallet": {"equity": 163245.78, "usdt_equity": 49911.05, "available": 99007.9, "unrealized_pnl": 24.4},
-            "positions": [{"symbol": "BTCUSDT", "side": "short", "size": 0.05, "entry": 90000.0, "mark": 90100.0, "upnl": -5.0}]}
-    doc = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(acct))
+ACCOUNT = {"wallet": {"equity": 163245.78, "usdt_equity": 49911.05, "available": 99007.9, "unrealized_pnl": 24.4},
+           "positions": [{"symbol": "BTCUSDT", "side": "short", "size": 0.05, "entry": 90000.0, "mark": 90100.0, "upnl": -5.0}]}
+
+
+def test_bybit_account_block_compares_like_with_like(roots, tmp_path):
+    doc = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(ACCOUNT))
     b = doc["venues"][0]
     a = b["account"]
-    assert a["equity"] == 49911.05 and a["collateral_usd"] == 163245.78 and a["pnl_today"] == 0.0
-    assert a["unattributed"] == pytest.approx(24.4 - (-0.5))  # carry's two legs: -5.0 + 4.5
+    assert a["equity"] == 49911.05 and a["collateral_usd"] == 163245.78
+    assert a["pnl_today"] is None  # the USDT coin's equity moves on spot buys: no account-level P&L today
+    # carry holds a linear leg (uPnL -5.0) and a spot leg (+4.5): only the linear one is in the exchange's unrealised
+    assert a["books_unrealised"] == pytest.approx(-5.0) and a["unattributed"] == pytest.approx(24.4 + 5.0)
+    assert b["books"]["unrealised"] == pytest.approx(-0.5)  # the books' own figure keeps both legs
     assert b["positions"][0]["held_by"] == ["Carry"]  # the exchange's netted row, with who holds a leg
     okx = doc["venues"][1]
     assert okx["account"] is None and okx["books"]["equity"] == 20004.0  # other venues: books only
+
+
+def test_a_spot_purchase_does_not_move_any_pnl_today(roots, tmp_path):
+    sd = FakeSystemd(active=BYBIT_UNITS)
+    run(hub(roots, sd, tmp_path).summary(ACCOUNT))
+    bought = {**ACCOUNT, "wallet": {**ACCOUNT["wallet"], "usdt_equity": 49911.05 - 4500.0}}  # 0.05 BTC bought with USDT
+    v = run(hub(roots, sd, tmp_path, now=NOW + 60).summary(bought))["venues"][0]
+    assert v["account"]["pnl_today"] is None and v["pnl_today"] == pytest.approx(0.0)
+
+
+def test_unknown_values_stay_unknown(roots, tmp_path):
+    okx = roots[1]
+    p = okx / "trend" / "status.json"
+    doc = json.loads(p.read_text())
+    doc["positions"][0]["upnl_usdt"] = None
+    doc.pop("pnl_usdt")
+    p.write_text(json.dumps(doc))
+    v = run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).summary())["venues"][1]
+    assert v["books"]["unrealised"] is None  # one unvalued leg: unknown, not zero
+    assert v["books"]["pnl"] == 0.0 and v["books"]["incomplete"] == ["Trend"]  # longvol's 0.0 is known; trend's is not
+    for sid in ("trend", "longvol"):
+        q = okx / sid / "status.json"
+        d = json.loads(q.read_text())
+        d.pop("pnl_usdt", None)
+        q.write_text(json.dumps(d))
+    v = run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).summary())["venues"][1]
+    assert v["books"]["pnl"] is None  # nothing known: unknown, never "+0.00"
 
 
 # ---------------------------------------------------------------- strategies: names, IDLE, applied values, netting
