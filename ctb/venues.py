@@ -36,7 +36,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -47,12 +47,13 @@ from .control_lock import locked
 
 PRIMARY = "bybit-demo"  # the allocator venue
 VID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-# id: (label, unit, settlement currency, controlled by)
+# id: (label, unit, settlement currency, controlled by). Every venue is the LLM allocator's unless CTB_ALLOCATOR_VENUES
+# leaves it out (apply_allocator_venues); bybit-demo stays the allocator venue: its root holds the allocator's files.
 KNOWN: dict[str, tuple[str, str | None, str, str]] = {
     "bybit-demo": ("BYBIT·DEMO", "calibrain-live.service", "USDT", "allocator"),
-    "okx-demo": ("OKX·DEMO", "calibrain-live-okx.service", "USDT", "owner"),
-    "deribit-test": ("DERIBIT·TEST", "calibrain-live-deribit.service", "USDC", "owner"),
-    "bitget-demo": ("BITGET·DEMO", "calibrain-live-bitget.service", "USDT", "owner"),
+    "okx-demo": ("OKX·DEMO", "calibrain-live-okx.service", "USDT", "allocator"),
+    "deribit-test": ("DERIBIT·TEST", "calibrain-live-deribit.service", "USDC", "allocator"),
+    "bitget-demo": ("BITGET·DEMO", "calibrain-live-bitget.service", "USDT", "allocator"),
 }
 IDLE_ALERT_S = 24 * 3600  # an enabled strategy that held nothing and traded nothing for this long is flagged
 # A baseline sampled this soon after 00:00 UTC counts as "since 00:00 UTC": the sampler runs every 60 s, so a harness that
@@ -73,7 +74,7 @@ class VenueConfig:
 
 
 def venue_config(vid: str, root: Path, *, unit: str | None = None) -> VenueConfig:
-    label, known_unit, ccy, by = KNOWN.get(vid) or (vid.upper().replace("-", "·"), None, "USDT", "owner")
+    label, known_unit, ccy, by = KNOWN.get(vid) or (vid.upper().replace("-", "·"), None, "USDT", "allocator")
     return VenueConfig(vid, label, root, unit if unit is not None else known_unit, ccy, by)
 
 
@@ -100,6 +101,19 @@ def parse_live_roots(text: str | None, default_root: Path) -> list[VenueConfig]:
     if not any(v.id == PRIMARY for v in out):
         raise ValueError(f"CTB_LIVE_ROOTS must list {PRIMARY}: the LLM allocator and the per-symbol bot's guard are bound to it")
     return out
+
+
+def apply_allocator_venues(venues: list[VenueConfig], text: str | None) -> list[VenueConfig]:
+    """CTB_ALLOCATOR_VENUES: the venue ids the LLM allocator controls, comma separated. Unset or empty: every configured
+    venue. A venue left out is the owner's (controlled_by "owner"). An id that is not configured refuses to start."""
+    ids = {v.id for v in venues}
+    if not (text or "").strip():
+        managed = ids
+    else:
+        managed = {x.strip().lower() for x in (text or "").split(",") if x.strip()}
+        if unknown := sorted(managed - ids):
+            raise ValueError(f"CTB_ALLOCATOR_VENUES names {', '.join(unknown)}, which CTB_LIVE_ROOTS does not configure")
+    return [replace(v, controlled_by="allocator" if v.id in managed else "owner") for v in venues]
 
 
 def state_dir() -> Path:
@@ -485,7 +499,8 @@ class VenueHub:
 
     @classmethod
     def from_env(cls) -> "VenueHub":
-        venues = parse_live_roots(os.environ.get("CTB_LIVE_ROOTS"), S.live_root())
+        venues = apply_allocator_venues(parse_live_roots(os.environ.get("CTB_LIVE_ROOTS"), S.live_root()),
+                                        os.environ.get("CTB_ALLOCATOR_VENUES"))
         sdir = state_dir()
         services: dict[str, S.StrategyService] = {}
         for v in venues:
@@ -495,13 +510,50 @@ class VenueHub:
                 services[v.id] = S.StrategyService(v.root, extra_units=tuple(dict.fromkeys(extra)), auto_set_path=auto)
             else:
                 services[v.id] = S.StrategyService(v.root, extra_units=(v.unit,) if v.unit else (), dashboard_account="",
-                                                   shares_bot_account=False, auto_set_path=None, has_allocator=False)
+                                                   shares_bot_account=False, auto_set_path=None,
+                                                   has_allocator=v.controlled_by == "allocator")
         return cls(venues, services, state=sdir)
 
     @classmethod
     def single(cls, svc: S.StrategyService, *, state: Path | None = None) -> "VenueHub":
         """One venue (bybit-demo) around an existing service: old configurations and tests."""
         return cls([venue_config(PRIMARY, svc.root, unit="")], {PRIMARY: svc}, state=state, clock=svc.clock)
+
+    def allocator_venues(self) -> list[Any]:
+        """The venues the LLM allocator applies its decision to (ctb.allocator.AllocVenue): the allocator venue first (its
+        root holds the allocator's files; managed False when CTB_ALLOCATOR_VENUES leaves it out), then every other venue it
+        controls. A venue left out is not even computed."""
+        from .allocator import AllocVenue  # the allocator module pulls in the model clients: imported only here
+        first = self.config(self.primary_id)
+        out = [AllocVenue(first.id, first.root, first.label, managed=first.controlled_by == "allocator")]
+        return out + [AllocVenue(v.id, v.root, v.label) for v in self.venues if v.id != self.primary_id and v.controlled_by == "allocator"]
+
+    async def auto_others(self, enabled: bool, mode: str) -> dict[str, str]:
+        """The header AUTO-TRADE switch on the venues other than the allocator venue that the allocator controls. OFF (any
+        mode) pauses every strategy there, positions stay open. ON in LLM DECIDES makes sure their runners run (the allocator
+        then writes their controls); ON in MANUAL changes nothing there (the header set is the allocator venue's)."""
+        out: dict[str, str] = {}
+        for cfg in self.venues:
+            if cfg.id == self.primary_id or cfg.controlled_by != "allocator":
+                continue
+            svc = self.services[cfg.id]
+            reg = svc.registry()
+            if reg.error or not reg.entries:
+                out[cfg.id] = "not started: nothing to switch"
+                continue
+            try:
+                if not enabled:
+                    await svc._pause_all(reg)
+                    svc._cache = None
+                    out[cfg.id] = "paused"
+                elif mode == "llm":
+                    await svc._ensure_running([e.unit for e in reg.entries if e.unit])
+                    out[cfg.id] = "runner running; the allocator decides"
+                else:
+                    out[cfg.id] = "unchanged (MANUAL: switch its strategies per card)"
+            except S.StrategyError as exc:
+                out[cfg.id] = f"refused: {exc.message}"
+        return out
 
     @property
     def primary(self) -> S.StrategyService:
@@ -529,6 +581,7 @@ class VenueHub:
                              for v in doc["strategies"]]
         doc["venue_id"], doc["venue_label"], doc["ccy"], doc["controlled_by"] = cfg.id, cfg.label, cfg.ccy, cfg.controlled_by
         doc["allocator_venue"] = cfg.id == self.primary_id
+        doc["allocator_managed"] = cfg.controlled_by == "allocator"
         return doc
 
     def _account_for(self, cfg: VenueConfig, doc: dict, account: dict | None) -> dict | None:

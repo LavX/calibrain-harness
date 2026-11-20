@@ -20,6 +20,8 @@ Environment=CTB_TRADING_ENABLED=0
 Environment=CTB_LIVE_ROOT=%h/Documents/calibrain-study/data/live
 # Several venues (F1 venue strip, F7 venue selector): one runner root per exchange account. bybit-demo must be listed and
 # then overrides CTB_LIVE_ROOT. Roots that do not exist yet show as "not started". Never a glob: list each root.
+# The LLM allocator controls every configured venue unless this lists fewer (comma separated ids):
+#Environment=CTB_ALLOCATOR_VENUES=bybit-demo,okx-demo,deribit-test,bitget-demo
 #Environment=CTB_LIVE_ROOTS=bybit-demo=%h/Documents/calibrain-study/data/live,okx-demo=%h/Documents/calibrain-study/data/live-okx,deribit-test=%h/Documents/calibrain-study/data/live-deribit,bitget-demo=%h/Documents/calibrain-study/data/live-bitget
 # The demo account the per-symbol bot would use. Strategies whose account equals it, or all of them when this is unset,
 # are treated as sharing the account (only one mode trades it at a time).

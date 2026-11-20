@@ -94,10 +94,10 @@ def test_unset_means_one_bybit_venue_at_the_old_root(tmp_path):
 def test_known_venues_get_label_unit_currency_and_controller(tmp_path):
     vs = V.parse_live_roots(f"bybit-demo={tmp_path}/live, okx-demo={tmp_path}/live-okx,deribit-test={tmp_path}/d,bitget-demo={tmp_path}/b", tmp_path)
     got = {v.id: (v.label, v.unit, v.ccy, v.controlled_by) for v in vs}
-    assert got == {"bybit-demo": ("BYBIT·DEMO", "calibrain-live.service", "USDT", "allocator"),
-                   "okx-demo": ("OKX·DEMO", "calibrain-live-okx.service", "USDT", "owner"),
-                   "deribit-test": ("DERIBIT·TEST", "calibrain-live-deribit.service", "USDC", "owner"),
-                   "bitget-demo": ("BITGET·DEMO", "calibrain-live-bitget.service", "USDT", "owner")}
+    assert got == {"bybit-demo": ("BYBIT·DEMO", "calibrain-live.service", "USDT", "allocator"),  # every venue is the allocator's
+                   "okx-demo": ("OKX·DEMO", "calibrain-live-okx.service", "USDT", "allocator"),  # unless CTB_ALLOCATOR_VENUES
+                   "deribit-test": ("DERIBIT·TEST", "calibrain-live-deribit.service", "USDC", "allocator"),  # leaves it out
+                   "bitget-demo": ("BITGET·DEMO", "calibrain-live-bitget.service", "USDT", "allocator")}
 
 
 @pytest.mark.parametrize("bad", ["okx-demo=/x", "bybit-demo=/a,bybit-demo=/b", "bybit-demo", "Bybit Demo=/x", "bybit-demo=/a,../x=/b",

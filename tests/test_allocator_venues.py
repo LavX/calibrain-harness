@@ -212,7 +212,27 @@ def test_score_reads_the_migrated_history(roots):
     assert A.score_decisions(bybit, now_ms=int(T0 * 1000))["pending"] == 0  # reads the new keys without failing
 
 
-# ---------------------------------------------------------------- a venue computed but not written
+# ---------------------------------------------------------------- the opt-out
+def test_ctb_allocator_venues_leaves_a_venue_to_the_owner(roots, monkeypatch):
+    bybit, okx = roots
+    monkeypatch.setenv("CTB_LIVE_ROOTS", f"bybit-demo={bybit},okx-demo={okx}")
+    monkeypatch.setenv("CTB_ALLOCATOR_VENUES", "bybit-demo")
+    h = V.VenueHub.from_env()
+    assert {v.id: v.controlled_by for v in h.venues} == {"bybit-demo": "allocator", "okx-demo": "owner"}
+    assert [v.id for v in h.allocator_venues()] == ["bybit-demo"] and h.services["okx-demo"].has_allocator is False
+    a = A.Allocator(bybit, ChatModel(), market, model="chat/test", clock=lambda: T0, budget=RateBudget(50), mode="chat",
+                    venues=h.allocator_venues())
+    before = ctl(okx, "trend")
+    rec = decide(a)
+    assert ctl(okx, "trend") == before and "okx-demo" not in rec["venues"]
+    monkeypatch.delenv("CTB_ALLOCATOR_VENUES")
+    h = V.VenueHub.from_env()
+    assert [v.id for v in h.allocator_venues()] == ["bybit-demo", "okx-demo"]  # default: every configured venue
+    monkeypatch.setenv("CTB_ALLOCATOR_VENUES", "bybit-demo,ftx")
+    with pytest.raises(ValueError):
+        V.VenueHub.from_env()
+
+
 def test_an_unmanaged_allocator_venue_is_computed_but_not_written(roots):
     bybit, okx = roots
     a = A.Allocator(bybit, ChatModel(), market, model="chat/test", clock=lambda: T0, budget=RateBudget(50), mode="chat",
@@ -220,3 +240,58 @@ def test_an_unmanaged_allocator_venue_is_computed_but_not_written(roots):
     rec = decide(a)
     assert all(ctl(bybit, i)["enabled"] is False for i in BYBIT_IDS) and rec["applied"] == {}
     assert ctl(okx, "trend")["enabled"] is True
+
+
+# ---------------------------------------------------------------- the dashboard side
+class FakeSystemd:
+    def __init__(self, active=()):
+        self.active = set(active)
+
+    async def __call__(self, argv, **_):
+        unit = argv[-1]
+        if argv[2] == "show":
+            return 0, f"LoadState=loaded\nActiveState={'active' if unit in self.active else 'inactive'}\n", ""
+        if argv[2] == "start":
+            self.active.add(unit)
+        return 0, "", ""
+
+
+def hub_of(bybit, okx, tmp_path, sd):
+    vs = [V.venue_config("bybit-demo", bybit, unit=""), V.venue_config("okx-demo", okx)]
+    services = {"bybit-demo": st.StrategyService(bybit, run=sd, clock=lambda: T0, extra_units=(), dashboard_account="", allocator_available=True),
+                "okx-demo": st.StrategyService(okx, run=sd, clock=lambda: T0, extra_units=("calibrain-live-okx.service",),
+                                               dashboard_account="", shares_bot_account=False, has_allocator=True)}
+    services["bybit-demo"]._mode = "llm"
+    return V.VenueHub(vs, services, state=tmp_path / "state", clock=lambda: T0)
+
+
+def test_hand_to_allocator_clears_owner_locks_but_not_over_a_pending_kill(roots, tmp_path):
+    bybit, okx = roots
+    for i in OKX_IDS:  # the deploy state: the owner's, weight 1
+        put(okx / i / "control.json", {"enabled": True, "weight": 1.0, "set_by": "owner", "owner_lock": True})
+    c = ctl(okx, "longvol")
+    put(okx / "longvol" / "control.json", {**c, "flatten": True})  # a kill is pending there
+    svc = hub_of(bybit, okx, tmp_path, FakeSystemd()).service("okx-demo")
+    with pytest.raises(st.StrategyError) as e:
+        svc.hand_to_allocator()
+    assert e.value.status == 409 and sorted(e.value.detail["handed"]) == ["trend", "xsmom"] and "longvol" in e.value.detail["refused"]
+    assert ctl(okx, "trend")["owner_lock"] is False and ctl(okx, "trend")["set_by"] == "llm" and ctl(okx, "trend")["weight"] == 1.0
+    assert ctl(okx, "longvol")["owner_lock"] is True
+    out = svc.hand_to_allocator(cancel_kill=True)
+    assert out["handed"] == ["longvol"] and sorted(out["already"]) == ["trend", "xsmom"] and ctl(okx, "longvol")["flatten"] is False
+    owner_svc = st.StrategyService(okx, run=FakeSystemd(), clock=lambda: T0, extra_units=(), dashboard_account="",
+                                   shares_bot_account=False, has_allocator=False)
+    with pytest.raises(st.StrategyError):
+        owner_svc.hand_to_allocator()  # a venue left to the owner
+
+
+def test_the_header_switch_reaches_every_allocator_venue(roots, tmp_path):
+    bybit, okx = roots
+    for i in OKX_IDS:
+        book(okx, i, weight=0.5, enabled=True)
+    sd = FakeSystemd()
+    h = hub_of(bybit, okx, tmp_path, sd)
+    out = asyncio.run(h.auto_others(True, "llm"))
+    assert "calibrain-live-okx.service" in sd.active and "allocator decides" in out["okx-demo"]
+    out = asyncio.run(h.auto_others(False, "llm"))
+    assert out["okx-demo"] == "paused" and all(ctl(okx, i)["enabled"] is False for i in OKX_IDS)

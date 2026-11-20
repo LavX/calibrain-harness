@@ -86,9 +86,20 @@ CTB_LIVE_ROOTS=bybit-demo=<root>,okx-demo=<root>,deribit-test=<root>,bitget-demo
 | Venue id | Label | Unit | Currency | Controlled by |
 | --- | --- | --- | --- | --- |
 | bybit-demo | BYBIT·DEMO | calibrain-live.service | USDT | the LLM allocator |
-| okx-demo | OKX·DEMO | calibrain-live-okx.service | USDT | the owner |
-| deribit-test | DERIBIT·TEST | calibrain-live-deribit.service | USDC | the owner |
-| bitget-demo | BITGET·DEMO | calibrain-live-bitget.service | USDT | the owner |
+| okx-demo | OKX·DEMO | calibrain-live-okx.service | USDT | the LLM allocator |
+| deribit-test | DERIBIT·TEST | calibrain-live-deribit.service | USDC | the LLM allocator |
+| bitget-demo | BITGET·DEMO | calibrain-live-bitget.service | USDT | the LLM allocator |
+
+Every venue is the LLM allocator's unless `CTB_ALLOCATOR_VENUES` (comma-separated venue ids, default every configured
+venue) leaves it out; a left-out venue is the owner's. The allocator makes one decision per strategy (on bybit-demo's
+books, forecasts and decider) and applies it to each venue it controls whose runner lists that strategy, under that
+venue's own risk rules: the 10% vol cap over that venue's strategies, the 15% drawdown floor per (venue, strategy) book,
+the +0.25 daily step from a day anchor per (venue, strategy), the exploration floor per (venue, strategy), and on every
+write the owner lock, a pending kill and the allocator's pause (only risk-reducing writes while paused). The header
+AUTO-TRADE switch and the mode apply to every allocator venue: OFF pauses their strategies, ON in LLM DECIDES starts
+their runners (ON in MANUAL switches only the bybit-demo header set). KILL stays per venue. F7's HAND TO ALLOCATOR
+(`POST /api/venues/{vid}/hand-to-allocator`, body `{"cancel_kill": true}` to cancel pending kills) clears the owner
+locks on a venue's strategies so the allocator decides them at its next weights run.
 
 bybit-demo must be listed: the allocator, the predictions panel and the per-symbol bot's guard stay bound to it, and
 `/api/strategies` (and its actions) are aliases of `/api/venues/bybit-demo/...`. Unset, the dashboard has one venue,

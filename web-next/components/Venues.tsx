@@ -230,7 +230,8 @@ function AllocatorLine({ doc }: { doc: VenuesDoc }) {
   );
   return (
     <div className="alloc-line">
-      <div><span className="muted">LLM ALLOCATOR · {venue?.label || "BYBIT·DEMO"}:</span> {control}
+      <div><span className="muted" data-tip={`One decision per strategy (made on ${venue?.label || "BYBIT·DEMO"}'s books), applied on each venue under its own risk rules. CTB_ALLOCATOR_VENUES leaves a venue to the owner.`}>
+        LLM ALLOCATOR · controls {doc.venues.filter((v) => v.controlled_by === "allocator").map((v) => v.label).join(", ") || "no venue"}:</span> {control}
         {st && doc.mode === "llm" && <>
           <span className="muted"> · weights last set </span>{st.last_weights_ms ? `${hhmm(st.last_weights_ms / 1000)} (${ago(st.last_weights_ms / 1000)})` : NA}
           <span className="muted">, next </span>{st.next_weights_ms ? hhmm(st.next_weights_ms / 1000) : NA}
