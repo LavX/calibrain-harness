@@ -84,6 +84,7 @@ import aiohttp
 from . import allocator_context as X
 from . import allocator_math as M
 from .config import ROOT, Settings
+from . import strategies as S
 from .control_lock import locked
 from .kairos.allocator_prompt import REASONING_MAX_CHARS, build_messages, build_schema, retry_messages
 from .kairos.allocator_questions import (BEST_QID, NONE_ID, QUESTION_SET_VERSION, SCORED_QSETS, MappingParams, batches,
@@ -744,13 +745,16 @@ class Allocator:
         """The strategies a venue's runner lists (strategies.json). Only the allocator venue falls back to its directories
         (older roots): another venue's strategy is written only when its runner lists it."""
         venue = venue or self.primary
-        listed = read_json(venue.root / "strategies.json")
-        rows = [r for r in listed if isinstance(r, dict) and isinstance(r.get("id"), str)] if isinstance(listed, list) else []
         if venue is not self.primary:
-            return [r for r in rows if r["id"] != ALLOCATOR_ID]
+            # the dashboard's registry rules (ids, units, duplicates): an unusable file writes nothing on that venue, and an
+            # id can never reach outside the venue's root
+            reg = S.load_registry(venue.root)
+            return [] if reg.error else [{"id": e.id, "label": e.label} for e in reg.entries]
+        listed = read_json(venue.root / "strategies.json")
+        rows = [r for r in listed if isinstance(r, dict) and isinstance(r.get("id"), str) and S.ID_RE.fullmatch(r["id"])] if isinstance(listed, list) else []
         if not rows and self.root.is_dir():
             rows = [{"id": p.name, "label": p.name} for p in sorted(self.root.iterdir())
-                    if p.is_dir() and p.name != ALLOCATOR_ID and (p / "status.json").exists()]
+                    if p.is_dir() and p.name != ALLOCATOR_ID and S.ID_RE.fullmatch(p.name) and (p / "status.json").exists()]
         return [r for r in rows if r["id"] != ALLOCATOR_ID]
 
     def _seed_budget(self) -> None:
@@ -1288,7 +1292,7 @@ class Allocator:
                     "no_forecast": calc_out["held"],
                 })
             for v in self.venues[1:]:  # the same forecasts and decider p, each venue's own books, anchor and rules
-                venues[v.id] = self._computed_venue(v, fc, kind, why, p_new, now_ms, dry_run)
+                venues[v.id] = self._computed_venue(v, fc, kind, why, p_new, now_ms, dry_run, decided_ids=ids)
             record["venues"] = venues
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
@@ -1317,7 +1321,7 @@ class Allocator:
         weight under that venue's step limit, drawdown floor, exploration floor and owner locks; the others are held."""
         current = self._read_current(now_ms, v)
         if not current:
-            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "no strategies.json: nothing to apply"}
+            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "no usable strategies.json (missing or invalid): nothing applied"}
         decided = [s for s in current if decision is not None and s in decision.weights]
         sub = None if decision is None else Decision(
             {s: decision.weights[s] if s in decided else current[s].weight for s in current},
@@ -1332,33 +1336,43 @@ class Allocator:
             elif decision is None:
                 reasons[sid] = "kept (allocator error)"
             elif sid not in decided:
-                reasons[sid] = f"held: not in the decision (it covers the strategies {self.primary.label} lists)"
+                reasons[sid] = f"no decision: strategy not on the decision venue ({self.primary.label}), held"
             else:
                 reasons[sid] = decision.reasoning + (f" | demo minimum {plan.weights[sid]:.2f}" if sid in explored else "")
-        applied = self._apply(plan, current, reasons, now_ms, venue=v) if not dry_run and v.managed else {}
+        writable = {s: c for s, c in current.items() if s in decided or s in plan.floored or decision is None}
+        applied = self._apply(plan, writable, reasons, now_ms, venue=v) if not dry_run and v.managed else {}
+        applied.update({s: False for s in current if s not in writable})
         return self._venue_record(v, plan, current, reasons, applied, explored)
 
     def _computed_venue(self, v: AllocVenue, fc: Forecast, kind: str, why: str, p_new: dict[str, float], now_ms: int,
-                        dry_run: bool) -> dict[str, Any]:
+                        dry_run: bool, decided_ids: list[str] | None = None) -> dict[str, Any]:
         """The computed weights on another venue: the same forecasts and decider p per strategy, that venue's own books,
-        day anchor, vol cap over its strategies, drawdown floor, exploration floor and owner locks."""
+        day anchor, vol cap over its strategies, drawdown floor, exploration floor and owner locks. Only strategies the
+        decision venue lists (decided_ids) are computed; a strategy only this venue lists is held (no decision covers it),
+        whatever the forecast file holds for it."""
         current = self._read_current(now_ms, v)
         if not current:
-            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "no strategies.json: nothing to apply"}
+            return {"label": v.label, "managed": v.managed, "strategies": [], "note": "no usable strategies.json (missing or invalid): nothing applied"}
         ids = list(current)
+        covered = [s for s in ids if decided_ids is None or s in decided_ids]
         calc_out: dict[str, Any] | None = None
         decision: Decision | None = None
-        if kind == "computed":
-            anchored = self._day_anchor(current, now_ms, persist=not dry_run, venue=v)
-            p_now = self.p_means(ids, p_new if dry_run else None)
-            calc_out = compute_weights(ids, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
-            decision = Decision(dict(calc_out["w_final"]), {sid: current[sid].enabled for sid in ids},
-                                " | ".join(calc_out["reasons"][sid] for sid in ids), None, derive_enabled=tuple(calc_out["opt"]))
+        if kind == "computed" and covered:
+            anchored = self._day_anchor({s: current[s] for s in covered}, now_ms, persist=not dry_run, venue=v)
+            p_now = self.p_means(covered, p_new if dry_run else None)
+            calc_out = compute_weights(covered, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+            decision = Decision({**{s: current[s].weight for s in ids}, **calc_out["w_final"]}, {sid: current[sid].enabled for sid in ids},
+                                " | ".join(calc_out["reasons"][sid] for sid in covered), None, derive_enabled=tuple(calc_out["opt"]))
         plan = resolve(current, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct)
-        reasons = {sid: (self._floor_reason(v, c) if sid in plan.floored else (calc_out["reasons"][sid] if calc_out else why))
+        held = f"no decision: strategy not on the decision venue ({self.primary.label}), held"
+        reasons = {sid: (self._floor_reason(v, c) if sid in plan.floored
+                         else held if sid not in covered else (calc_out["reasons"][sid] if calc_out else why))
                    for sid, c in current.items()}
-        applied = (self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed", venue=v)
+        # a held strategy (no decision covers it) is not written at all; only the drawdown floor may still cut it
+        writable = {s: c for s, c in current.items() if s in covered or s in plan.floored}
+        applied = (self._apply(plan, writable, reasons, now_ms, refresh_reasons=kind == "computed", venue=v)
                    if not dry_run and v.managed else {})
+        applied.update({s: False for s in current if s not in writable})
         extra = {"core": {k: round(x, 6) for k, x in calc_out["core"].items()},
                  "w_target": {k: round(x, 6) for k, x in calc_out["w_target"].items()}, "steps": calc_out["steps"]} if calc_out else {}
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
@@ -1644,10 +1658,17 @@ def _jprint(obj: Any) -> None:
 async def _main(args: argparse.Namespace) -> int:
     from .config import load_dotenv
     load_dotenv()
+    from .venues import allocator_venues_of, configs_from_env
+    # the same venues the dashboard gives the allocator (CTB_LIVE_ROOTS, CTB_ALLOCATOR_VENUES); --root overrides bybit-demo's
+    venues = allocator_venues_of(configs_from_env(), args.root)
     async with aiohttp.ClientSession() as session:
-        alloc = create_allocator(session, args.root)
+        alloc = create_allocator(session, venues[0].root, venues=venues)
         if args.cmd == "reset-peak":
-            print("peaks reset:", ", ".join(alloc.reset_peak(args.ids or None)) or "none")
+            venue = next((v for v in alloc.venues if v.id == args.venue), None)
+            if venue is None:
+                print(f"unknown or unmanaged venue {args.venue!r}", file=sys.stderr)
+                return 2
+            print("peaks reset:", ", ".join(alloc.reset_peak(args.ids or None, venue=venue)) or "none")
             return 0
         if args.cmd == "score":
             _jprint(score_decisions(alloc.root, horizon_h=args.horizon_h, qset=args.qset))
@@ -1699,6 +1720,7 @@ def main(argv: list[str] | None = None) -> int:
     sc.add_argument("--qset", choices=list(SCORED_QSETS), help="score one question set only (default: both, same questions)")
     rp = sub.add_parser("reset-peak", help="restart a book's drawdown measurement from now")
     rp.add_argument("ids", nargs="*")
+    rp.add_argument("--venue", default=PRIMARY_VENUE, help="the venue whose books to reset (default bybit-demo)")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:

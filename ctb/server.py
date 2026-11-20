@@ -493,6 +493,12 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
                 return refused(exc)
             out = {"ok": False, "error": exc.message}  # OFF must still reach the other venues
         out["venues"] = await hub.auto_others(enabled, strat.mode(strat.registry()))
+        # every venue was tried; any that was not switched (and the allocator venue's own failure) is an error the page shows
+        failed = {vid: msg for vid, msg in out["venues"].items() if msg.startswith("refused")}
+        if failed or out.get("ok") is False:
+            parts = ([f"{hub.config(hub.primary_id).label}: {out['error']}"] if out.get("ok") is False else []) + \
+                    [f"{hub.config(vid).label}: {msg}" for vid, msg in failed.items()]
+            return j({**out, "ok": False, "error": f"AUTO-TRADE {'ON' if enabled else 'OFF'} did not reach every venue: " + "; ".join(parts)}, 409)
         return j(out)
 
     @routes.post("/api/venues/{vid}/hand-to-allocator")

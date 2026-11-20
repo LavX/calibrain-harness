@@ -89,7 +89,7 @@ def test_the_decision_is_applied_to_every_venue_that_lists_the_strategy(roots):
     assert {i: ctl(bybit, i)["weight"] for i in BYBIT_IDS} == {"carry": 0.5, "trend": 0.5, "xsmom": 0.5}  # step limit 0.5 from 0
     assert ctl(okx, "trend")["weight"] == 0.5 and ctl(okx, "xsmom")["weight"] == 0.5 and ctl(okx, "trend")["set_by"] == "llm"
     assert rec["venues"]["okx-demo"]["applied"] == {"trend": True, "xsmom": True, "longvol": False}
-    assert "not in the decision" in rec["venues"]["okx-demo"]["reasons"]["longvol"]  # the model is asked about Bybit's books
+    assert "no decision: strategy not on the decision venue" in rec["venues"]["okx-demo"]["reasons"]["longvol"]  # the model sees Bybit's books
     assert ctl(okx, "longvol")["weight"] == 0.0 and ctl(okx, "longvol")["enabled"] is False  # held, never switched on
 
 
@@ -335,3 +335,66 @@ def test_an_opted_out_allocator_venue_refuses_unlock_and_hand_over(roots, monkey
         assert e.value.status == 409
     assert ctl(bybit, "trend")["owner_lock"] is True
     assert h.services["okx-demo"].hand_to_allocator()["handed"] == ["trend"]  # the managed venue still can
+
+
+def test_a_strategy_only_a_secondary_venue_lists_is_held_in_the_computed_mode(roots):
+    from test_allocator_computed import FakeDecider, answers, forecast
+
+    bybit, okx = roots
+    book(okx, "longvol", weight=0.3, enabled=True)  # OKX lists longvol, Bybit does not
+    day0 = T0 - T0 % 86_400
+    t = day0 + 8 * 3600
+    f = forecast(t - 7200)
+    f["strategies"]["longvol"] = dict(f["strategies"]["trend"])  # the forecast file still has a row for it
+    put(bybit / "forecast" / "latest.json", f)
+    a = A.Allocator(bybit, FakeDecider(answers({i: 0.5 for i in BYBIT_IDS})), market, model="ordecide / test", clock=lambda: t,
+                    budget=RateBudget(50), venues=venues(bybit, okx))
+    rec = decide(a, trigger="decide_now")
+    okx_rec = rec["venues"]["okx-demo"]
+    assert "longvol" not in okx_rec["core"] and okx_rec["applied"]["longvol"] is False
+    assert ctl(okx, "longvol")["weight"] == 0.3 and "no decision: strategy not on the decision venue" in okx_rec["reasons"]["longvol"]
+
+
+def test_an_unusable_venue_strategies_json_writes_nothing_there(roots):
+    bybit, okx = roots
+    put(okx / "strategies.json", [{"id": "../live/carry", "label": "escape"}])  # an id that would leave the venue's root
+    before = {i: ctl(bybit, i) for i in BYBIT_IDS}
+    a = chat_alloc(bybit, okx)
+    assert a.strategies(a.venues[1]) == []
+    rec = decide(a)
+    assert "no usable strategies.json" in rec["venues"]["okx-demo"]["note"]
+    assert ctl(bybit, "carry")["weight"] == 0.5 and before["carry"]["weight"] == 0.0  # only the allocator's own Bybit write
+
+
+def test_the_header_switch_reports_venues_it_could_not_reach(roots, tmp_path):
+    from types import SimpleNamespace
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from ctb.server import make_app
+
+    bybit, okx = roots
+    put(okx / "strategies.json", [{"id": "trend", "unit": "bad unit; rm"}])  # unusable: its strategies cannot be paused
+
+    class Engine:
+        s = SimpleNamespace(trading_enabled=False, public_view=lambda: {})
+        db = SimpleNamespace(event=lambda *a: a, one=lambda *a: None)
+        executor = None
+
+        async def start(self): ...
+        async def stop(self): ...
+        def emit(self, *a): ...
+
+    h = hub_of(bybit, okx, tmp_path, FakeSystemd())
+    app = make_app(Engine(), hub=h)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+
+    async def go():
+        async with TestClient(TestServer(app)) as c:
+            r = await c.post("/api/strategies/auto", json={"enabled": False})
+            return r.status, await r.json()
+
+    status, body = asyncio.run(go())
+    assert status == 409 and "OKX·DEMO" in body["error"] and "unusable" in body["error"]
+    assert all(ctl(bybit, i)["enabled"] is False for i in BYBIT_IDS)  # the venues it could reach were switched off

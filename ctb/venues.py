@@ -116,6 +116,22 @@ def apply_allocator_venues(venues: list[VenueConfig], text: str | None) -> list[
     return [replace(v, controlled_by="allocator" if v.id in managed else "owner") for v in venues]
 
 
+def configs_from_env() -> list[VenueConfig]:
+    """CTB_LIVE_ROOTS with CTB_ALLOCATOR_VENUES applied: what the dashboard and the allocator CLI both use."""
+    return apply_allocator_venues(parse_live_roots(os.environ.get("CTB_LIVE_ROOTS"), S.live_root()), os.environ.get("CTB_ALLOCATOR_VENUES"))
+
+
+def allocator_venues_of(configs: list[VenueConfig], primary_root: Path | str | None = None) -> list[Any]:
+    """The venues the LLM allocator applies its decision to (ctb.allocator.AllocVenue): the allocator venue first (its root
+    holds the allocator's files; managed False when CTB_ALLOCATOR_VENUES leaves it out), then every other venue it controls.
+    A venue left out is not even computed. primary_root overrides the allocator venue's root (the CLI's --root)."""
+    from .allocator import AllocVenue  # the allocator module pulls in the model clients: imported only here
+    first = next(v for v in configs if v.id == PRIMARY)
+    root = Path(primary_root) if primary_root else first.root
+    out = [AllocVenue(first.id, root, first.label, managed=first.controlled_by == "allocator")]
+    return out + [AllocVenue(v.id, v.root, v.label) for v in configs if v.id != PRIMARY and v.controlled_by == "allocator"]
+
+
 def state_dir() -> Path:
     """The harness's own data directory (next to its database), where the venue baselines and the header set live."""
     return Path(os.environ.get("CTB_DB_PATH") or ROOT / "data" / "ctb.db").parent / "venues"
@@ -499,8 +515,7 @@ class VenueHub:
 
     @classmethod
     def from_env(cls) -> "VenueHub":
-        venues = apply_allocator_venues(parse_live_roots(os.environ.get("CTB_LIVE_ROOTS"), S.live_root()),
-                                        os.environ.get("CTB_ALLOCATOR_VENUES"))
+        venues = configs_from_env()
         sdir = state_dir()
         services: dict[str, S.StrategyService] = {}
         for v in venues:
@@ -524,10 +539,7 @@ class VenueHub:
         """The venues the LLM allocator applies its decision to (ctb.allocator.AllocVenue): the allocator venue first (its
         root holds the allocator's files; managed False when CTB_ALLOCATOR_VENUES leaves it out), then every other venue it
         controls. A venue left out is not even computed."""
-        from .allocator import AllocVenue  # the allocator module pulls in the model clients: imported only here
-        first = self.config(self.primary_id)
-        out = [AllocVenue(first.id, first.root, first.label, managed=first.controlled_by == "allocator")]
-        return out + [AllocVenue(v.id, v.root, v.label) for v in self.venues if v.id != self.primary_id and v.controlled_by == "allocator"]
+        return allocator_venues_of(self.venues, self.config(self.primary_id).root)
 
     async def auto_others(self, enabled: bool, mode: str) -> dict[str, str]:
         """The header AUTO-TRADE switch on the venues other than the allocator venue that the allocator controls. OFF (any
@@ -539,7 +551,10 @@ class VenueHub:
                 continue
             svc = self.services[cfg.id]
             reg = svc.registry()
-            if reg.error or not reg.entries:
+            if reg.error:  # its strategies cannot be read, so they cannot be paused either: a failure, said so
+                out[cfg.id] = f"refused: strategies.json is unusable ({reg.error})"
+                continue
+            if not reg.entries:
                 out[cfg.id] = "not started: nothing to switch"
                 continue
             try:
