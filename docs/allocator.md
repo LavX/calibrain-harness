@@ -211,8 +211,9 @@ weight the book already had where it was not (owner-locked, a pending kill, paus
   reads it, and the decision lines that carry their input only for the time before it existed.
 - **The full model input** stays in `decisions.jsonl` on weights runs, on polls with an error and on every
   `CTB_ALLOCATOR_FULL_INPUT_EVERY`-th routine poll (default 60); other polls mark `inputs_omitted` and keep `state_bytes`.
-- **Rotation.** When the first line of a new UTC day is appended, `decisions.jsonl` becomes `decisions-<day>.jsonl`
-  (`<day>` = the UTC day of its first line), older archives are gzipped (`decisions-<day>.jsonl.gz`, possibly several gzip
+- **Rotation.** When the first line of a new UTC day is appended, the lines of `decisions.jsonl` move to
+  `decisions-<day>.jsonl`, each to the archive of its own UTC day (the log from before rotation, spanning many days, is
+  split the same way at the first rotation, before any retention), older archives are gzipped (`decisions-<day>.jsonl.gz`, possibly several gzip
   members) and archives older than 90 days are deleted (`ctb/decision_log.py`). Read everything with
   `decision_log.iter_all(<root>/allocator)`, oldest first.
 

@@ -1,8 +1,9 @@
 """allocator/decisions.jsonl and its daily archives.
 
 The allocator appends one line per decision to decisions.jsonl. When the first line of a new UTC day is appended, the
-file is renamed to decisions-<day>.jsonl (<day> = the UTC day of its first line), the archives before it are gzipped
-(decisions-<day>.jsonl.gz) and archives older than KEEP_DAYS are deleted. The newest archive stays uncompressed so
+file's lines move to decisions-<day>.jsonl, each line to the archive of its own UTC day (a log from before rotation,
+spanning many days, is split the same way), the archives before the newest are gzipped (decisions-<day>.jsonl.gz) and
+archives older than KEEP_DAYS are deleted. The newest archive stays uncompressed so
 the feed and the predictions panel can read the hours just before midnight cheaply.
 
 Readers: tail() for the newest lines (current file, then the newest archive), iter_all() for everything kept, oldest
@@ -67,25 +68,68 @@ def _gzip(src: Path) -> None:
     src.unlink()
 
 
+def _split(d: Path, work: Path, today: str) -> None:
+    """Move the lines of `work` into the archive of their UTC day (a line without t_ms goes with the line before it). A
+    log from before rotation existed spans many days and is split the same way; a line of today goes back to the
+    current file."""
+    by_day: dict[str, list[bytes]] = {}
+    day = None
+    with open(work, "rb") as f:
+        for raw in f:
+            try:
+                t = json.loads(raw).get("t_ms")
+            except (ValueError, AttributeError):
+                t = None
+            if isinstance(t, (int, float)):
+                day = utc_day(t)
+            if day is None:  # leading lines without a time: keep them with the first dated line
+                by_day.setdefault("", []).append(raw if raw.endswith(b"\n") else raw + b"\n")
+                continue
+            by_day.setdefault(day, []).append(raw if raw.endswith(b"\n") else raw + b"\n")
+    lead = by_day.pop("", [])
+    if lead:
+        first = min(by_day) if by_day else today
+        by_day[first] = lead + by_day.get(first, [])
+    for day in sorted(by_day):
+        rows = b"".join(by_day[day])
+        if day >= today:
+            path = d / LOG
+        else:
+            gz = d / f"decisions-{day}.jsonl.gz"
+            if gz.exists():
+                with gzip.open(gz, "ab") as fout:  # a further gzip member: readers see one day
+                    fout.write(rows)
+                continue
+            path = d / f"decisions-{day}.jsonl"
+        with open(path, "ab") as fout:
+            fout.write(rows)
+            fout.flush()
+            os.fsync(fout.fileno())
+    work.unlink()
+
+
 def rotate(d: Path, now_ms: float, keep_days: int = KEEP_DAYS) -> None:
-    """Before appending a line at now_ms: archive the current file if it holds an earlier UTC day."""
+    """Before appending a line at now_ms: when the current file holds an earlier UTC day, move its lines into the archive
+    of their own day (all its days, if it is a log from before rotation), gzip every archive but the newest, then delete
+    the archives older than keep_days. Splitting comes first, so no line is deleted for the day of an older neighbour.
+    A split cut short by a crash is finished at the next rotation (its lines may then appear twice, never get lost)."""
     cur = d / LOG
-    first = _first_day(cur)
+    work = d / (LOG + ".rotating")
     today = utc_day(now_ms)
+    if work.exists():
+        _split(d, work, today)
+    first = _first_day(cur)
     if first is None or first >= today:
         return
-    target = d / f"decisions-{first}.jsonl"
-    if target.exists():  # a day split by a restart: keep both parts in order
-        with open(cur, "rb") as fin, open(target, "ab") as fout:
-            shutil.copyfileobj(fin, fout)
-        cur.unlink()
-    else:
-        os.replace(cur, target)
+    os.replace(cur, work)  # appends go to a fresh file from here on
+    _split(d, work, today)
+    days = archives(d)
     cutoff = (date.fromisoformat(today) - timedelta(days=keep_days)).isoformat()
-    for day, p in archives(d):
+    newest = max((day for day, _ in days), default=None)
+    for day, p in days:
         if day < cutoff:
             p.unlink(missing_ok=True)
-        elif p.name.endswith(".jsonl") and p != target:
+        elif p.name.endswith(".jsonl") and day != newest:
             _gzip(p)
 
 

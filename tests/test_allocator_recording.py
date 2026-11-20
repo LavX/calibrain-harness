@@ -313,3 +313,39 @@ def test_the_scorer_still_reads_old_decision_lines_once(tmp_path):
     (alloc / "state.json").write_text(json.dumps({"history": {"carry": [[t + h, 1020.0], [t + 3 * h, 990.0]]}}))
     c = A.score_decisions(tmp_path, now_ms=t + 10 * h)["strategies"]["carry"]
     assert c["n"] == 2 and c["brier"] == pytest.approx(((0.7 - 1) ** 2 + (0.4 - 0) ** 2) / 2, abs=1e-4)
+
+
+def test_the_first_rotation_splits_a_legacy_log_by_day_before_retention(tmp_path):
+    """A log from before rotation spans many days. Each line goes to its own day's archive; only days past the 90-day
+    retention are deleted, never recent ones for the date of the file's first line."""
+    import calendar
+    import datetime as dt
+
+    from ctb import decision_log as DL
+
+    def ms(m, d, h=12):
+        return calendar.timegm(dt.datetime(2026, m, d, h).timetuple()) * 1000
+
+    d = tmp_path / "allocator"
+    d.mkdir()
+    legacy = [{"t_ms": ms(7, 1), "k": "jul1"}, {"t_ms": ms(11, 18, 9), "k": "nov18a"}, {"t_ms": ms(11, 18, 23), "k": "nov18b"},
+              {"t_ms": ms(11, 19), "k": "nov19"}]
+    (d / "decisions.jsonl").write_text("".join(json.dumps(x) + "\n" for x in legacy))
+    DL.append(d, {"t_ms": ms(11, 20), "k": "nov20"}, ms(11, 20))
+    names = sorted(p.name for p in d.iterdir())
+    assert names == ["decisions-2026-11-18.jsonl.gz", "decisions-2026-11-19.jsonl", "decisions.jsonl"]  # July 1 is past 90 days
+    assert [r["k"] for r in DL.iter_all(d)] == ["nov18a", "nov18b", "nov19", "nov20"]
+    assert [r["k"] for r in DL.tail(d, 2)] == ["nov19", "nov20"]
+
+
+def test_a_split_cut_short_is_finished_at_the_next_rotation(tmp_path):
+    from ctb import decision_log as DL
+
+    d = tmp_path / "allocator"
+    d.mkdir()
+    day = 86_400_000
+    t0 = (int(T0 * 1000) // day) * day
+    (d / "decisions.jsonl.rotating").write_text(json.dumps({"t_ms": t0 + 1000, "k": "a"}) + "\n")  # a crash left it
+    (d / "decisions.jsonl").write_text(json.dumps({"t_ms": t0 + day + 1000, "k": "b"}) + "\n")
+    DL.append(d, {"t_ms": t0 + 2 * day + 1000, "k": "c"}, t0 + 2 * day + 1000)
+    assert [r["k"] for r in DL.iter_all(d)] == ["a", "b", "c"] and not (d / "decisions.jsonl.rotating").exists()
