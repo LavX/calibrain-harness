@@ -21,7 +21,8 @@ IDS = ["carry", "trend", "xsmom"]
 
 @pytest.fixture(autouse=True)
 def _no_explore_floor(monkeypatch):
-    """These tests pin the decider-only mapping itself; the demo minimum is tested in test_allocator_explore_floor.py."""
+    """These tests pin the question set, the mapping function and how the decider is asked; the demo minimum is tested in
+    test_allocator_explore_floor.py. There is no forecast file here: the weights are held, the decider is still asked."""
     monkeypatch.setenv("CTB_ALLOCATOR_EXPLORE_FLOOR", "0")
 
 
@@ -118,28 +119,20 @@ def test_constants_live_in_config():
     assert (s.allocator_p_zero, s.allocator_p_full, s.allocator_winner_min_p, s.allocator_winner_weight) == (0.5, 0.65, 0.55, 0.5)
 
 
-def test_decision_applies_rules_and_logs_everything_needed_for_scoring(root):
+def test_the_decider_is_asked_and_logged_but_never_sets_the_weights_alone(root):
+    """No forecast file: the decider-only mapping used to set the weights (carry 0.73, trend 0.5, xsmom 0.5 here). Now the
+    weights are held and the answers only go into the p history and the log."""
     llm = FakeDecider(answers(P, BEST))
     a = make(root, llm)
     rec = decide(a)
-    assert rec["error"] is None and rec["mode"] == "decider" and len(llm.calls) == 1
+    assert rec["mode"] == "decider" and rec["weights_mode"] == "held" and len(llm.calls) == 1
     assert llm.calls[0][0]["strategies"]["carry"]["weight"] == 1.0  # the same context is the decision state
-    # current weight 1.0: carry 0.73 is inside the step; trend wants 0 but is limited to 0.5; xsmom 0.5
-    assert ctl(root, "carry")["weight"] == pytest.approx(0.7333, abs=1e-3) and ctl(root, "trend")["weight"] == 0.5
-    assert ctl(root, "trend")["enabled"] is True and ctl(root, "xsmom")["weight"] == 0.5
-    assert rec["step_limited"] == ["trend"] and ctl(root, "carry")["reason"].startswith("carry p=0.61 -> 0.73")
+    assert {i: ctl(root, i)["weight"] for i in IDS} == {"carry": 1.0, "trend": 1.0, "xsmom": 1.0}
     line = json.loads((root / "allocator" / "decisions.jsonl").read_text().splitlines()[-1])
     assert line["qset"] == "alloc-v1.1" and line["model"] == "ordecide / test" and line["request_ids"] == ["req-1"]
-    assert line["answers"]["p"] == P and line["answers"]["best"]["xsmom"] == 0.5
-    assert line["mapping"]["trend"]["target"] == 0 and line["weights"]["trend"] == 0.5 and line["inputs"]["strategies"]["carry"]
+    assert line["answers"]["p"] == P and line["answers"]["best"]["xsmom"] == 0.5 and line["inputs"]["strategies"]["carry"]
+    assert "forecast missing: holding" in line["reasoning"] and a._state()["p_hist"]["carry"][-1][1] == 0.61
     assert a.status()["model"] == "ordecide / test"
-
-
-def test_target_zero_disables_once_the_step_limit_allows(root):
-    for i in IDS:
-        put(root / i / "control.json", {"enabled": True, "weight": 0.4, "owner_lock": False})
-    decide(make(root, FakeDecider(answers({"carry": 0.7, "trend": 0.45, "xsmom": 0.4}, BEST))))
-    assert ctl(root, "trend")["weight"] == 0 and ctl(root, "trend")["enabled"] is False and ctl(root, "carry")["weight"] == 0.9
 
 
 def test_floor_and_owner_lock_still_apply_after_the_mapping(root):
@@ -151,19 +144,18 @@ def test_floor_and_owner_lock_still_apply_after_the_mapping(root):
     assert (root / "trend" / "control.json").read_bytes() == before and rec["skipped_owner_lock"] == ["trend"]
 
 
-def test_missing_answers_are_retried_once_then_that_strategy_keeps_its_weight(root):
+def test_missing_answers_are_retried_once(root):
     partial = answers({"carry": 0.62, "xsmom": 0.9}, BEST)  # no answer for trend
     llm = FakeDecider(partial, partial)
     rec = decide(make(root, llm))
     assert len(llm.calls) == 2 and rec["attempts"] == 2 and rec["unanswered"] == ["net_positive_trend"]
-    assert rec["mapping"]["trend"]["held"] is True and ctl(root, "trend")["weight"] == 1.0  # untouched
-    assert ctl(root, "xsmom")["weight"] == 1.0 and ctl(root, "carry")["weight"] == pytest.approx(0.8, abs=1e-3)
+    assert rec["answers"]["p"] == {"carry": 0.62, "xsmom": 0.9} and ctl(root, "trend")["weight"] == 1.0  # untouched
 
 
 def test_questions_are_batched_to_the_model_limit(root):
     llm = FakeDecider(answers(P), answers(P, BEST), max_questions=3)
     rec = decide(make(root, llm))
-    assert [len(c[1]) for c in llm.calls] == [3, 1] and rec["request_ids"] == ["req-1", "req-2"] and rec["error"] is None
+    assert [len(c[1]) for c in llm.calls] == [3, 1] and rec["request_ids"] == ["req-1", "req-2"] and rec["attempts"] == 2
 
 
 def test_model_error_keeps_the_allocation(root):
@@ -175,7 +167,7 @@ def test_model_error_keeps_the_allocation(root):
 def test_dry_run_writes_nothing(root):
     snap = {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()}
     rec = decide(make(root, FakeDecider(answers(P, BEST))), dry_run=True)
-    assert rec["mapping"]["carry"]["target"] > 0
+    assert rec["answers"]["p"]["carry"] == 0.61
     assert {str(p): p.read_bytes() for p in root.rglob("*") if p.is_file()} == snap and not (root / "allocator").exists()
 
 

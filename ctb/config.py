@@ -133,11 +133,14 @@ class Settings:
     allocator_sharpe_cap: float = _f("CTB_ALLOCATOR_SHARPE_CAP", 1.5)      # every forecast clipped to this annual Sharpe
     allocator_decider_k: float = _f("CTB_ALLOCATOR_DECIDER_K", 0.8)        # mu_decider = (2p - 1) * k * sigma_d
     allocator_p_window: int = _i("CTB_ALLOCATOR_P_WINDOW", 24)             # p = mean of the decider's last N answers
+    allocator_p_max_age_h: float = _f("CTB_ALLOCATOR_P_MAX_AGE_H", 36.0)   # ... of those answered within this many hours
+    allocator_p_min_fresh: int = _i("CTB_ALLOCATOR_P_MIN_FRESH", 12)       # fewer fresh answers than this: no p (no veto, no decider forecast)
     allocator_vol_cap: float = _f("CTB_ALLOCATOR_VOL_CAP", 0.10)           # portfolio volatility cap, annual
     allocator_buffer: float = _f("CTB_ALLOCATOR_BUFFER", 0.10)             # a weight change under this is not made
     allocator_step_up: float = _f("CTB_ALLOCATOR_STEP_UP", 0.25)           # weight rises at most this much per day
     allocator_veto_p: float = _f("CTB_ALLOCATOR_VETO_P", 0.40)             # decider p below this caps the weight ...
     allocator_veto_factor: float = _f("CTB_ALLOCATOR_VETO_FACTOR", 0.5)    # ... at this fraction of the previous weight
+    allocator_veto_live: bool = _b("CTB_ALLOCATOR_VETO_LIVE", True)        # false: the veto only shows in the shadow (live weights ignore it)
     allocator_explore_floor: float = _f("CTB_ALLOCATOR_EXPLORE_FLOOR", 0.10)  # minimum weight so every strategy keeps trading (0 disables)
     allocator_explore_venues: list[str] = field(default_factory=lambda: [v.lower() for v in _list("CTB_ALLOCATOR_EXPLORE_VENUES", "demo,testnet")])
     allocator_stale_h: float = _f("CTB_ALLOCATOR_STALE_H", 36.0)           # a forecast older than this: hold weights, report the error

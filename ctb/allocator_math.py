@@ -15,6 +15,9 @@ weights. This module turns them, together with the decider's probabilities, into
      logged as the shadow.
   4. the rules, in order: vol cap, buffer, step, decider veto, exploration floor, then the drawdown
      floor and owner_lock, which override everything (see apply_rules)
+  5. the final check (final_vol_cap): the vol cap again, on the weights that will actually be held on a venue, every
+     book of it included (owner-locked, held, without a forecast). The buffer, the exploration floor and the locks run
+     after the first cap and can push the portfolio over it; this check only ever cuts, and only unlocked books.
 
 solve_weights, the mean-variance optimiser of the first version (w* = argmax mu'w - gamma/2 w'Sigma w - cost
 term), is kept for the comparison and no longer used for the target.
@@ -44,6 +47,7 @@ class RuleParams:
     step_up: float = 0.25           # weight may rise at most this much per day, down is unlimited
     veto_p: float = 0.40            # decider probability below this caps the weight ...
     veto_factor: float = 0.5        # ... at this fraction of the previous weight
+    veto_live: bool = True          # False: the veto changes no live weight, it is only logged as the shadow (veto_shadow)
     explore_floor: float = 0.10     # minimum weight so every strategy keeps producing fills (0 disables)
 
 
@@ -161,6 +165,28 @@ def portfolio_vol_ann(w: Sequence[float], cov: Sequence[Sequence[float]], n: int
     return math.sqrt(max(0.0, DAYS * q)) / n if n else 0.0
 
 
+def is_positive_semidefinite(matrix: Sequence[Sequence[float]]) -> bool:
+    """Test a symmetric matrix by eliminating one pivot at a time, allowing zero pivots."""
+    size = len(matrix)
+    work = [list(row) for row in matrix]
+    tolerance = max((abs(work[i][i]) for i in range(size)), default=0.0) * 1e-12
+    for i in range(size):
+        if any(abs(work[j][i] - work[i][j]) > tolerance for j in range(i + 1, size)):
+            return False
+    for i in range(size):
+        pivot = work[i][i]
+        if pivot < -tolerance:
+            return False
+        if pivot <= tolerance:
+            if any(abs(work[j][i]) > tolerance for j in range(i + 1, size)):
+                return False
+            continue
+        for j in range(i + 1, size):
+            for k in range(j, size):
+                work[k][j] -= work[k][i] * work[j][i] / pivot
+    return True
+
+
 def solve_weights(mu: Sequence[float], cov: Sequence[Sequence[float]], w_prev: Sequence[float], cost: Sequence[float], *,
                   gamma: float = 2.0, iters: int = 50_000, tol: float = 1e-13) -> list[float]:
     """argmax over 0 <= w <= 1 of  mu'w - gamma/2 w'Sigma w - sum_s cost_s |w_s - w_prev_s|.
@@ -216,14 +242,85 @@ def apply_rules(ids: Sequence[str], w_target: Mapping[str, float], w_prev: Mappi
     record("buffer", {i: (w_prev[i] if abs(w[i] - w_prev[i]) < params.buffer - 1e-12 else w[i]) for i in ids})
     # 3. step: up at most step_up per day, down without limit
     record("step", {i: min(w[i], w_prev[i] + params.step_up) for i in ids})
-    # 4. decider veto: p below the threshold caps the weight at a fraction of the previous one
-    record("veto", {i: (min(w[i], params.veto_factor * w_prev[i]) if p.get(i) is not None and p[i] < params.veto_p else w[i]) for i in ids})
+    # 4. decider veto: p below the threshold caps the weight at a fraction of the previous one. Not live: the live weights
+    # pass unchanged and the step carries what the veto would have done (shadow_after, shadow_changed)
+    vetoed = {i: (min(w[i], params.veto_factor * w_prev[i]) if p.get(i) is not None and p[i] < params.veto_p else w[i]) for i in ids}
+    if params.veto_live:
+        record("veto", vetoed, {"live": True})
+    else:
+        record("veto", dict(w), {"live": False, "shadow_after": {i: round(vetoed[i], 6) for i in ids},
+                                 "shadow_changed": [i for i in ids if abs(vetoed[i] - w[i]) > 1e-9]})
     # 5. exploration floor
     record("explore_floor", {i: (max(w[i], params.explore_floor) if params.explore_floor > 0 else w[i]) for i in ids})
     # 6. the drawdown floor and owner_lock override everything; owner_lock wins over the floor
     fl, lk = set(floored), set(locked)
     record("floor_lock", {i: (w_prev[i] if i in lk else (0.0 if i in fl else w[i])) for i in ids})
     return {i: min(1.0, max(0.0, w[i])) for i in ids}, steps
+
+
+def final_vol_cap(ids: Sequence[str], w: Mapping[str, float], cov: Sequence[Sequence[float]], locked: Sequence[str],
+                  vol_cap: float, n: int | None = None, *, min_weight: float = 0.0001) -> tuple[dict[str, float], dict[str, Any]]:
+    """The vol cap on the final holdings of one venue. `ids` is the order of `cov` and covers every book of the venue;
+    `n` is its number of books (the portfolio is their average, as in portfolio_vol_ann). Locked books are fixed.
+    Scale the others by the largest common factor that meets the cap, stopping each at its minimum weight or its
+    starting weight if already lower. If there is no such factor, use the one with the lowest volatility and report
+    infeasibility."""
+    n = n or len(ids)
+    lk = set(locked)
+    x = [max(0.0, float(w[i])) for i in ids]
+    floors = [v if i in lk else min(v, max(0.0001, min_weight)) for i, v in zip(ids, x)]
+    m = len(ids)
+
+    def quad(a: Sequence[float], b: Sequence[float]) -> float:
+        return sum(a[r] * cov[r][c] * b[c] for r in range(m) for c in range(m))
+
+    def weights_at(factor: float) -> list[float]:
+        return [max(floor, factor * initial) for floor, initial in zip(floors, x)]
+
+    before = portfolio_vol_ann(x, cov, n)
+    info: dict[str, Any] = {"vol_before": round(before, 6), "vol_after": round(before, 6), "factor": 1.0, "cut": [], "infeasible": False,
+                            "vol_cap": vol_cap}
+    if before <= vol_cap + 1e-12 or floors == x:
+        info["infeasible"] = before > vol_cap + 1e-12
+        return {i: v for i, v in zip(ids, x)}, info
+
+    # Between floor crossings, variance is quadratic in the scale factor. Search from the least cut down.
+    crossings = [floor / initial if initial else 1.0 for floor, initial in zip(floors, x)]
+    bounds = sorted({0.0, 1.0, *crossings}, reverse=True)
+    cap_variance = vol_cap ** 2 * n ** 2 / DAYS
+    best_factor, best_variance = 1.0, quad(x, x)
+    factor = None
+    for upper, lower in zip(bounds, bounds[1:]):
+        moving = [initial if crossing < upper else 0.0 for initial, crossing in zip(x, crossings)]
+        fixed = [floor if crossing >= upper else 0.0 for floor, crossing in zip(floors, crossings)]
+        a, c = quad(moving, moving), quad(fixed, fixed)
+        b = quad(moving, fixed) + quad(fixed, moving)
+        upper_variance = (a * upper + b) * upper + c
+        if upper_variance <= cap_variance:
+            factor = upper
+            break
+        candidate = min(upper, max(lower, -b / (2 * a))) if a > 0 else lower
+        variance = (a * candidate + b) * candidate + c
+        if variance < best_variance:
+            best_factor, best_variance = candidate, variance
+        if variance <= cap_variance:
+            # A feasible point and an over-cap edge bracket the largest feasible factor in this interval.
+            left, right = candidate, upper
+            for _ in range(48):
+                mid = (left + right) / 2
+                if (a * mid + b) * mid + c <= cap_variance:
+                    left = mid
+                else:
+                    right = mid
+            factor = left
+            break
+
+    info["infeasible"] = factor is None
+    factor = best_factor if factor is None else factor
+    out = weights_at(factor)
+    info.update({"vol_after": round(portfolio_vol_ann(out, cov, n), 6), "factor": round(factor, 6),
+                 "cut": [i for i, old, new in zip(ids, x, out) if new < old]})
+    return dict(zip(ids, out)), info
 
 
 # ---------------------------------------------------------------------------------- text

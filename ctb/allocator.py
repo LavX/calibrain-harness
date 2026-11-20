@@ -3,17 +3,19 @@
 Default: the harness's decision model (CTB_MODEL_PROVIDER when it is a decision spec: kairos, jev,
 ordecide, or:<id>; else ordecide) answers the alloc-v1.1 question set (ctb/kairos/allocator_questions.py):
 per strategy "is its net book return over the next 24 h positive" plus "which strategy, or none, earns
-the most". Code maps the probabilities to weights: weight = clip((p - 0.5) / 0.15, 0, 1), the
-categorical winner is lifted to 0.5 when its own p > 0.55, enabled = weight > 0. Fallback: a chat
-model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that answers one JSON allocation directly.
+the most". Code maps the probabilities to a "mapping" (weight = clip((p - 0.5) / 0.15, 0, 1), the
+categorical winner lifted to 0.5 when its own p > 0.55) that is logged; the weights themselves come from the
+computed layer below, never from the mapping. Fallback: a chat model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that
+answers one JSON allocation directly.
 
 Computed weights (ctb/allocator_math.py): when <root>/forecast/latest.json exists (written daily by the
 prediction layer) the decider is only one forecaster. It is still asked every hour, p is the mean of its
-last 24 answers, and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: core plus tilt (the
+last 24 answers from the last 36 h (none with fewer than 12 such answers: no veto then), and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: core plus tilt (the
 static inverse-volatility mix, tilted by at most +-T by each strategy's forecast Sharpe, with the tilt room kappa 0 until
 the shadow tilt has earned it, so live weights start as the core), then the vol cap,
-buffer, step, decider veto, exploration floor, the drawdown floor and owner_lock. A forecast older than 36 h holds the weights and reports the error in
-status.json. Without the file the decider-only mapping above applies and status.json says so.
+buffer, step, decider veto, exploration floor, the drawdown floor and owner_lock. A forecast that is missing, unreadable
+or older than 36 h holds the last weights ("forecast missing: holding") and reports the error in status.json and the
+feed: the decider alone never sets weights. Risk reductions (the drawdown floor) still apply while held.
 
 Each live strategy (carry, trend, xsmom, ...) has a virtual book and reads <root>/<id>/control.json
 every loop. This module is the only writer of the allocation part of those files ("enabled",
@@ -310,6 +312,7 @@ class Current:
     owner_lock: bool
     drawdown_pct: float | None
     gross: float | None = None   # gross exposure per unit of capital at weight 1 (None: unknown, 1 is used)
+    confirmed_flat: bool = False  # only an explicit empty positions list confirms a flat book
 
 
 @dataclass
@@ -386,6 +389,8 @@ class Calc:
     sharpe_cap: float = 1.5
     decider_k: float = 0.8
     p_window: int = 24
+    p_max_age_h: float = 36.0   # an answer older than this does not count in p
+    p_min_fresh: int = 12       # with fewer fresh answers p is None: the veto does not fire, the decider is no forecaster
     stale_h: float = 36.0
     weights_utc: tuple[int, int] = (23, 50)
     rules: M.RuleParams = M.RuleParams()
@@ -407,9 +412,11 @@ class Calc:
             floor = 0.0
         return Calc(gamma=s.allocator_gamma, horizon_days=s.allocator_horizon_days, cost_bp=s.allocator_cost_bp,
                     carry_cost_bp=s.allocator_carry_cost_bp, sharpe_cap=s.allocator_sharpe_cap, decider_k=s.allocator_decider_k,
-                    p_window=max(1, s.allocator_p_window), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
+                    p_window=max(1, s.allocator_p_window), p_max_age_h=s.allocator_p_max_age_h,
+                    p_min_fresh=max(1, s.allocator_p_min_fresh), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
                     rules=M.RuleParams(vol_cap=s.allocator_vol_cap, buffer=s.allocator_buffer, step_up=s.allocator_step_up,
-                                       veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, explore_floor=floor),
+                                       veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, veto_live=s.allocator_veto_live,
+                                       explore_floor=floor),
                     tilt=M.TiltParams(sr_full=s.allocator_tilt_sr_full, t_max=s.allocator_tilt_max),
                     start_weights=s.allocator_start_weights)
 
@@ -433,8 +440,8 @@ class Forecast:
 
     @property
     def error(self) -> str | None:
-        """What the status shows as an error: a forecast that exists but cannot be used. A missing file is a mode, not an error."""
-        return self.note if self.state in ("invalid", "stale") else None
+        """What the status shows as an error: a forecast that is missing or cannot be used (the weights are held)."""
+        return self.note if self.state in ("missing", "invalid", "stale") else None
 
     def info(self) -> dict[str, Any]:
         return {"state": self.state, "date": self.date, "made_ms": self.made_ms,
@@ -444,15 +451,15 @@ class Forecast:
 def read_forecast(root: Path, now_ms: int, stale_h: float) -> Forecast:
     path = root / "forecast" / "latest.json"
     if not path.exists():
-        return Forecast("missing", note="forecast/latest.json is missing: weights come from the decider alone")
+        return Forecast("missing", note="forecast missing: holding the last weights (forecast/latest.json not found; risk cuts still apply)")
     raw = read_json(path)
     made = _num(raw.get("made_ms")) if isinstance(raw, dict) else None
     if not isinstance(raw, dict) or not isinstance(raw.get("strategies"), dict) or made is None:
-        return Forecast("invalid", note="forecast/latest.json is unreadable or incomplete: weights held")
+        return Forecast("invalid", note="forecast invalid: holding the last weights (forecast/latest.json unreadable or incomplete; risk cuts still apply)")
     age = max(0.0, (now_ms - made) / 3_600_000)
     date = raw.get("date") if isinstance(raw.get("date"), str) else None
     if age > stale_h:
-        return Forecast("stale", raw, date, int(made), age, f"forecast is {age:.1f} h old (limit {stale_h:g} h): weights held")
+        return Forecast("stale", raw, date, int(made), age, f"forecast stale: holding the last weights (it is {age:.1f} h old, limit {stale_h:g} h; risk cuts still apply)")
     return Forecast("fresh", raw, date, int(made), age)
 
 
@@ -550,11 +557,24 @@ def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str,
     final, steps = M.apply_rules(opt, w_target, {sid: w_prev[sid] for sid in opt}, cov, {sid: p.get(sid) for sid in opt}, calc.rules,
                                  floored=[sid for sid in opt if current[sid].drawdown_pct is not None and current[sid].drawdown_pct > dd_floor_pct], locked=[sid for sid in opt if current[sid].owner_lock])
     reasons = {sid: f"{sid}: held at {w_prev[sid]:.2f} ({why})" for sid, why in held.items()}
+    veto_shadow: dict[str, float] = {}
+    if not calc.rules.veto_live:  # the veto lives in the shadow only: the shadow tilted book takes it, the live one does not
+        for sid in opt:
+            cap = calc.rules.veto_factor * w_prev[sid]
+            if p.get(sid) is not None and p[sid] < calc.rules.veto_p and shadow_w[sid] > cap:
+                veto_shadow[sid] = round(cap, 6)
+                shadow_w[sid] = cap
+        veto_step = next(step for step in steps if step["step"] == "veto")
+        veto_step["shadow_after"] = {sid: round(weight, 6) for sid, weight in shadow_w.items()}
+        veto_step["shadow_changed"] = list(veto_shadow)
     for sid in opt:
         binding = [st["step"] for st in steps if sid in st["changed"]]
         reasons[sid] = M.reason_line(sid, core[sid], tau[sid], sr[sid], w_target[sid], final[sid], binding, regime, tilt.kappa, shadow_tau[sid])
+        if sid in veto_shadow:
+            reasons[sid] += f" [decider veto in shadow only: would cap at {veto_shadow[sid]:.2f}]"
     return {"opt": opt, "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "core": core, "tau": tau,
             "sr": sr, "kappa": tilt.kappa, "t_eff": tilt.t_eff, "w_target": w_target, "shadow_tau": shadow_tau, "shadow_w_target": shadow_w,
+            "veto_live": calc.rules.veto_live, "veto_shadow": veto_shadow,
             "w_final": {**{sid: w_prev[sid] for sid in ids}, **final}, "steps": steps, "reasons": reasons}
 
 
@@ -815,16 +835,34 @@ class Allocator:
             hist[sid] = hist[sid][-self.calc.p_window:]
         self._dirty = True
 
-    def p_means(self, ids: list[str], extra: dict[str, float] | None = None) -> dict[str, float | None]:
-        """p per strategy: the mean of the decider's last p_window answers (`extra`: one more, not stored, for dry runs)."""
+    def p_means(self, ids: list[str], extra: dict[str, float] | None = None, now_ms: int | None = None) -> dict[str, float | None]:
+        """p per strategy: the mean of the decider's last p_window answers that are at most p_max_age_h old (`extra`: one
+        more at now, not stored, for dry runs). None when fewer than p_min_fresh such answers exist: then the veto does not
+        fire and the decider is not a forecaster for that strategy (see p_fresh for the counts)."""
+        return {sid: v for sid, (v, _) in self.p_fresh(ids, extra, now_ms).items()}
+
+    def p_fresh(self, ids: list[str], extra: dict[str, float] | None = None, now_ms: int | None = None) -> dict[str, tuple[float | None, int]]:
+        """Per strategy (p, number of fresh answers it is the mean of)."""
+        now_ms = self.now_ms() if now_ms is None else now_ms
+        oldest = now_ms - self.calc.p_max_age_h * 3_600_000
         hist = self._state()["p_hist"]
-        out: dict[str, float | None] = {}
+        out: dict[str, tuple[float | None, int]] = {}
         for sid in ids:
-            vals = [v for _, v in (hist.get(sid) or [])]
+            vals = [v for t, v in (hist.get(sid) or []) if (_num(t) or 0) >= oldest]
             if extra and sid in extra:
                 vals.append(extra[sid])
-            out[sid] = M.mean_p(vals[-self.calc.p_window:])
+            vals = vals[-self.calc.p_window:]
+            out[sid] = (M.mean_p(vals) if len(vals) >= self.calc.p_min_fresh else None, len(vals))
         return out
+
+    def _p_note(self, fresh: dict[str, tuple[float | None, int]], reasons: dict[str, str]) -> list[str]:
+        """Names the strategies whose p has too few fresh answers in their reason; returns them."""
+        few = [sid for sid, (p, n) in fresh.items() if p is None]
+        for sid in few:
+            if sid in reasons:
+                reasons[sid] += (f" [decider: {fresh[sid][1]} answers in the last {self.calc.p_max_age_h:g} h, fewer than "
+                                 f"{self.calc.p_min_fresh}: no p, the veto holds off]")
+        return few
 
     def weights_due(self, now_ms: int) -> bool:
         """True when the daily weight-setting slot (23:50 UTC) has passed since weights were last set, or never were."""
@@ -911,7 +949,7 @@ class Allocator:
             "last_error": status.get("last_error"),
         }
         return ctx, Current(enabled=enabled, weight=weight, owner_lock=lock, drawdown_pct=dd,
-                            gross=gross_per_unit(positions, eq, weight))
+                            gross=gross_per_unit(positions, eq, weight), confirmed_flat=status.get("positions") == [])
 
     async def build_context(self, now_ms: int) -> tuple[dict[str, Any], dict[str, Current], list[dict[str, Any]]]:
         rows = self.strategies()
@@ -1165,15 +1203,18 @@ class Allocator:
 
     # ---- one decision
     async def decide(self, *, dry_run: bool = False, trigger: str = "schedule") -> dict[str, Any]:
-        """One decision. With forecast/latest.json (and a decision model) the computed layer runs; without it the
-        decider-only mapping. With dry_run nothing is written: the record comes back and that is all."""
+        """One decision. With a decision model the computed layer runs; a missing, invalid or stale forecast holds the last
+        weights there (the decider is still asked, its answers still go into the p history) and never falls back to the
+        decider-only mapping. The chat fallback model has its own path. With dry_run nothing is written: the record comes
+        back and that is all."""
         fc = self.load_forecast(self.now_ms()) if self.mode == "decider" else None
-        if fc is None or fc.state == "missing":
+        if fc is None:
             return await self._decide_legacy(dry_run=dry_run, trigger=trigger)
         return await self._decide_computed(fc, dry_run=dry_run, trigger=trigger)
 
     async def _decide_legacy(self, *, dry_run: bool = False, trigger: str = "schedule") -> dict[str, Any]:
-        """Build the context, ask the model, apply the rules and write the controls (decider-only weights)."""
+        """Build the context, ask the model, apply the rules and write the controls: the chat fallback model's allocation.
+        (A decision model never comes here: its weights are computed, or held without a usable forecast.)"""
         async with self._busy:
             now_ms = self.now_ms()
             record: dict[str, Any] = {"t_ms": now_ms, "model": self.model, "trigger": trigger}
@@ -1259,12 +1300,13 @@ class Allocator:
             if not current:
                 current = self._read_current(now_ms)
             ids = list(current)
-            extra.pop("mapping", None)  # the decider-only mapping is not used here
+            extra.pop("mapping", None)  # the decider-only mapping never sets weights
             record.update(extra)
             p_new = (extra.get("answers") or {}).get("p") or {}
             if p_new and not dry_run:
                 self._push_p(p_new, now_ms)
-            p_now = self.p_means(ids, p_new if dry_run else None)
+            fresh = self.p_fresh(ids, p_new if dry_run else None, now_ms)
+            p_now = {sid: v for sid, (v, _) in fresh.items()}
             weights_run = trigger != "schedule" or self.weights_due(now_ms)
             calc_out: dict[str, Any] | None = None
             decision: Decision | None = None
@@ -1278,9 +1320,12 @@ class Allocator:
                 kind = "computed"
                 anchored = self._day_anchor(current, now_ms, persist=not dry_run)
                 calc_out = compute_weights(ids, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+                record["p_too_few"] = self._p_note(fresh, calc_out["reasons"])
                 why = " | ".join(calc_out["reasons"][sid] for sid in ids)
                 decision = Decision(dict(calc_out["w_final"]), {sid: current[sid].enabled for sid in ids}, why, None,
                                     derive_enabled=tuple(calc_out["opt"]))
+            if fc.state == "fresh" and not dry_run:
+                self._remember_risk(fc)
             plan = resolve(current, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct) if current else None
             reasons: dict[str, str] = {}
             if plan:
@@ -1289,12 +1334,16 @@ class Allocator:
                         reasons[sid] = f"risk floor: book {current[sid].drawdown_pct:.1f}% below its peak, weight forced to 0"
                     else:
                         reasons[sid] = calc_out["reasons"][sid] if calc_out else why
+            final_cap = self._final_cap(self.primary, plan, current, reasons, fc) if plan and self.primary.managed and kind != "refresh" else None
+            if final_cap:
+                record["final_cap"] = final_cap
             applied: dict[str, bool] = {}
             failed: dict[str, str] = {}
             if plan and not dry_run and self.primary.managed:
                 applied = self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed", errors=failed)
             venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, None,
-                                                          {"write_failed": failed} if failed else None)}
+                                                          {**({"write_failed": failed} if failed else {}),
+                                                           **({"final_cap": final_cap} if final_cap else {})})}
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1306,7 +1355,7 @@ class Allocator:
                 "skipped_paused": [x for x in self._paused_skips if x in applied],
                 "risk_floor": plan.floored if plan else [],
                 "step_limited": next((st["changed"] for st in (calc_out or {}).get("steps", []) if st["step"] == "step"), []),
-                "p_decider": p_now,
+                "p_decider": p_now, "p_fresh_n": {sid: n for sid, (_, n) in fresh.items()},
                 "error": error or fc.error, "dry_run": dry_run,
             })
             if calc_out:
@@ -1319,6 +1368,7 @@ class Allocator:
                     "shadow_w_target": {k: round(v, 6) for k, v in calc_out["shadow_w_target"].items()},
                     "w_target": {k: round(v, 6) for k, v in calc_out["w_target"].items()},
                     "w_final": plan.weights if plan else {}, "steps": calc_out["steps"], "reasons": reasons, "clipped": calc_out["clipped"],
+                    "veto_live": calc_out.get("veto_live", True), "veto_shadow": calc_out.get("veto_shadow", {}),
                     "no_forecast": calc_out["held"],
                 })
             for v in self.venues[1:]:  # the same forecasts and decider p, each venue's own books, anchor and rules
@@ -1326,13 +1376,135 @@ class Allocator:
             record["venues"] = venues
             # only a weights run rewrites every book: an hourly refresh or a held run leaves earlier failures standing
             not_applied = self._write_failures(venues, now_ms, dry_run, replace=kind == "computed")
-            record["error"] = _join_errors(record["error"], not_applied)
+            # Refreshes do not check the cap, so only a weights run can clear its last error.
+            infeasible = self._cap_infeasible(venues) if kind != "refresh" else self._state().get("cap_error")
+            record["error"] = _join_errors(record["error"], infeasible, not_applied)
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
-                self.last_error = _join_errors(error, not_applied)  # the forecast's error is said by write_status, as before
+                if kind != "refresh":
+                    self._state()["cap_error"] = infeasible
+                self.last_error = _join_errors(error, not_applied)  # forecast and persistent cap errors are added by write_status
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
+
+    # ---- the final vol cap (allocator_math.final_vol_cap) on what a venue will actually hold
+    def _remember_risk(self, fc: Forecast) -> None:
+        """Keep each strategy's last known sigma_d and the last covariance matrix, so a sleeve that drops out of the forecast,
+        or a forecast that goes missing, still has a volatility for the final vol cap."""
+        rm = self._state().setdefault("risk_model", {})
+        sig = rm.setdefault("sigma_d", {})
+        data = fc.data or {}
+        for sid, f in (data.get("strategies") or {}).items():
+            v = _num(f.get("sigma_d")) if isinstance(f, dict) else None
+            if v is not None and v > 0:
+                sig[sid] = [v, fc.made_ms]
+        cov = data.get("cov_d") if isinstance(data.get("cov_d"), dict) else {}
+        ids, matrix = cov.get("ids"), cov.get("matrix")
+        if isinstance(ids, list) and isinstance(matrix, list) and len(matrix) == len(ids) and all(isinstance(r, list) and len(r) == len(ids) for r in matrix):
+            previous = rm.get("cov") if isinstance(rm.get("cov"), dict) else {}
+            old_ids = previous.get("ids") if isinstance(previous.get("ids"), list) else []
+            old_matrix = previous.get("matrix") if isinstance(previous.get("matrix"), list) else []
+            all_ids = list(dict.fromkeys(sid for sid in [*ids, *old_ids] if isinstance(sid, str)))
+
+            def last_cov(a: str, b: str) -> float | None:
+                for cids, mat in ((ids, matrix), (old_ids, old_matrix)):
+                    if a in cids and b in cids:
+                        try:
+                            v = _num(mat[cids.index(a)][cids.index(b)])
+                        except (IndexError, TypeError):
+                            v = None
+                        if v is not None:
+                            return v
+                return None
+
+            rm["cov"] = {"ids": all_ids, "matrix": [[last_cov(a, b) for b in all_ids] for a in all_ids],
+                         "made_ms": fc.made_ms}
+        self._dirty = True
+
+    def _risk_cov(self, ids: list[str], fc: Forecast | None) -> tuple[list[list[float]] | None, dict[str, str]]:
+        """The covariance of the given books for the final vol cap: the forecast in use when it has them, else the last known
+        sigma and covariance (state.json risk_model). A pair with no known covariance counts as independent, like
+        compute_weights. A book with no known sigma at all gets the largest known one (said in the notes). None when no
+        sigma is known for any strategy."""
+        rm = self._state().get("risk_model") if isinstance(self._state().get("risk_model"), dict) else {}
+        data = (fc.data if fc is not None and fc.state == "fresh" else None) or {}
+        fstrat = data.get("strategies") if isinstance(data.get("strategies"), dict) else {}
+        stored = rm.get("sigma_d") if isinstance(rm.get("sigma_d"), dict) else {}
+        notes: dict[str, str] = {}
+        sigma: dict[str, float | None] = {}
+        for sid in dict.fromkeys([*ids, *fstrat, *stored]):
+            f = fstrat.get(sid)
+            v = _num(f.get("sigma_d")) if isinstance(f, dict) else None
+            if v is None or v <= 0:
+                old = stored.get(sid)
+                v = _num(old[0]) if isinstance(old, list) and old else None
+                if v is not None and v > 0 and sid in ids:
+                    notes[sid] = "last known volatility"
+            sigma[sid] = v if v is not None and v > 0 else None
+        known = [v for v in sigma.values() if v is not None]
+        if not known:
+            return None, {}
+        for sid in ids:
+            if sigma[sid] is None:
+                sigma[sid], notes[sid] = max(known), "volatility unknown, the largest known one assumed"
+        mats = []
+        for src in (data.get("cov_d"), rm.get("cov")):
+            if isinstance(src, dict) and isinstance(src.get("ids"), list) and isinstance(src.get("matrix"), list):
+                mats.append((src["ids"], src["matrix"]))
+
+        def cov_ij(a: str, b: str) -> float:
+            if a == b:
+                return sigma[a] ** 2
+            for cids, matrix in mats:
+                if a in cids and b in cids:
+                    try:
+                        v = _num(matrix[cids.index(a)][cids.index(b)])
+                    except (IndexError, TypeError):
+                        v = None
+                    if v is not None:
+                        return v
+            return 0.0
+
+        cov = [[cov_ij(a, b) for b in ids] for a in ids]
+        if not M.is_positive_semidefinite(cov):
+            # Mixing forecasts can create an impossible covariance matrix. Use the upper risk bound for long weights.
+            note = "inconsistent covariance estimates, perfect positive correlation assumed"
+            for sid in ids:
+                notes[sid] = f"{notes[sid]}, {note}" if sid in notes else note
+            cov = [[sigma[a] * sigma[b] for b in ids] for a in ids]
+        return cov, notes
+
+    def _final_cap(self, v: AllocVenue, plan: Plan, current: dict[str, Current], reasons: dict[str, str],
+                   fc: Forecast | None) -> dict[str, Any]:
+        """Cap the managed venue's modeled volatility by scaling down unlocked trading books, keeping them enabled."""
+        ids = list(current)
+        cov, notes = self._risk_cov(ids, fc)
+        if cov is None:
+            return {"checked": False, "note": "no volatility known for any book: the final vol cap was not checked"}
+        locked = [s for s in ids if current[s].owner_lock or s in plan.skipped_owner_lock]
+        disabled = [s for s in ids if not plan.enabled[s]]
+        w = dict(plan.weights)
+        for sid in disabled:
+            c = current[sid]
+            # Disabling stops orders but can leave positions open at the previous exposure.
+            w[sid] = 0.0 if c.confirmed_flat else c.weight
+        min_weight = math.ceil(self.calc.rules.explore_floor * 1e4) / 1e4
+        new, info = M.final_vol_cap(ids, w, cov, locked + disabled, self.calc.rules.vol_cap, len(ids), min_weight=min_weight)
+        for sid in info["cut"]:
+            plan.weights[sid] = math.floor(new[sid] * 1e4 + 1e-6) / 1e4  # round down to control.json precision
+            reasons[sid] = (f"{reasons.get(sid, '')} -> {plan.weights[sid]:.2f} after the final vol cap ({v.label} at "
+                            f"{info['vol_before'] * 100:.1f}% > {info['vol_cap'] * 100:.0f}%)").strip()
+        info.update({"checked": True, "notes": notes, "locked": locked})
+        if info["infeasible"]:
+            info["note"] = (f"cap infeasible on {v.label}: modeled volatility is {info['vol_after'] * 100:.1f}% "
+                            f"at the lowest-risk permitted weights (cap {info['vol_cap'] * 100:.0f}%)")
+        return info
+
+    @staticmethod
+    def _cap_infeasible(venues: dict[str, dict[str, Any]]) -> str | None:
+        notes = [vr["final_cap"]["note"] for vr in venues.values() if isinstance(vr.get("final_cap"), dict) and vr["final_cap"].get("infeasible")]
+        return "; ".join(notes) or None
 
     def _other_venue(self, v: AllocVenue, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         """One other venue's part of a decision. Anything that goes wrong there (beyond a single write, which _apply keeps
@@ -1428,8 +1600,10 @@ class Allocator:
         decision: Decision | None = None
         if kind == "computed" and covered:
             anchored = self._day_anchor({s: current[s] for s in covered}, now_ms, persist=not dry_run, venue=v)
-            p_now = self.p_means(covered, p_new if dry_run else None)
+            fresh = self.p_fresh(covered, p_new if dry_run else None, now_ms)
+            p_now = {sid: v for sid, (v, _) in fresh.items()}
             calc_out = compute_weights(covered, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+            self._p_note(fresh, calc_out["reasons"])
             decision = Decision({**{s: current[s].weight for s in ids}, **calc_out["w_final"]}, {sid: current[sid].enabled for sid in ids},
                                 " | ".join(calc_out["reasons"][sid] for sid in covered), None, derive_enabled=tuple(calc_out["opt"]))
         plan = resolve(current, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct)
@@ -1437,8 +1611,10 @@ class Allocator:
         reasons = {sid: (self._floor_reason(v, c) if sid in plan.floored
                          else held if sid not in covered else (calc_out["reasons"][sid] if calc_out else why))
                    for sid, c in current.items()}
-        # a held strategy (no decision covers it) is not written at all; only the drawdown floor may still cut it
-        writable = {s: c for s, c in current.items() if s in covered or s in plan.floored}
+        final_cap = self._final_cap(v, plan, current, reasons, fc) if v.managed and kind != "refresh" else None
+        cap_cut = set(final_cap.get("cut") or []) if final_cap else set()
+        # a held strategy (no decision covers it) is not written at all; only the drawdown floor and the final vol cap may cut it
+        writable = {s: c for s, c in current.items() if s in covered or s in plan.floored or s in cap_cut}
         failed: dict[str, str] = {}
         applied = (self._apply(plan, writable, reasons, now_ms, refresh_reasons=kind == "computed", venue=v, errors=failed)
                    if not dry_run and v.managed else {})
@@ -1447,6 +1623,8 @@ class Allocator:
                  "w_target": {k: round(x, 6) for k, x in calc_out["w_target"].items()}, "steps": calc_out["steps"]} if calc_out else {}
         if failed:
             extra["write_failed"] = failed
+        if final_cap:
+            extra["final_cap"] = final_cap
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:
@@ -1539,12 +1717,12 @@ class Allocator:
         nxt = None if paused or not last else int(last) + ctl["interval_min"] * 60_000
         last_dec = (self.decisions(1) or [{}])[0]
         fc = self.load_forecast(now_ms) if self.mode == "decider" else None
-        err = self.last_error or (fc.error if fc else None)  # an unusable forecast is an error; a missing one is a mode
+        err = _join_errors(self.last_error, self._state().get("cap_error")) or (fc.error if fc else None)
         floor = [f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in self.floor_errors.values()]
         if floor:  # the drawdown floor could not cut a book: said even while paused
             err = "; ".join(([err] if err else []) + [f"drawdown floor could not write control.json ({'; '.join(floor)})"])
-        weights_mode = {None: "chat", "missing": "decider-only", "fresh": "computed"}.get(fc.state if fc else None, "held")
-        nxt_w = None if fc is None or fc.state == "missing" or paused else latest_weights_slot_ms(now_ms, *self.calc.weights_utc) + DAY_MS
+        weights_mode = {None: "chat", "fresh": "computed"}.get(fc.state if fc else None, "held")
+        nxt_w = None if fc is None or paused else latest_weights_slot_ms(now_ms, *self.calc.weights_utc) + DAY_MS
         write_json_atomic(self.dir / "status.json", {
             "state": "paused" if paused else ("error" if err else "running"),
             "model": self.model, "last_decision_ms": last, "next_decision_ms": nxt,
@@ -1740,6 +1918,10 @@ def format_table(rec: dict[str, Any]) -> str:
                      *[("-" if key not in steps or i not in steps[key]["after"] else f"{steps[key]['after'][i]:.2f}") for key, _ in RULE_COLUMNS],
                      f"{rec['w_final'][i]:.2f}"])
     out += _grid(rows)
+    fcap = rec.get("final_cap") or {}
+    if fcap.get("checked"):
+        out += ["", f"final vol cap: {fcap['vol_before'] * 100:.1f}% -> {fcap['vol_after'] * 100:.1f}% (cap {fcap['vol_cap'] * 100:.0f}%)"
+                    + (f", cut {', '.join(fcap['cut'])}" if fcap.get("cut") else "") + (" INFEASIBLE" if fcap.get("infeasible") else "")]
     out += ["", "reasons:", *[f"  {rec['reasons'][i]}" for i in ids if i in (rec.get("reasons") or {})]]
     return "\n".join(out)
 
@@ -1784,8 +1966,6 @@ async def _main(args: argparse.Namespace) -> int:
                 print(format_table(rec))
                 print(f"decider: {rec.get('cost_usd', 0)} usd, error: {rec.get('error')}")
             elif args.dry_run:
-                if rec.get("mode") == "decider":
-                    print("== forecast/latest.json is missing: decider-only mapping ==")
                 print(f"== CONTEXT given to the model ({rec.get('qset')}, {(rec.get('state_bytes') or {}).get('total')} bytes) ==")
                 _jprint(rec.get("inputs"))
                 print("state bytes per block:", json.dumps(rec.get("state_bytes")))

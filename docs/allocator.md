@@ -4,13 +4,15 @@
 deployed, and when. It places no orders: it only writes the allocation fields of each strategy's
 `control.json`, which the live runner reads every loop.
 
-There are two ways it sets weights:
+How it sets weights:
 
-- **Computed** (when `forecast/latest.json` exists): weights come from the prediction layer's
+- **Computed** (a fresh `forecast/latest.json`): weights come from the prediction layer's
   forecasts by a static core (inverse-volatility mix) that the forecasts may tilt once the tilt has earned
   it (it starts in shadow, so live weights start as the core), plus fixed rules, see "Computed weights" below. The decision model is one forecaster among several and still has a veto.
-- **Decider only** (no forecast file): the decision model's probabilities map straight to weights,
-  see "Model and question set". `status.json` says `weights_mode: "decider-only"`.
+- **Held** (the forecast file is missing, unreadable or stale): the last weights stay, `status.json` says
+  `weights_mode: "held"` and `last_error` "forecast missing: holding" (or invalid, stale). The decision model is still asked
+  every hour and its answers still go into the p history, but it never sets weights alone: the decider-only mapping of
+  "Model and question set" is only logged. Risk reductions (the drawdown floor) still apply.
 
 Layout under the live root (`CTB_LIVE_ROOT`, default `data/live`; on aurora4
 `/home/lavx/Documents/calibrain-study/data/live`):
@@ -44,7 +46,7 @@ Things to know before handing a venue over:
   30 s, also while the allocator is paused) can cut a book more than 15% below its peak at once.
 - HAND TO ALLOCATOR keeps the current enabled and weight; the next weights run (DECIDE NOW, or 23:50 UTC) sets them. The
   day anchor is the weight at that day's first weights run, so a cut lands at once and an increase is capped at +0.25 per
-  day from the anchor (computed mode; the decider-only fallback steps at most 0.5 per decision).
+  day from the anchor.
 - The vol cap of every venue is computed from bybit-demo's forecast (sigma and covariance of Bybit's return series) over
   that venue's strategies. For another exchange it is an approximation: its fills, symbols and margin currency differ.
 - The drawdown floor keeps running while the allocator is paused (AUTO-TRADE OFF, MANUAL, PER-SYMBOL BOT, a bybit-demo
@@ -89,13 +91,17 @@ Schedule:
 - Weights are set once a day at 23:50 UTC (`CTB_ALLOCATOR_WEIGHTS_UTC`), on the first run when none were
   ever set, and on DECIDE NOW or `once`. The decider is asked first, so its newest answer is in p. If the
   decider or market data fail, the stored p history is used and the weights are still set.
-- A forecast older than 36 h (`CTB_ALLOCATOR_STALE_H`), or an unreadable file: weights are held, the hourly
-  refresh continues, and the reason is in `status.json` `last_error` and `forecast`. The drawdown floor and
-  `owner_lock` keep working. A missing file is not an error: decider-only mode, noted in `forecast.note`.
+- A forecast older than 36 h (`CTB_ALLOCATOR_STALE_H`), an unreadable file or a missing one: weights are held, the hourly
+  refresh continues, and the reason ("forecast missing: holding", "forecast invalid: holding", "forecast stale: holding")
+  is in `status.json` `last_error` and `forecast`, and in the decision line. The drawdown floor and `owner_lock` keep
+  working. The decider-only mapping is never used for weights.
 
 Per strategy, a weights run does:
 
-1. `p` = mean of the decider's last 24 answers; `mu_decider = (2p - 1) * 0.8 * sigma_d`.
+1. `p` = mean of the decider's last 24 answers that are at most 36 h old (`CTB_ALLOCATOR_P_MAX_AGE_H`);
+   `mu_decider = (2p - 1) * 0.8 * sigma_d`. With fewer than 12 such answers (`CTB_ALLOCATOR_P_MIN_FRESH`) there is no
+   p: the veto does not fire and the decider is not a forecaster for that strategy. The decision line lists them in
+   `p_too_few` (and `p_fresh_n` per strategy), and the card's reason says so.
 2. Clip every forecast to annual Sharpe +-1.5: `|mu| <= 1.5 sigma_d / sqrt(365)`.
 3. `mu = sum_k W_k mu_k`, `W` from `weights_k` (the decider's weight too). If the file has no row for a
    strategy, or no `decider` key, the ledger's starting weights fill in (base 0.30, regime 0.25, ridge 0.20,
@@ -120,11 +126,28 @@ Per strategy, a weights run does:
 5. The rules, in this order (each is logged with before and after):
    `vol_cap` (scale all so `sqrt(365 w'Sigma w) / N <= 10%/yr`, N the number of strategies), `buffer`
    (a change under 0.10 is not made), `step` (up at most 0.25 per run, down unlimited), `veto` (p below 0.40
-   caps w at half of `w_prev`), `explore_floor` (w at least 0.10, only on the venues in
+   caps w at half of `w_prev`; with `CTB_ALLOCATOR_VETO_LIVE=false` the live weights pass unchanged and the veto only caps
+   the shadow tilted book: the step logs `shadow_after` and `shadow_changed`, the decision line `veto_shadow` and
+   `veto_live`, the card's reason "decider veto in shadow only". The default `true` keeps it live), `explore_floor` (w at least 0.10, only on the venues in
    `CTB_ALLOCATOR_EXPLORE_VENUES`, default demo and testnet; 0 disables), then `floor_lock`: the 15%
    drawdown floor (weight 0, flatten) and `owner_lock` (weight untouched) override everything, the lock
    wins over the floor.
 6. A strategy with no forecast (or no sigma) is held at its weight and listed in `no_forecast`.
+7. The final vol cap runs on managed venues after every rule above, including the drawdown floor
+   and the owner locks, the venue's portfolio (`sqrt(365 w'Sigma w) / N`, N its number of books) is checked again with
+   every book counted: owner-locked, held, and strategies without a forecast. The buffer, the exploration floor and the
+   locks run after the first cap and could push the portfolio over it (one 20%-vol sleeve: the cap gives 0.50, the
+   buffer keeps 0.55, 11%). Enabled, unlocked books are scaled down together, stopping at the exploration floor or a
+   minimum weight of 0.0001 on venues without a floor. A book already below that limit keeps its weight. Disabled
+   books are held fixed and contribute zero when the runner reports an empty position list. Locked books keep their
+   controls. A sleeve with no sigma in today's forecast counts at its last known one (`state.json`
+   `risk_model`, kept from every fresh forecast). A sleeve without any volatility history uses the largest known sigma.
+   Cached covariance pairs remain available when a forecast omits a sleeve. If the combined estimates form an invalid
+   covariance matrix, the cap assumes perfect positive correlation. If the cap cannot be
+   met, the cap uses the lowest-risk permitted weights, keeps trading books enabled, and reports "cap infeasible" in
+   the decision line and `status.json` `last_error`. The check runs on every weights run, also a held one (forecast
+   missing or stale: it uses the last known volatilities), and its result is `final_cap` in the decision line (per venue
+   under `venues`).
 
 ### Tilt room by skill
 
@@ -157,7 +180,7 @@ regime in the line is today's state from `regime/latest.json` and its 7-day prob
 
 `python -m ctb.allocator once --dry-run` asks the decider (its answer counts toward p but is not stored),
 prints the full table (mu per forecaster in %/yr, p, sigma, previous weight, core, SR, live tilt, shadow tilt, target, the weight
-after each rule, final, the reasons) and writes nothing. Without a forecast file it prints the decider-only output as before.
+after each rule, final, the reasons) and writes nothing. Without a usable forecast file it prints the held table.
 The chat fallback (`CTB_ALLOCATOR_MODEL=llm`) never uses the forecast.
 
 ## Model and question set
@@ -242,7 +265,7 @@ perps and can be set with `CTB_ALLOCATOR_TREND_SYMBOLS` (comma separated).
 
 ## CLI
 
-    python -m ctb.allocator once --dry-run   # computed: the state with its sizes, then the full weight table; decider-only: context and answer; writes nothing
+    python -m ctb.allocator once --dry-run   # the state with its sizes, then the full weight table (or the held one); writes nothing
     python -m ctb.allocator once             # one decision, applied
     python -m ctb.allocator run              # loop until stopped
     python -m ctb.allocator score            # score logged answers against realised book returns (--qset alloc-v1.1 for one set)
