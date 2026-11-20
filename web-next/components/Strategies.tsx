@@ -3,12 +3,13 @@
 // does the trading; this screen reads the files it writes and writes only control.json files, plus start/stop of the
 // runner unit, through /api/venues/{vid}/... The allocator venue's document is the store's `strat` (polled every 10 s by the
 // terminal, the header reads it too); another venue's is polled here while it is selected.
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { post } from "@/lib/api";
 import { loadOverview, loadPredictions, loadStrat, loadVenues, loadVenueStrat } from "@/lib/data";
 import { PredictionsPanel, ScoreboardPanel } from "@/components/Predictions";
-import { useStore } from "@/lib/store";
-import { age, ago, dt, fx, isNum, NA, pf, sg, ud } from "@/lib/format";
+import { setState, useStore } from "@/lib/store";
+import { age, ago, dt, fx, isNum, money, NA, pf, sg, smoney, ud } from "@/lib/format";
+import { PRESENCE, type VenuesDoc } from "./Venues";
 
 type Pos = { symbol: string; side: string; market: string; qty: number | null; entry_price: number | null; mark_price: number | null; upnl_usdt: number | null };
 type Status = {
@@ -349,9 +350,37 @@ function RunnerBar({ doc }: { doc: StratDoc }) {
   );
 }
 
+/** Which venue F7 shows. */
+function VenueTabs({ venues, sel }: { venues: VenuesDoc | null; sel: string }) {
+  if (!venues || venues.venues.length < 2) return null;
+  return (
+    <span className="seg venue-tabs" data-tip="Pick the venue: cards, runner and controls below act on that venue only">
+      {venues.venues.map((v) => (
+        <button key={v.id} className={v.id === sel ? "on" : ""} onClick={() => setState({ stratVenue: v.id })}
+          data-tip={v.presence_text || undefined}>{v.label}{v.presence !== "live" ? ` · ${(PRESENCE[v.presence]?.[0] || v.presence).toLowerCase()}` : ""}</button>
+      ))}
+    </span>
+  );
+}
+
 export function StrategiesView() {
-  const doc = useStore((s) => s.strat) as StratDoc | null;
-  if (!doc) return <main className="view on"><div className="empty">Loading</div></main>;
+  const venues = useStore((s) => s.venues) as VenuesDoc | null;
+  const primary = venues?.primary || "bybit-demo";
+  const sel = useStore((s) => s.stratVenue) || primary;
+  const own = useStore((s) => s.strat) as StratDoc | null;
+  const other = useStore((s) => s.venueStrat[sel]) as StratDoc | undefined;
+  const [err, setErr] = useState<string | null>(null);
+  const isPrimary = sel === primary;
+  useEffect(() => {
+    if (isPrimary) return;
+    const load = () => loadVenueStrat(sel).then(() => setErr(null), (e) => setErr(e.message));
+    load();
+    const id = setInterval(() => { if (!document.hidden) load(); }, 10_000);
+    return () => clearInterval(id);
+  }, [sel, isPrimary]);
+  const doc = isPrimary ? own : other;
+  const v = venues?.venues.find((x) => x.id === sel);
+  if (!doc) return <main className="view on"><div className="toolbar"><span className="code">STRATEGIES</span><VenueTabs venues={venues} sel={sel} /></div><div className="empty">{err || "Loading"}</div></main>;
   const set = manualSet(doc);
   const toggleSet = async (id: string) => {
     const next = set.includes(id) ? set.filter((i) => i !== id) : [...set, id];
@@ -361,16 +390,21 @@ export function StrategiesView() {
   return (
     <main className="view on">
       <div className="toolbar">
-        <span className="code">STRATEGIES</span><b>{doc.venue_label}</b>
-        <span className="muted">mode <b className="w">{MODE_LABEL[doc.mode]}</b> · AUTO-TRADE <b className="w">{doc.auto_on ? "ON" : "OFF"}</b> · orders go to {doc.venue_label} only</span>
-        <button className="kbtn" onClick={() => reloadAll()}>REFRESH</button>
+        <span className="code">STRATEGIES</span><VenueTabs venues={venues} sel={sel} /><b>{doc.venue_label}</b>
+        {doc.allocator_venue
+          ? <span className="muted">mode <b className="w">{MODE_LABEL[doc.mode]}</b> · AUTO-TRADE <b className="w">{doc.auto_on ? "ON" : "OFF"}</b> · orders go to {doc.venue_label} only</span>
+          : <span className="muted">controlled by the owner (no allocator) · orders go to {doc.venue_label} only · settles in {doc.ccy}</span>}
+        {v && v.presence !== "live" && <span className={`vbadge ${PRESENCE[v.presence]?.[1] || "bad"}`} data-tip={v.presence_text || undefined}>{PRESENCE[v.presence]?.[0] || v.presence}</span>}
+        <button className="kbtn" onClick={() => reloadAll(isPrimary ? undefined : sel)}>REFRESH</button>
       </div>
-      <div className="muted strat-help">{MODE_HELP[doc.mode]} Change the mode in the header.</div>
+      {doc.allocator_venue && <div className="muted strat-help">{MODE_HELP[doc.mode]} Change the mode in the header.</div>}
+      {v?.presence === "absent" && <div className="alert"><b>NOT STARTED</b> {v.presence_text}. The runner ({v.unit || "its unit"}) writes strategies.json when it first starts.</div>}
       {doc.error && <div className="alert crit"><b>CONFIG</b> {doc.error}</div>}
       <RunnerBar doc={doc} />
-      {(doc.allocator.available || doc.mode === "llm") && <AllocatorPanel doc={doc} />}
-      <PredictionsPanel />
-      <ScoreboardPanel />
+      {doc.allocator_venue && (doc.allocator.available || doc.mode === "llm") && <AllocatorPanel doc={doc} />}
+      {doc.allocator_venue && <PredictionsPanel />}
+      {doc.allocator_venue && <ScoreboardPanel />}
+      {v && v.account && <div className="muted strat-help">{doc.venue_label} account: USDT equity {money(v.account.equity, v.account.ccy)} · unrealised {smoney(v.account.unrealised, v.account.ccy)}</div>}
       <div className="strat-grid">
         {doc.strategies.map((s) => (
           <Card key={s.id} s={s} doc={doc} inSet={set.includes(s.id)} toggleSet={() => toggleSet(s.id)} />
