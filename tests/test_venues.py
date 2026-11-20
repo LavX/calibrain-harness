@@ -367,6 +367,25 @@ def test_a_pending_kill_is_not_cancelled_by_enable_unless_the_owner_says_so(root
     assert c["enabled"] is True and c["flatten"] is False and c["owner_lock"] is True
 
 
+def test_an_enable_racing_a_kill_does_not_switch_on_over_it(roots, tmp_path):
+    """The enable awaits systemctl (start the runner); a KILL written during that await must win."""
+    okx = roots[1]
+
+    class KillDuringStart(FakeSystemd):
+        async def __call__(self, argv, **kw):
+            if argv[2] == "start":  # the event loop yields here in real life; the kill lands meanwhile
+                c = json.loads((okx / "trend" / "control.json").read_text())
+                (okx / "trend" / "control.json").write_text(json.dumps({**c, "enabled": False, "owner_lock": True, "flatten": True}))
+            return await super().__call__(argv, **kw)
+
+    h = hub(roots, KillDuringStart(), tmp_path)  # the OKX unit is down, so enable starts it
+    with pytest.raises(st.StrategyError) as e:
+        run(h.service("okx-demo").act("trend", "enable", llm_trading=False, venue="demo"))
+    assert e.value.status == 409 and "kill is pending" in e.value.message
+    c = ctl(okx, "trend")
+    assert c["flatten"] is True and c["enabled"] is False
+
+
 def test_manual_header_switch_does_not_cancel_a_pending_kill(roots, tmp_path):
     sd = FakeSystemd(active=BYBIT_UNITS)
     h = hub(roots, sd, tmp_path)
@@ -409,7 +428,7 @@ def test_the_allocator_never_switches_on_a_strategy_with_a_pending_kill(roots):
     p.write_text(json.dumps({"enabled": False, "flatten": True, "owner_lock": False, "weight": 0.6}))
     before = p.read_bytes()
     assert a._write_control("carry", True, 0.8, "the LLM wants it on", False, int(NOW * 1000)) is False
-    assert p.read_bytes() == before
+    assert p.read_bytes() == before and a._kill_skips == ["carry"]  # the decision feed shows it next to owner-lock skips
     assert a._write_control("carry", False, 0.0, "off", False, int(NOW * 1000)) is True  # switching off is fine
 
 

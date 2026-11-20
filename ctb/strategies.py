@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .config import ROOT
+from .control_lock import locked
 
 DEFAULT_ROOT = ROOT / "data" / "live"  # the same default as ctb.allocator; on aurora4 CTB_LIVE_ROOT points at the runner's root
 UNIT_RE = re.compile(r"^[A-Za-z0-9_.:-]+(@[A-Za-z0-9_.:-]+)?\.service$")
@@ -287,7 +288,8 @@ def is_active(st: dict[str, Any]) -> bool:
 
 
 # ------------------------------------------------------------------------------------------------ service
-DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "risk_floor", "error")
+DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "skipped_kill_pending",
+                 "risk_floor", "error")
 
 
 def clean_allocator(status: dict | None, control: dict | None, decisions: list[dict]) -> dict[str, Any]:
@@ -375,24 +377,33 @@ class StrategyService:
         reg = self.registry()
         self._write_allocator(enabled=self.mode(reg) == "llm")
 
-    def _write(self, e: Entry, **changes: Any) -> None:
-        """Merge changes into the strategy's control.json (unknown keys the runner may use are kept), atomically."""
+    def _write(self, e: Entry, *, refuse_if_kill: bool = False, derive: Callable[[dict], dict] | None = None, **changes: Any) -> None:
+        """Merge changes into the strategy's control.json (unknown keys the runner may use are kept), atomically, under the
+        file's lock (ctb.control_lock, shared with the allocator). refuse_if_kill re-checks the kill flag inside the lock, so
+        an enable that awaited (systemctl) in between cannot switch on over a kill written meanwhile; derive computes changes
+        from the current file inside the lock."""
         path = self.root / e.id / "control.json"
-        cur = read_json(path) or {}
-        ctl = {**cur, "enabled": self._enabled(e), "flatten": bool(cur.get("flatten")), "reset_latch": bool(cur.get("reset_latch")),
-               **changes, "updated_ms": int(self.clock() * 1000)}
-        try:
-            write_control(path, ctl)
-        except OSError as exc:
-            raise StrategyError(500, f"cannot write control.json: {exc.strerror or exc}") from exc
+        with locked(path):
+            cur = read_json(path) or {}
+            if refuse_if_kill and cur.get("flatten") is True:
+                raise StrategyError(409, KILL_PENDING_MSG.format(names=e.label), detail={"kill_pending": [e.id]})
+            ctl = {**cur, "enabled": self._enabled(e), "flatten": bool(cur.get("flatten")), "reset_latch": bool(cur.get("reset_latch")),
+                   **(derive(cur) if derive else {}), **changes, "updated_ms": int(self.clock() * 1000)}
+            try:
+                write_control(path, ctl)
+            except OSError as exc:
+                raise StrategyError(500, f"cannot write control.json: {exc.strerror or exc}") from exc
 
     def _write_owner(self, e: Entry, enabled: bool, *, cancel_kill: bool = False) -> None:
         """The owner flips a switch: the allocator may not change this strategy until it is unlocked. A pending kill is left
-        alone unless the owner explicitly cancels it (cancel_kill), which clears flatten so the runner does not close the book."""
-        cur = self._control(e)
-        w = _num(cur.get("weight"))
-        self._write(e, enabled=enabled, owner_lock=True, set_by="owner", reason="owner",
-                    weight=1.0 if enabled and not w else (w if w is not None else 1.0), **({"flatten": False} if cancel_kill else {}))
+        alone unless the owner explicitly cancels it (cancel_kill), which clears flatten so the runner does not close the book;
+        without cancel_kill an "on" is refused if a kill is pending when the write happens."""
+        def weight(cur: dict) -> dict:
+            w = _num(cur.get("weight"))
+            return {"weight": 1.0 if enabled and not w else (w if w is not None else 1.0)}
+
+        self._write(e, refuse_if_kill=enabled and not cancel_kill, derive=weight, enabled=enabled, owner_lock=True, set_by="owner",
+                    reason="owner", **({"flatten": False} if cancel_kill else {}))
 
     def _kill_pending(self, e: Entry) -> bool:
         return self._control(e).get("flatten") is True
@@ -407,10 +418,11 @@ class StrategyService:
         d = self.root / ALLOCATOR
         try:
             d.mkdir(parents=True, exist_ok=True)
-            cur = read_json(d / "control.json") or {}
-            write_control(d / "control.json", {"enabled": bool(cur.get("enabled")), "interval_min": cur.get("interval_min", 60),
-                                               "decide_now": bool(cur.get("decide_now")), **cur, **changes,
-                                               "updated_ms": int(self.clock() * 1000)})
+            with locked(d / "control.json"):
+                cur = read_json(d / "control.json") or {}
+                write_control(d / "control.json", {"enabled": bool(cur.get("enabled")), "interval_min": cur.get("interval_min", 60),
+                                                   "decide_now": bool(cur.get("decide_now")), **cur, **changes,
+                                                   "updated_ms": int(self.clock() * 1000)})
         except OSError as exc:
             raise StrategyError(500, f"cannot write the allocator's control.json: {exc.strerror or exc}") from exc
 
@@ -685,7 +697,7 @@ class StrategyService:
             if not self.has_allocator:
                 raise StrategyError(409, "this venue is controlled by the owner: there is no LLM allocator to hand the strategy to")
             self._refuse_if_kill_pending([e], cancel_kill)
-            self._write(e, owner_lock=False, set_by="llm", reason="unlocked: the LLM decides at its next decision",
+            self._write(e, refuse_if_kill=not cancel_kill, owner_lock=False, set_by="llm", reason="unlocked: the LLM decides at its next decision",
                         **({"flatten": False} if cancel_kill else {}))
         elif action == "cancel_kill":
             if not self._kill_pending(e):
