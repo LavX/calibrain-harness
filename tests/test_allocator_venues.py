@@ -295,3 +295,22 @@ def test_the_header_switch_reaches_every_allocator_venue(roots, tmp_path):
     assert "calibrain-live-okx.service" in sd.active and "allocator decides" in out["okx-demo"]
     out = asyncio.run(h.auto_others(False, "llm"))
     assert out["okx-demo"] == "paused" and all(ctl(okx, i)["enabled"] is False for i in OKX_IDS)
+
+
+def test_the_drawdown_floor_keeps_running_on_every_venue_while_the_allocator_is_paused(roots, tmp_path):
+    """A KILL on bybit-demo pauses the allocator; OKX's books are still open and must still be cut by the floor."""
+    bybit, okx = roots
+    for i in BYBIT_IDS:
+        book(bybit, i, weight=0.5, enabled=True)
+    book(okx, "trend", weight=0.6, enabled=True)
+    put(bybit / "allocator" / "control.json", {"enabled": True, "interval_min": 60})
+    sd = FakeSystemd(active=["calibrain-live.service", "calibrain-live-okx.service"])
+    h = hub_of(bybit, okx, tmp_path, sd)
+    asyncio.run(h.kill("bybit-demo"))  # pauses the allocator (and flags bybit's books)
+    assert json.loads((bybit / "allocator" / "control.json").read_text())["enabled"] is False
+    book(okx, "trend", weight=0.6, enabled=True, equity=750.0)  # OKX trend falls 25%
+    a = chat_alloc(bybit, okx)
+    asyncio.run(a._tick())
+    c = ctl(okx, "trend")
+    assert c["weight"] == 0.0 and c["enabled"] is False and c["flatten_on_zero"] is True
+    assert a.status()["state"] == "paused"  # no decision ran

@@ -1451,8 +1451,8 @@ class Allocator:
 
     async def run(self) -> None:
         """The loop the dashboard server starts as a task. Wakes every tick_s: the drawdown floor
-        always runs; a model decision runs when the interval has passed or decide_now is set; nothing
-        changes while allocator/control.json says enabled false."""
+        always runs, on every managed venue, also while paused; a model decision runs when the interval has passed or
+        decide_now is set, and none runs while allocator/control.json says enabled false."""
         log.info("allocator running: model %s, root %s", self.model, self.root)
         while not self._stop.is_set():
             try:
@@ -1469,10 +1469,13 @@ class Allocator:
     async def _tick(self) -> None:
         now_ms = self.now_ms()
         ctl = self.control()
+        # The drawdown floor runs on every managed venue every tick, paused or not: it only cuts (the paused rule in
+        # _write_control lets a risk-reducing write through). A pause (AUTO-TRADE OFF, MANUAL, PER-SYMBOL BOT, a bybit-demo
+        # KILL) stops decisions, never the floor on books that are still open.
+        await self.risk_check()
         if not ctl["enabled"]:
             self.write_status(now_ms, paused=True)
             return
-        await self.risk_check()
         st = read_json(self.dir / "status.json") or {}
         last = _num(st.get("last_decision_ms"))
         due = last is None or now_ms >= last + ctl["interval_min"] * 60_000
