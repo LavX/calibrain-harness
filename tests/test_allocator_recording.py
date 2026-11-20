@@ -152,6 +152,7 @@ def test_a_shadow_policy_steps_from_its_own_weights_not_from_live(root):
     first = decide(a, trigger="decide_now")["venues"]["bybit-demo"]["policies"]
     clock.t = T0 + DAY
     put(root / "forecast" / "latest.json", forecast(clock.t - 7200, kappa=0.0))
+    a._state()["p_hist"]["trend"] = [[int(clock.t * 1000) - 3600_000, 0.2]] * 23  # the p window is 24 h: still low today
     second = decide(a, trigger="decide_now")["venues"]["bybit-demo"]["policies"]
     assert second["live"]["trend"] == pytest.approx(0.1)  # vetoed again (the exploration floor keeps 0.1)
     # the core held its own 0.37 overnight; stepping from live's 0.1 it could reach 0.35 at most
