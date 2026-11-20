@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, post } from "@/lib/api";
 import { loadOverview, selectTf } from "@/lib/data";
 import { setState, useStore } from "@/lib/store";
-import { age, dt, fx, hrs, sg, short, ud, usd } from "@/lib/format";
+import { age, dt, fx, hrs, NA, sg, short, ud, usd } from "@/lib/format";
 
 function Dialog({ className, children }: { className?: string; children: React.ReactNode }) {
   const ref = useRef<HTMLDialogElement>(null);
@@ -22,7 +22,7 @@ function Dialog({ className, children }: { className?: string; children: React.R
   );
 }
 
-const J = ({ x }: { x: unknown }) => <pre className="code">{JSON.stringify(x, null, 1) ?? "—"}</pre>;
+const J = ({ x }: { x: unknown }) => <pre className="code">{JSON.stringify(x, null, 1) ?? NA}</pre>;
 
 export function Modals() {
   const modal = useStore((s) => s.modal);
@@ -41,7 +41,7 @@ function DecisionModal({ d }: { d: any }) {
   return (
     <Dialog>
       <div className="ph"><span className="code">DEC</span>Decision #{d.id} · {d.symbol} · {dt(d.ts)}</div>
-      <p>question set {d.qset_version} · {fx(d.latency_ms, 0)} ms · {d.request_bytes ?? "—"} bytes · attempts {d.attempts ?? "—"} · request_id {d.request_id || "—"}</p>
+      <p>question set {d.qset_version} · {fx(d.latency_ms, 0)} ms · {d.request_bytes ?? NA} bytes · attempts {d.attempts ?? NA} · request_id {d.request_id || NA}</p>
       {d.issues_json?.length > 0 && <p className="dn">Contract issues: {d.issues_json.join("; ")}</p>}
       <div className="mgrid">
         <div><h3>State sent</h3><J x={d.state_json} /></div>
@@ -69,8 +69,9 @@ function HelpModal() {
     ["BTC · ETH · SOL …", "Load a symbol into chart, model signal, book and stats"], ["ASK", "Ask the active model now for the loaded symbol (1 request)"],
     ["PRB", "Ask + repeat & mirror consistency probes (4 requests)"], ["1M 5M 15M 1H 4H", "Chart timeframe (view only)"],
     ["POS 10", "Max open positions (1–50); new entries only"], ["TF 1M · TF 5M · TF 15M · TF 1H", "Trading timeframe: how often the model decides and trades"], ["MODEL", "Kairos, Jev, OR Decide or LLM: switch in the function-key bar (starts a new run)"],
-    ["UNIV", "Choose the symbols the bot watches and trades"], ["STRAT", "Strategy: brackets, entries, mirror averaging, triggers, filters, sizing"],
-    ["MON EVAL VALID STRATEGIES TRD NEWS LOG", "Switch screen (F1 F2 F6 F7 F3 F4 F5)"], ["KEYS · HELP", "API credentials · this list"], ["/", "Focus the command line from anywhere"],
+    ["UNIV", "Choose the symbols the dashboard watches and the per-symbol bot trades"], ["BRACKETS", "Per-symbol bot brackets: entries, mirror averaging, triggers, filters, sizing (bot mode)"],
+    ["MON · STRATEGIES (STRAT) · MARKET · BOT", "F1 strategies world (every venue) · F7 strategies of one venue · F8 market · F9 per-symbol bot"],
+    ["EVAL VALID TRD NEWS LOG", "Switch screen (F2 F6 F3 F4 F5)"], ["KEYS · HELP", "API credentials · this list"], ["/", "Focus the command line from anywhere"],
   ];
   return (
     <Dialog className="keys">
@@ -237,6 +238,7 @@ function KeysModal() {
 
 /* ---------------------------------------------------------------- symbol universe */
 function UniverseModal() {
+  const venue: string = useStore((s) => s.ov?.settings?.venue_label) || "on the bot's venue";
   const [u, setU] = useState<any>(null);
   const [sel, setSel] = useState<string[]>([]);
   const [q, setQ] = useState("");
@@ -281,12 +283,12 @@ function UniverseModal() {
   };
   return (
     <Dialog>
-      <div className="ph"><span className="code">UNIV</span>Symbol universe · signals Bybit mainnet · orders Bybit testnet</div>
-      <p>Pick the perps the bot watches and trades. Each needs ~{u ? fx(u.rph_per_symbol, 1) : "—"} model requests/hour at the current {u?.decision_tf}m trading timeframe (one per bar close, plus consistency probes). Only perps listed on both mainnet and testnet can be chosen. Entries take only testnet liquidity within {u?.max_entry_slip_bp}bp of the best price, so a thin testnet book means small or unfilled orders.</p>
+      <div className="ph"><span className="code">UNIV</span>Symbol universe · signals Bybit mainnet · per-symbol bot orders {venue}</div>
+      <p>Pick the perps the bot watches and trades. Each needs ~{u ? fx(u.rph_per_symbol, 1) : NA} model requests/hour at the current {u?.decision_tf}m trading timeframe (one per bar close, plus consistency probes). Only perps listed on both mainnet and testnet can be chosen. Entries take only testnet liquidity within {u?.max_entry_slip_bp}bp of the best price, so a thin testnet book means small or unfilled orders.</p>
       <div className="unibar">
         <input type="text" placeholder="filter or type a symbol" value={q} onChange={(e) => setQ(e.target.value)} />
         <span>SELECTED <b className="amb">{sel.length}</b>/{u?.max_symbols ?? 30}</span>
-        <span className={over ? "dn" : ""}>KAIROS <b>~{need}</b> / {u?.budget_per_hour ?? "—"} req/h</span>
+        <span className={over ? "dn" : ""}>KAIROS <b>~{need}</b> / {u?.budget_per_hour ?? NA} req/h</span>
         {changed && <span className="muted">+{added.map(short).join(" +") || "0"} · −{dropped.map(short).join(" −") || "0"}</span>}
         <span style={{ marginLeft: "auto" }} />
         <button className="kbtn" onClick={() => u && setSel(u.selected)}>RESET</button>
@@ -312,8 +314,8 @@ function UniverseModal() {
                     <td className="r">{usd(c.turnover24h)}</td>
                     <td className={`r ${ud(c.pct24h)}`}>{sg(c.pct24h, 2, "%")}</td>
                     <td>{c.testnet ? <span className="tag long">LISTED</span> : <span className="tag err">NOT LISTED</span>}</td>
-                    <td className="r">{b?.ok ? `${usd(b.bid_usd_20bp)} / ${usd(b.ask_usd_20bp)}` : b ? <span className="muted">{b.reason}</span> : "—"}</td>
-                    <td className="r">{b?.ok ? fx(b.spread_bp, 2) : "—"}</td>
+                    <td className="r">{b?.ok ? `${usd(b.bid_usd_20bp)} / ${usd(b.ask_usd_20bp)}` : b ? <span className="muted">{b.reason}</span> : NA}</td>
+                    <td className="r">{b?.ok ? fx(b.spread_bp, 2) : NA}</td>
                     <td>{c.asset_type !== "crypto" && <span className="tag amb" data-tip={`Bybit lists this as a ${c.asset_type} perp: it tracks a market with trading hours, so nights and weekends behave unlike crypto and the base rates mix open and closed sessions.`}>{String(c.asset_type).toUpperCase()}</span>} {b?.ok && b.thin ? <span className="tag part" data-tip={`Less than one max-size order ($${usd(u.thin_depth_usd)}) rests within 20bp on one side: entries will be partly filled`}>THIN BOOK</span> : ""}</td>
                   </tr>
                 );

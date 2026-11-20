@@ -5,7 +5,7 @@ import {
 } from "lightweight-charts";
 import { setBarSink, useStore, type Bar } from "@/lib/store";
 import { useBotMode } from "./TopBar";
-import { cssVar, decimalsOf, fx, SERIES_C, sg, short, ud, usd } from "@/lib/format";
+import { cssVar, decimalsOf, dt, fx, SERIES_C, sg, short, ud, usd } from "@/lib/format";
 
 type Candle = { time: number; open: number; high: number; low: number; close: number; volume: number };
 
@@ -27,7 +27,7 @@ const baseOpts = () => ({
   timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#242424", rightOffset: 4 },
   rightPriceScale: { borderColor: "#242424" },
   crosshair: { mode: 0, vertLine: { color: "#5a5a5a", labelBackgroundColor: "#2b1a05" }, horzLine: { color: "#5a5a5a", labelBackgroundColor: "#2b1a05" } },
-  localization: { timeFormatter: (t: number) => new Date(t * 1000).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) },
+  localization: { timeFormatter: (t: number) => dt(t) },
 });
 
 export function PriceChart() {
@@ -147,7 +147,7 @@ export function PriceChart() {
       {ohlc && (
         <div className="ohlc">
           <b>O</b> {fx(ohlc.open, pd)} <b>H</b> {fx(ohlc.high, pd)} <b>L</b> {fx(ohlc.low, pd)} <b>C</b> <span className={ud(chg)}>{fx(ohlc.close, pd)}</span> <b>V</b> {usd(ohlc.volume)}{" "}
-          <span className="muted">{new Date(ohlc.time * 1000).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+          <span className="muted">{dt(ohlc.time)}</span>
         </div>
       )}
     </div>

@@ -11,6 +11,10 @@ export type State = {
   ov: any | null;
   strat: any | null;
   pred: any | null;
+  venues: any | null;
+  /** F7: the venue whose strategies are shown, and the documents of venues other than the allocator venue. */
+  stratVenue: string | null;
+  venueStrat: Record<string, any>;
   mon: any | null;
   mkt: any | null;
   decisions: any[];
@@ -19,7 +23,7 @@ export type State = {
   perf: Record<string, [number, number][]>;
   symbol: string | null;
   tf: string;
-  view: "mon" | "eval" | "valid" | "strat" | "trades" | "news" | "log";
+  view: "mon" | "eval" | "valid" | "strat" | "trades" | "news" | "log" | "market" | "bot";
   ticks: Record<string, Tick>;
   book: Book | null;
   socket: { connected: boolean; lastMsg: number; latencyMs: number | null; msgs: number };
@@ -29,7 +33,7 @@ export type State = {
 };
 
 let state: State = {
-  ov: null, strat: null, pred: null, mon: null, mkt: null, decisions: [], latest: {}, news: { forecasts: [], headlines: [] }, perf: {},
+  ov: null, strat: null, pred: null, venues: null, stratVenue: null, venueStrat: {}, mon: null, mkt: null, decisions: [], latest: {}, news: { forecasts: [], headlines: [] }, perf: {},
   symbol: null, tf: "5", view: "mon", ticks: {}, book: null,
   socket: { connected: false, lastMsg: 0, latencyMs: null, msgs: 0 }, modal: null, cmdHint: null,
   rev: { trades: 0, events: 0, eval: 0 },
