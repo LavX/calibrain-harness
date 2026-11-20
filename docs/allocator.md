@@ -98,7 +98,8 @@ Schedule:
 
 Per strategy, a weights run does:
 
-1. `p` = mean of the decider's last 24 answers that are at most 36 h old (`CTB_ALLOCATOR_P_MAX_AGE_H`);
+1. `p` = mean of the decider's answers from the last 24 h (`CTB_ALLOCATOR_P_WINDOW_H`), whatever the polling interval;
+   `CTB_ALLOCATOR_P_WINDOW` (default 5000) only caps how many answers are kept;
    `mu_decider = (2p - 1) * 0.8 * sigma_d`. With fewer than 12 such answers (`CTB_ALLOCATOR_P_MIN_FRESH`) there is no
    p: the veto does not fire and the decider is not a forecaster for that strategy. The decision line lists them in
    `p_too_few` (and `p_fresh_n` per strategy), and the card's reason says so.
@@ -164,7 +165,7 @@ exist; 0.5 when `skill_90` is positive; 1.0 when `skill_90` and `skill_180` are 
 down by the same rules when a mean turns zero or negative. `decisions.jsonl` carries the `kappa` and `t_eff` used.
 
 Defaults: `CTB_ALLOCATOR_TILT_MAX` 0.5, `_TILT_SR_FULL` 1.0, `CTB_ALLOCATOR_GAMMA` 2, `_HORIZON_DAYS` 7, `_COST_BP` 10, `_CARRY_COST_BP` 16, `_SHARPE_CAP` 1.5,
-`_DECIDER_K` 0.8, `_P_WINDOW` 24, `_VOL_CAP` 0.10, `_BUFFER` 0.10, `_STEP_UP` 0.25, `_VETO_P` 0.40,
+`_DECIDER_K` 0.8, `_P_WINDOW_H` 24, `_VOL_CAP` 0.10, `_BUFFER` 0.10, `_STEP_UP` 0.25, `_VETO_P` 0.40,
 `_VETO_FACTOR` 0.5, `_EXPLORE_FLOOR` 0.10, `_STALE_H` 36, `_WEIGHTS_UTC` 23:50.
 
 A weights run's `decisions.jsonl` line carries the usual fields (`weights` is the final applied weight,
