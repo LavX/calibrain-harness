@@ -164,7 +164,7 @@ export function CommandBar() {
         {hasModes && (
           <span className="seg modeseg" data-tip={`Who trades the ${allocVenue} account: the LLM allocator decides which strategies trade (LLM DECIDES), you switch strategies per card (MANUAL), or the older per-symbol LLM bot trades. Only one at a time. Other venues are owner-controlled and not affected.`}>
             {(["llm", "manual", "bot"] as const).map((m) => (
-              <button key={m} className={mode === m ? "on" : ""} onClick={() => switchMode(mode, m)}>{MODE_LABEL[m]}</button>
+              <button key={m} className={mode === m ? "on" : ""} onClick={() => switchMode(mode, m, strat)}>{MODE_LABEL[m]}</button>
             ))}
           </span>
         )}

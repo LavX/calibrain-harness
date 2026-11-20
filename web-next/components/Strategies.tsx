@@ -35,6 +35,7 @@ export type StratDoc = {
   mode: "llm" | "manual" | "bot"; auto_on: boolean; error: string | null; root: string; venue: string; llm_trading_enabled: boolean;
   allocator: Allocator; runners: Runner[]; strategies: Strat[]; auto_set: string[] | null;
   venue_id: string; venue_label: string; ccy: string; controlled_by: "allocator" | "owner"; allocator_venue: boolean;
+  dashboard_account: string | null;
 };
 
 export const MODE_LABEL: Record<string, string> = { llm: "LLM DECIDES", manual: "MANUAL", bot: "PER-SYMBOL BOT" };
@@ -63,10 +64,15 @@ async function reloadAll(vid?: string) {
 }
 
 /** Header: change the auto-trade mode (with a confirm that says what gets paused first). PER-SYMBOL BOT needs the word typed. */
-export async function switchMode(from: string, to: string) {
+export async function switchMode(from: string, to: string, doc?: StratDoc | null) {
   if (from === to) return;
+  // what the server's set_mode("bot") really does: it pauses and stops only when the bot trades the strategies' own account
+  const shares = !!doc && doc.venue === "demo" && doc.strategies.some((s) => !doc.dashboard_account || s.account === doc.dashboard_account);
+  const unit = doc?.runners[0]?.unit || "the strategy runner";
   const what = to === "bot"
-    ? "The LLM allocator and every BYBIT·DEMO strategy are paused and the strategy runner (calibrain-live.service) is stopped. Positions stay open on the account (flatten them first if you want them closed). Other venues are not affected."
+    ? shares
+      ? `The per-symbol bot trades the strategies' Bybit demo account, so the LLM allocator and every BYBIT·DEMO strategy are paused and ${unit} is stopped first (refused while a strategy holds positions: flatten them first). Other venues are not affected.`
+      : "The per-symbol bot trades another account, so nothing of the strategies changes: the LLM allocator and the BYBIT·DEMO strategies keep running as they are. Only the header mode changes. Other venues are not affected."
     : from === "bot"
       ? "The per-symbol bot's AUTO-TRADE is turned off first."
       : to === "manual" ? "The LLM allocator is paused. Strategies stay as they are and you switch them per card."

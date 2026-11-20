@@ -765,9 +765,9 @@ def test_kill_all_kills_the_per_symbol_bot_only_when_it_owns_the_account(roots, 
     body = run(go())
     by = {x["venue"]: x for x in body["venues"]}
     assert by["okx-demo"]["ok"] is True and eng.s.trading_enabled is False and body["bot"]["auto_trade"] == "off"
-    if mode == "bot":  # the bot owns the account: it is killed, the paused bybit strategies are skipped with the reason
+    # bybit-demo is killed in every mode: nothing assumes the bot mode paused it (it does only when they share the account)
+    assert by["bybit-demo"]["ok"] is True and ctl(roots[0], "carry")["flatten"] is True
+    if mode == "bot":  # the bot is killed too
         assert kills == ["dashboard KILL ALL"] and body["bot"]["killed"] is True
-        assert by["bybit-demo"]["skipped"] is True and "PER-SYMBOL BOT" in by["bybit-demo"]["error"]
-        assert ctl(roots[0], "carry").get("flatten") is False
     else:  # the strategies own it: Executor.kill would close their netted legs, so the bot is not touched on the exchange
-        assert kills == [] and body["bot"]["killed"] is False and by["bybit-demo"]["ok"] is True
+        assert kills == [] and body["bot"]["killed"] is False

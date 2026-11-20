@@ -393,16 +393,14 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
 
     @routes.post("/api/kill-all")
     async def kill_all(_: web.Request) -> web.Response:
-        """Every venue that has started gets its kill flags written and says whether that is confirmed, and the per-symbol
-        bot is killed when it owns the Bybit account (mode PER-SYMBOL BOT): its positions closed, orders cancelled, trading off.
-        In that mode the bybit-demo strategies are skipped: they are already paused and their runner stopped. The bot's part
-        is reported on its own ("bot"). Outside that mode the bot is not touched on the exchange: Executor.kill closes every
-        position on the account, which would close the strategies' netted legs behind their runner."""
+        """Every venue that has started gets its kill flags written and says whether that is confirmed (bybit-demo too, in
+        every mode: switching to PER-SYMBOL BOT pauses its strategies only when they share the bot's account, so nothing is
+        assumed), and the per-symbol bot is killed when the header mode is PER-SYMBOL BOT: its positions closed, orders
+        cancelled, trading off, reported on its own ("bot"). Outside that mode the bot is not touched on the exchange:
+        Executor.kill closes every position on its account, which can be the strategies' account with their netted legs."""
         bot_mode = not strat.owns_account()
         bot_open = bool(engine.db.one("SELECT id FROM trades WHERE status IN ('open','opening') LIMIT 1"))
-        skip = {hub.primary_id: ("the header mode is PER-SYMBOL BOT: these strategies are paused and their runner stopped; "
-                                 "the per-symbol bot is killed instead")} if bot_mode else None
-        out = await hub.kill_all(skip=skip)
+        out = await hub.kill_all()
         ex = getattr(engine, "executor", None)
         if bot_mode and ex is not None:
             try:

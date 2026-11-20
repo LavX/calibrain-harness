@@ -114,8 +114,8 @@ strategies.json without a directory is named as not flagged. F1's KILL button ap
 preview and the answer agree. Only a venue that has not started, or whose
 strategies.json is unusable, is refused with nothing written. KILL ALL does every venue and reports each one (a venue
 that has not started is skipped) and then switches the per-symbol bot's AUTO-TRADE off. In mode PER-SYMBOL BOT it also
-kills the bot (all its positions closed, orders cancelled) and skips the bybit-demo strategies, which that mode has
-already paused with their runner stopped. In the other modes the bot is not touched on the exchange: its kill closes
+kills the bot (every position on its account closed, orders cancelled); bybit-demo's strategies are killed as in every
+mode, because that mode pauses them and stops their runner only when the bot trades the same account. In the other modes the bot is not touched on the exchange: its kill closes
 every position on the account, which would close the strategies' netted legs behind their runner. The answer reports
 the bot's part on its own. `/api/kill` (the old header
 button) is the bybit-demo kill in LLM DECIDES and MANUAL.
