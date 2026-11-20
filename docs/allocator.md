@@ -48,6 +48,9 @@ Things to know before handing a venue over:
   that venue's strategies. For another exchange it is an approximation: its fills, symbols and margin currency differ.
 - The drawdown floor keeps running while the allocator is paused (AUTO-TRADE OFF, MANUAL, PER-SYMBOL BOT, a bybit-demo
   KILL): pausing stops decisions, not the floor on books that are still open.
+- Each (venue, strategy) stands alone in the floor: a control.json that cannot be written (a read-only directory, a full
+  disk) is logged, named in the feed and in `status.json` (`last_error`, `risk_floor_errors`), and raised as a red
+  FLOOR FAILED alert for that venue and strategy; the floor goes on with the other books and tries again every tick.
 
 ## Rules enforced in code
 

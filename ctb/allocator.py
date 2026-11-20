@@ -717,6 +717,9 @@ class Allocator:
         self._stop = asyncio.Event()
         self._busy = asyncio.Lock()
         self.last_error: str | None = None
+        # "<venue>/<strategy>": the drawdown floor's last failed write ({venue, venue_label, strategy, error, t_ms}). Rebuilt
+        # by every risk check: an entry stays while the write keeps failing and goes once it succeeds or is no longer needed.
+        self.floor_errors: dict[str, dict[str, Any]] = {}
         self.state_cache: dict[str, Any] | None = None
         self._dirty = False
         self._seed_budget()
@@ -1094,7 +1097,11 @@ class Allocator:
         return True
 
     def _apply(self, plan: Plan, current: dict[str, Current], reasons: dict[str, str], now_ms: int, *,
-               refresh_reasons: bool = False, venue: AllocVenue | None = None) -> dict[str, bool]:
+               refresh_reasons: bool = False, venue: AllocVenue | None = None,
+               errors: dict[str, str] | None = None) -> dict[str, bool]:
+        """Write the plan into each strategy's control.json on one venue. With errors given, a failed write (an unwritable
+        directory, a full disk) is logged and recorded there as "<Type>: message" and the other strategies are still written;
+        without it the failure propagates as before."""
         venue = venue or self.primary
         applied: dict[str, bool] = {}
         self._kill_skips = []  # filled by _write_control: strategies not switched on because a kill is pending
@@ -1110,8 +1117,14 @@ class Allocator:
             if unchanged:
                 applied[sid] = False  # nothing to tell the runner; keep control.json (and its reason) as is
                 continue
-            applied[sid] = self._write_control(sid, plan.enabled[sid], plan.weights[sid], reasons[sid],
-                                               self.flatten_on_floor and sid in plan.floored, now_ms, root=venue.root)
+            try:
+                applied[sid] = self._write_control(sid, plan.enabled[sid], plan.weights[sid], reasons[sid],
+                                                   self.flatten_on_floor and sid in plan.floored, now_ms, root=venue.root)
+            except Exception as exc:  # noqa: BLE001 - only when the caller collects errors (the drawdown floor)
+                if errors is None:
+                    raise
+                errors[sid] = f"{type(exc).__name__}: {exc}"[:300]
+                applied[sid] = False
         return applied
 
     def _day_anchor(self, current: dict[str, "Current"], now_ms: int, *, persist: bool = True,
@@ -1396,28 +1409,49 @@ class Allocator:
 
     async def risk_check(self) -> dict[str, Any] | None:
         """The drawdown floor on its own, no model: runs every tick so a bad book is cut within
-        seconds of the runner reporting it, not at the next hourly decision."""
+        seconds of the runner reporting it, not at the next hourly decision. Each (venue, strategy) stands alone: a write
+        that fails (or a venue that cannot be read) is logged, kept in floor_errors (status.json and the venue alerts show
+        it), named in the feed when it is new, and the floor goes on with the other books; the next tick tries again."""
         async with self._busy:
             now_ms = self.now_ms()
             last: dict[str, Any] | None = None
+            prev, errs = self.floor_errors, {}
             for v in self.venues:  # each venue's books against their own peaks
                 if not v.managed:
                     continue
-                current = self._read_current(now_ms, v)
-                plan = resolve(current, None, max_step=self.max_step, dd_floor_pct=self.dd_floor_pct)
-                todo = [s for s in plan.floored if current[s].weight > 0 or current[s].enabled]
-                if not todo:
-                    continue
-                reasons = {s: self._floor_reason(v, current[s]) for s in todo}
-                partial = Plan({s: plan.enabled[s] for s in todo}, {s: plan.weights[s] for s in todo}, todo, [], [])
-                applied = self._apply(partial, {s: current[s] for s in todo}, reasons, now_ms, venue=v)
+                failed: dict[str, str] = {}
+                try:
+                    current = self._read_current(now_ms, v)
+                    plan = resolve(current, None, max_step=self.max_step, dd_floor_pct=self.dd_floor_pct)
+                    todo = [s for s in plan.floored if current[s].weight > 0 or current[s].enabled]
+                    if not todo:
+                        continue
+                    reasons = {s: self._floor_reason(v, current[s]) for s in todo}
+                    partial = Plan({s: plan.enabled[s] for s in todo}, {s: plan.weights[s] for s in todo}, todo, [], [])
+                    applied = self._apply(partial, {s: current[s] for s in todo}, reasons, now_ms, venue=v, errors=failed)
+                except Exception as exc:  # noqa: BLE001 - this venue's books could not even be read: the others still run
+                    todo, applied, plan, reasons = [], {}, None, {}
+                    failed[""] = f"{type(exc).__name__}: {exc}"[:300]
+                new = False
+                for sid, err in failed.items():
+                    key = self.vk(v.id, sid or "*")
+                    errs[key] = {"venue": v.id, "venue_label": v.label, "strategy": sid or None, "error": err, "t_ms": now_ms}
+                    if prev.get(key, {}).get("error") != err:
+                        new = True
+                        log.error("allocator: drawdown floor on %s %s failed: %s", v.id, sid or "(reading the venue)", err)
+                if failed and not new and not any(applied.values()):
+                    continue  # the same failure as last tick and nothing written: the alert and status.json already say it
+                txt = "; ".join(f"{sid or 'reading the venue'}: {err}" for sid, err in failed.items())
                 last = {"t_ms": now_ms, "model": "risk-floor", "trigger": "risk", "venue": v.id, "venue_label": v.label,
-                        "weights": plan.weights, "enabled": plan.enabled,
+                        "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {},
                         "reasoning": "; ".join(reasons.values()), "inputs": {"drawdown_pct": {s: _r(current[s].drawdown_pct, 2) for s in todo}},
-                        "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock,
+                        "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
                         "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
-                        "skipped_paused": [x for x in self._paused_skips if x in applied], "risk_floor": todo, "attempts": 0}
+                        "skipped_paused": [x for x in self._paused_skips if x in applied], "risk_floor": todo, "attempts": 0,
+                        "write_failed": {k: e for k, e in failed.items() if k},
+                        "error": f"drawdown floor not applied, tried again every tick ({txt})" if failed else None}
                 append_jsonl(self.dir / "decisions.jsonl", last)
+            self.floor_errors = errs
             if last is not None or self._dirty:
                 self._save_state()
             return last
@@ -1447,6 +1481,9 @@ class Allocator:
         last_dec = (self.decisions(1) or [{}])[0]
         fc = self.load_forecast(now_ms) if self.mode == "decider" else None
         err = self.last_error or (fc.error if fc else None)  # an unusable forecast is an error; a missing one is a mode
+        floor = [f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in self.floor_errors.values()]
+        if floor:  # the drawdown floor could not cut a book: said even while paused
+            err = "; ".join(([err] if err else []) + [f"drawdown floor could not write control.json ({'; '.join(floor)})"])
         weights_mode = {None: "chat", "missing": "decider-only", "fresh": "computed"}.get(fc.state if fc else None, "held")
         nxt_w = None if fc is None or fc.state == "missing" or paused else latest_weights_slot_ms(now_ms, *self.calc.weights_utc) + DAY_MS
         write_json_atomic(self.dir / "status.json", {
@@ -1457,6 +1494,7 @@ class Allocator:
             "last_reasoning": last_dec.get("reasoning") or None, "last_confidence": last_dec.get("confidence"),
             "weights_mode": weights_mode, "forecast": fc.info() if fc else None,
             "last_weights_ms": _num(self._state().get("last_weights_ms")), "next_weights_ms": nxt_w,
+            "risk_floor_errors": list(self.floor_errors.values()),
         })
 
     # ---- loop

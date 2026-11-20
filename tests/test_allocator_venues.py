@@ -120,6 +120,41 @@ def test_the_risk_check_cuts_a_venue_book_between_decisions(roots):
     assert rec["venue"] == "okx-demo" and rec["risk_floor"] == ["xsmom"] and ctl(okx, "xsmom")["enabled"] is False
 
 
+def test_a_failed_floor_write_does_not_stop_the_floor_on_the_other_books(roots, monkeypatch):
+    bybit, okx = roots
+    for root, sid in ((bybit, "trend"), (bybit, "xsmom"), (okx, "xsmom")):
+        book(root, sid, weight=0.5, enabled=True, equity=800.0)  # three books 20% below their peak
+    real = A.write_json_atomic
+
+    def full_disk(path, obj):  # Bybit's trend directory cannot be written; the allocator venue comes first
+        if path == bybit / "trend" / "control.json":
+            raise OSError(28, "No space left on device")
+        real(path, obj)
+
+    monkeypatch.setattr(A, "write_json_atomic", full_disk)
+    a = chat_alloc(bybit, okx)
+    asyncio.run(a.risk_check())
+    assert ctl(okx, "xsmom")["enabled"] is False and ctl(okx, "xsmom")["weight"] == 0.0  # the other venue is still cut
+    assert ctl(bybit, "xsmom")["enabled"] is False  # and the same venue's other book
+    assert ctl(bybit, "trend")["enabled"] is True  # the failed one is as it was
+    feed = (bybit / "allocator" / "decisions.jsonl").read_text().splitlines()
+    rec = next(json.loads(x) for x in feed if json.loads(x)["venue"] == "bybit-demo")
+    assert rec["applied"] == {"trend": False, "xsmom": True} and list(rec["write_failed"]) == ["trend"]
+    assert "No space left on device" in rec["error"] and "trend" in rec["error"]
+    assert list(a.floor_errors) == ["bybit-demo/trend"]
+    a.write_status(a.now_ms(), paused=True)  # said in status.json even while paused, and raised as a red venue alert
+    status = json.loads((bybit / "allocator" / "status.json").read_text())
+    assert "drawdown floor could not write control.json" in status["last_error"]
+    alerts = V.floor_alerts(st.clean_allocator(status, None, []), {"bybit-demo": "BYBIT·DEMO"})
+    assert [(x["venue"], x["strategy"], x["kind"], x["level"]) for x in alerts] == [("bybit-demo", "trend", "floor_failed", "crit")]
+    asyncio.run(a.risk_check())  # the same failure again: no new feed line, the alert stays
+    assert len((bybit / "allocator" / "decisions.jsonl").read_text().splitlines()) == len(feed)
+    assert list(a.floor_errors) == ["bybit-demo/trend"]
+    monkeypatch.setattr(A, "write_json_atomic", real)  # the disk has room again: the next tick cuts it and the error goes
+    asyncio.run(a.risk_check())
+    assert ctl(bybit, "trend")["enabled"] is False and a.floor_errors == {}
+
+
 # ---------------------------------------------------------------- per-write safety on every venue
 def test_owner_lock_and_a_pending_kill_are_respected_per_venue(roots):
     bybit, okx = roots

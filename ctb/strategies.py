@@ -291,7 +291,7 @@ def is_active(st: dict[str, Any]) -> bool:
 
 # ------------------------------------------------------------------------------------------------ service
 DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "skipped_kill_pending",
-                 "skipped_paused", "risk_floor", "error", "venue", "venue_label", "venues")
+                 "skipped_paused", "risk_floor", "write_failed", "error", "venue", "venue_label", "venues")
 
 
 def clean_allocator(status: dict | None, control: dict | None, decisions: list[dict]) -> dict[str, Any]:
@@ -304,7 +304,12 @@ def clean_allocator(status: dict | None, control: dict | None, decisions: list[d
                **{k: _num(status.get(k)) for k in ("last_decision_ms", "next_decision_ms", "cost_usd_today", "last_weights_ms",
                                                    "next_weights_ms", "updated_ms")},
                "weights_mode": status.get("weights_mode") if isinstance(status.get("weights_mode"), str) else None,
-               "last_error": str(status["last_error"])[:500] if status.get("last_error") else None}
+               "last_error": str(status["last_error"])[:500] if status.get("last_error") else None,
+               # the drawdown floor's failed writes, per (venue, strategy): the venue alerts name them
+               "risk_floor_errors": [{"venue": str(e.get("venue") or ""), "venue_label": str(e.get("venue_label") or e.get("venue") or ""),
+                                      "strategy": str(e["strategy"]) if e.get("strategy") else None, "error": str(e.get("error") or "")[:300],
+                                      "t_ms": _num(e.get("t_ms"))}
+                                     for e in (status.get("risk_floor_errors") or []) if isinstance(e, dict)][:50]}
     ctl = {"enabled": bool(control and control.get("enabled")), "interval_min": int(control["interval_min"]) if control and isinstance(control.get("interval_min"), int) else None,
            "decide_now_pending": bool(control and control.get("decide_now"))}
     return {"status": stt, "control": ctl, "decisions": [{k: d.get(k) for k in DECISION_KEYS} for d in decisions]}

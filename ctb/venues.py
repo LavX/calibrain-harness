@@ -350,6 +350,19 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
     }
 
 
+def floor_alerts(alloc: dict, labels: dict[str, str]) -> list[dict]:
+    """The allocator's drawdown floor could not write a book's control.json (or read a venue): red, per (venue, strategy),
+    until a later tick's write succeeds."""
+    out = []
+    for e in ((alloc.get("status") or {}).get("risk_floor_errors") or []):
+        sid = e.get("strategy")
+        out.append({"venue": e["venue"], "venue_label": labels.get(e["venue"]) or e.get("venue_label") or e["venue"],
+                    "strategy": sid, "name": S.short_name(sid, sid) if sid else None, "kind": "floor_failed", "level": "crit",
+                    "text": f"the drawdown floor could not {'cut this book' if sid else 'read this venue'} ({e.get('error')}); "
+                            "it tries again every tick. Check that the venue's directory is writable and the disk has space"})
+    return out
+
+
 def alerts(v: dict, now_ms: float) -> list[dict]:
     """What needs the owner's attention on one venue. crit: red (unit down, stale, error, latched); warn: amber."""
     out: list[dict] = []
@@ -630,6 +643,7 @@ class VenueHub:
             all_alerts += alerts(v, now_ms)
             out.append(v)
         prim = await self.primary.snapshot()
+        all_alerts += floor_alerts(prim.get("allocator") or {}, {v["id"]: v["label"] for v in out})
         return {"generated_at": now, "primary": self.primary_id, "venues": out, "alerts": all_alerts,
                 "mode": prim["mode"], "auto_on": prim["auto_on"], "allocator": prim["allocator"]}
 
