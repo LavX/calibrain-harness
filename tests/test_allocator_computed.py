@@ -344,11 +344,19 @@ def test_dry_run_writes_nothing_and_prints_the_table(root):
         assert token in table
 
 
-def test_without_a_forecast_file_the_decider_alone_decides_and_status_says_so(root):
-    (root / "forecast" / "latest.json").unlink()
-    a = make(root, FakeDecider(answers({"carry": 0.61, "trend": 0.48, "xsmom": 0.57})))
-    rec = decide(a, trigger="schedule")
-    assert rec.get("mapping") and "weights_mode" not in rec and rec["error"] is None
-    st = a.status()
-    assert st["weights_mode"] == "decider-only" and st["forecast"]["state"] == "missing" and "decider alone" in st["forecast"]["note"]
-    assert st["state"] == "running" and st["last_error"] is None
+def test_a_missing_or_invalid_forecast_holds_the_weights_and_never_hands_them_to_the_decider(root):
+    """The decider-only mapping would set carry 0.73, trend 0, xsmom 0.5 from these answers. The weights stay as they
+    were (0.5, 0.2, 0.3), status and feed say why, and the drawdown floor still cuts a book."""
+    put(root / "trend" / "status.json", {"state": "running", "equity_usdt": 800.0, "start_equity_usdt": 1000.0, "pnl_pct": -20.0})
+    for state, word in (("missing", "forecast missing: holding"), ("invalid", "forecast invalid: holding")):
+        if state == "missing":
+            (root / "forecast" / "latest.json").unlink()
+        else:
+            put(root / "forecast" / "latest.json", {"date": "2026-11-19"})  # no made_ms, no strategies
+        a = make(root, FakeDecider(answers({"carry": 0.61, "trend": 0.48, "xsmom": 0.57})))
+        rec = decide(a, trigger="schedule")
+        assert rec["weights_mode"] == "held" and "mapping" not in rec and word in rec["reasoning"] and word in rec["error"]
+        assert ctl(root, "carry")["weight"] == 0.5 and ctl(root, "xsmom")["weight"] == 0.3
+        assert ctl(root, "trend")["weight"] == 0.0 and rec["risk_floor"] == ["trend"]  # a risk cut still goes through
+        st = a.status()
+        assert st["weights_mode"] == "held" and st["forecast"]["state"] == state and st["state"] == "error" and word in st["last_error"]

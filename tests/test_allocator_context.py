@@ -356,7 +356,7 @@ def test_the_allocator_cuts_the_state_before_asking(live, tmp_path, monkeypatch)
     llm = FakeDecider(max_payload_bytes=base - 2500)
     rec = asyncio.run(make(live, llm).decide(trigger="cli"))
     state, questions = llm.calls[0]
-    assert rec["error"] is None and X.payload_bytes(state, questions) <= base - 2500
+    assert rec["attempts"] == 1 and X.payload_bytes(state, questions) <= base - 2500  # no forecast file: weights held, the state still cut
     assert rec["inputs"]["news"]["count"] == state["news"]["count"] < 40         # the log shows what was sent
     assert rec["state_bytes"]["total"] == len(X.dumps(state).encode())
 
@@ -371,13 +371,13 @@ def test_the_computed_path_logs_state_bytes_and_still_sets_weights(live):
     assert rec["state_bytes"]["forecasts"] > 0 and "forecasts" in llm.calls[0][0]
 
 
-def test_the_decider_only_path_has_regime_and_news_but_a_note_for_the_missing_forecast(live):
+def test_without_a_forecast_the_decider_state_has_regime_and_news_but_a_note_for_the_missing_forecast(live):
     put(live / "regime" / "latest.json", REGIME)
     default_news(live)
     llm = FakeDecider()
     rec = asyncio.run(make(live, llm).decide(trigger="cli"))
     state = llm.calls[0][0]
-    assert rec["error"] is None and rec.get("weights_mode") is None
+    assert "forecast missing: holding" in rec["error"] and rec["weights_mode"] == "held"
     assert "regime" in state and "news" in state and "forecasts" not in state and any("forecasts omitted" in n for n in state["state_notes"])
 
 

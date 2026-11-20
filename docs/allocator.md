@@ -4,13 +4,15 @@
 deployed, and when. It places no orders: it only writes the allocation fields of each strategy's
 `control.json`, which the live runner reads every loop.
 
-There are two ways it sets weights:
+How it sets weights:
 
-- **Computed** (when `forecast/latest.json` exists): weights come from the prediction layer's
+- **Computed** (a fresh `forecast/latest.json`): weights come from the prediction layer's
   forecasts by a static core (inverse-volatility mix) that the forecasts may tilt once the tilt has earned
   it (it starts in shadow, so live weights start as the core), plus fixed rules, see "Computed weights" below. The decision model is one forecaster among several and still has a veto.
-- **Decider only** (no forecast file): the decision model's probabilities map straight to weights,
-  see "Model and question set". `status.json` says `weights_mode: "decider-only"`.
+- **Held** (the forecast file is missing, unreadable or stale): the last weights stay, `status.json` says
+  `weights_mode: "held"` and `last_error` "forecast missing: holding" (or invalid, stale). The decision model is still asked
+  every hour and its answers still go into the p history, but it never sets weights alone: the decider-only mapping of
+  "Model and question set" is only logged. Risk reductions (the drawdown floor) still apply.
 
 Layout under the live root (`CTB_LIVE_ROOT`, default `data/live`; on aurora4
 `/home/lavx/Documents/calibrain-study/data/live`):
@@ -44,7 +46,7 @@ Things to know before handing a venue over:
   30 s, also while the allocator is paused) can cut a book more than 15% below its peak at once.
 - HAND TO ALLOCATOR keeps the current enabled and weight; the next weights run (DECIDE NOW, or 23:50 UTC) sets them. The
   day anchor is the weight at that day's first weights run, so a cut lands at once and an increase is capped at +0.25 per
-  day from the anchor (computed mode; the decider-only fallback steps at most 0.5 per decision).
+  day from the anchor.
 - The vol cap of every venue is computed from bybit-demo's forecast (sigma and covariance of Bybit's return series) over
   that venue's strategies. For another exchange it is an approximation: its fills, symbols and margin currency differ.
 - The drawdown floor keeps running while the allocator is paused (AUTO-TRADE OFF, MANUAL, PER-SYMBOL BOT, a bybit-demo
@@ -89,9 +91,10 @@ Schedule:
 - Weights are set once a day at 23:50 UTC (`CTB_ALLOCATOR_WEIGHTS_UTC`), on the first run when none were
   ever set, and on DECIDE NOW or `once`. The decider is asked first, so its newest answer is in p. If the
   decider or market data fail, the stored p history is used and the weights are still set.
-- A forecast older than 36 h (`CTB_ALLOCATOR_STALE_H`), or an unreadable file: weights are held, the hourly
-  refresh continues, and the reason is in `status.json` `last_error` and `forecast`. The drawdown floor and
-  `owner_lock` keep working. A missing file is not an error: decider-only mode, noted in `forecast.note`.
+- A forecast older than 36 h (`CTB_ALLOCATOR_STALE_H`), an unreadable file or a missing one: weights are held, the hourly
+  refresh continues, and the reason ("forecast missing: holding", "forecast invalid: holding", "forecast stale: holding")
+  is in `status.json` `last_error` and `forecast`, and in the decision line. The drawdown floor and `owner_lock` keep
+  working. The decider-only mapping is never used for weights.
 
 Per strategy, a weights run does:
 
@@ -157,7 +160,7 @@ regime in the line is today's state from `regime/latest.json` and its 7-day prob
 
 `python -m ctb.allocator once --dry-run` asks the decider (its answer counts toward p but is not stored),
 prints the full table (mu per forecaster in %/yr, p, sigma, previous weight, core, SR, live tilt, shadow tilt, target, the weight
-after each rule, final, the reasons) and writes nothing. Without a forecast file it prints the decider-only output as before.
+after each rule, final, the reasons) and writes nothing. Without a usable forecast file it prints the held table.
 The chat fallback (`CTB_ALLOCATOR_MODEL=llm`) never uses the forecast.
 
 ## Model and question set
@@ -242,7 +245,7 @@ perps and can be set with `CTB_ALLOCATOR_TREND_SYMBOLS` (comma separated).
 
 ## CLI
 
-    python -m ctb.allocator once --dry-run   # computed: the state with its sizes, then the full weight table; decider-only: context and answer; writes nothing
+    python -m ctb.allocator once --dry-run   # the state with its sizes, then the full weight table (or the held one); writes nothing
     python -m ctb.allocator once             # one decision, applied
     python -m ctb.allocator run              # loop until stopped
     python -m ctb.allocator score            # score logged answers against realised book returns (--qset alloc-v1.1 for one set)

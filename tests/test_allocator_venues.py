@@ -489,21 +489,19 @@ def test_a_strategy_only_a_secondary_venue_lists_is_held_in_the_computed_mode(ro
     assert ctl(okx, "longvol")["weight"] == 0.3 and "no decision: strategy not on the decision venue" in okx_rec["reasons"]["longvol"]
 
 
-def test_a_strategy_the_decider_left_unanswered_keeps_each_venues_own_allocation(roots):
+def test_without_a_forecast_every_venue_holds_its_own_allocation(roots):
     from test_allocator_computed import FakeDecider, answers
 
     bybit, okx = roots
-    book(bybit, "trend", weight=0.8, enabled=True)   # the decision venue's allocation, which the mapping keeps for it
-    book(okx, "trend", weight=0.1, enabled=False)    # OKX's own, different
-    a = A.Allocator(bybit, FakeDecider(answers({"carry": 0.6, "xsmom": 0.6})), market, model="ordecide / test", clock=lambda: T0,
-                    budget=RateBudget(50), venues=venues(bybit, okx))  # no forecast file: the decider-only mapping
+    book(bybit, "trend", weight=0.8, enabled=True)
+    book(okx, "trend", weight=0.1, enabled=False)
+    book(okx, "xsmom", weight=0.3, enabled=True)
+    a = A.Allocator(bybit, FakeDecider(answers({"carry": 0.6, "xsmom": 0.9})), market, model="ordecide / test", clock=lambda: T0,
+                    budget=RateBudget(50), venues=venues(bybit, okx))  # no forecast file: the weights are held everywhere
     rec = decide(a)
-    assert "trend" in rec["unanswered"][0] and rec["mapping"]["trend"]["held"] is True
-    okx_rec = rec["venues"]["okx-demo"]
-    assert ctl(okx, "trend")["enabled"] is False and ctl(okx, "trend")["weight"] == 0.1  # not switched on at Bybit's 0.8
-    assert okx_rec["applied"]["trend"] is False and "gave no valid answer" in okx_rec["reasons"]["trend"]
-    assert ctl(okx, "xsmom")["enabled"] is True and okx_rec["applied"]["xsmom"] is True  # an answered strategy still goes ahead
-    assert ctl(bybit, "trend")["weight"] == 0.8 and ctl(bybit, "trend")["enabled"] is True  # Bybit keeps its own too
+    assert rec["weights_mode"] == "held" and rec["venues"]["okx-demo"]["applied"] == {"trend": False, "xsmom": False, "longvol": False}
+    assert (ctl(okx, "trend")["weight"], ctl(okx, "trend")["enabled"], ctl(okx, "xsmom")["weight"]) == (0.1, False, 0.3)
+    assert ctl(bybit, "trend")["weight"] == 0.8 and ctl(bybit, "xsmom")["weight"] == 0.0
 
 
 def test_an_unusable_venue_strategies_json_writes_nothing_there(roots):

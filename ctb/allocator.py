@@ -3,17 +3,19 @@
 Default: the harness's decision model (CTB_MODEL_PROVIDER when it is a decision spec: kairos, jev,
 ordecide, or:<id>; else ordecide) answers the alloc-v1.1 question set (ctb/kairos/allocator_questions.py):
 per strategy "is its net book return over the next 24 h positive" plus "which strategy, or none, earns
-the most". Code maps the probabilities to weights: weight = clip((p - 0.5) / 0.15, 0, 1), the
-categorical winner is lifted to 0.5 when its own p > 0.55, enabled = weight > 0. Fallback: a chat
-model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that answers one JSON allocation directly.
+the most". Code maps the probabilities to a "mapping" (weight = clip((p - 0.5) / 0.15, 0, 1), the
+categorical winner lifted to 0.5 when its own p > 0.55) that is logged; the weights themselves come from the
+computed layer below, never from the mapping. Fallback: a chat model (CTB_ALLOCATOR_MODEL=llm or or:<id>) that
+answers one JSON allocation directly.
 
 Computed weights (ctb/allocator_math.py): when <root>/forecast/latest.json exists (written daily by the
 prediction layer) the decider is only one forecaster. It is still asked every hour, p is the mean of its
 last 24 answers, and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: core plus tilt (the
 static inverse-volatility mix, tilted by at most +-T by each strategy's forecast Sharpe, with the tilt room kappa 0 until
 the shadow tilt has earned it, so live weights start as the core), then the vol cap,
-buffer, step, decider veto, exploration floor, the drawdown floor and owner_lock. A forecast older than 36 h holds the weights and reports the error in
-status.json. Without the file the decider-only mapping above applies and status.json says so.
+buffer, step, decider veto, exploration floor, the drawdown floor and owner_lock. A forecast that is missing, unreadable
+or older than 36 h holds the last weights ("forecast missing: holding") and reports the error in status.json and the
+feed: the decider alone never sets weights. Risk reductions (the drawdown floor) still apply while held.
 
 Each live strategy (carry, trend, xsmom, ...) has a virtual book and reads <root>/<id>/control.json
 every loop. This module is the only writer of the allocation part of those files ("enabled",
@@ -433,8 +435,8 @@ class Forecast:
 
     @property
     def error(self) -> str | None:
-        """What the status shows as an error: a forecast that exists but cannot be used. A missing file is a mode, not an error."""
-        return self.note if self.state in ("invalid", "stale") else None
+        """What the status shows as an error: a forecast that is missing or cannot be used (the weights are held)."""
+        return self.note if self.state in ("missing", "invalid", "stale") else None
 
     def info(self) -> dict[str, Any]:
         return {"state": self.state, "date": self.date, "made_ms": self.made_ms,
@@ -444,15 +446,15 @@ class Forecast:
 def read_forecast(root: Path, now_ms: int, stale_h: float) -> Forecast:
     path = root / "forecast" / "latest.json"
     if not path.exists():
-        return Forecast("missing", note="forecast/latest.json is missing: weights come from the decider alone")
+        return Forecast("missing", note="forecast missing: holding the last weights (forecast/latest.json not found; risk cuts still apply)")
     raw = read_json(path)
     made = _num(raw.get("made_ms")) if isinstance(raw, dict) else None
     if not isinstance(raw, dict) or not isinstance(raw.get("strategies"), dict) or made is None:
-        return Forecast("invalid", note="forecast/latest.json is unreadable or incomplete: weights held")
+        return Forecast("invalid", note="forecast invalid: holding the last weights (forecast/latest.json unreadable or incomplete; risk cuts still apply)")
     age = max(0.0, (now_ms - made) / 3_600_000)
     date = raw.get("date") if isinstance(raw.get("date"), str) else None
     if age > stale_h:
-        return Forecast("stale", raw, date, int(made), age, f"forecast is {age:.1f} h old (limit {stale_h:g} h): weights held")
+        return Forecast("stale", raw, date, int(made), age, f"forecast stale: holding the last weights (it is {age:.1f} h old, limit {stale_h:g} h; risk cuts still apply)")
     return Forecast("fresh", raw, date, int(made), age)
 
 
@@ -1165,15 +1167,18 @@ class Allocator:
 
     # ---- one decision
     async def decide(self, *, dry_run: bool = False, trigger: str = "schedule") -> dict[str, Any]:
-        """One decision. With forecast/latest.json (and a decision model) the computed layer runs; without it the
-        decider-only mapping. With dry_run nothing is written: the record comes back and that is all."""
+        """One decision. With a decision model the computed layer runs; a missing, invalid or stale forecast holds the last
+        weights there (the decider is still asked, its answers still go into the p history) and never falls back to the
+        decider-only mapping. The chat fallback model has its own path. With dry_run nothing is written: the record comes
+        back and that is all."""
         fc = self.load_forecast(self.now_ms()) if self.mode == "decider" else None
-        if fc is None or fc.state == "missing":
+        if fc is None:
             return await self._decide_legacy(dry_run=dry_run, trigger=trigger)
         return await self._decide_computed(fc, dry_run=dry_run, trigger=trigger)
 
     async def _decide_legacy(self, *, dry_run: bool = False, trigger: str = "schedule") -> dict[str, Any]:
-        """Build the context, ask the model, apply the rules and write the controls (decider-only weights)."""
+        """Build the context, ask the model, apply the rules and write the controls: the chat fallback model's allocation.
+        (A decision model never comes here: its weights are computed, or held without a usable forecast.)"""
         async with self._busy:
             now_ms = self.now_ms()
             record: dict[str, Any] = {"t_ms": now_ms, "model": self.model, "trigger": trigger}
@@ -1259,7 +1264,7 @@ class Allocator:
             if not current:
                 current = self._read_current(now_ms)
             ids = list(current)
-            extra.pop("mapping", None)  # the decider-only mapping is not used here
+            extra.pop("mapping", None)  # the decider-only mapping never sets weights
             record.update(extra)
             p_new = (extra.get("answers") or {}).get("p") or {}
             if p_new and not dry_run:
@@ -1543,8 +1548,8 @@ class Allocator:
         floor = [f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in self.floor_errors.values()]
         if floor:  # the drawdown floor could not cut a book: said even while paused
             err = "; ".join(([err] if err else []) + [f"drawdown floor could not write control.json ({'; '.join(floor)})"])
-        weights_mode = {None: "chat", "missing": "decider-only", "fresh": "computed"}.get(fc.state if fc else None, "held")
-        nxt_w = None if fc is None or fc.state == "missing" or paused else latest_weights_slot_ms(now_ms, *self.calc.weights_utc) + DAY_MS
+        weights_mode = {None: "chat", "fresh": "computed"}.get(fc.state if fc else None, "held")
+        nxt_w = None if fc is None or paused else latest_weights_slot_ms(now_ms, *self.calc.weights_utc) + DAY_MS
         write_json_atomic(self.dir / "status.json", {
             "state": "paused" if paused else ("error" if err else "running"),
             "model": self.model, "last_decision_ms": last, "next_decision_ms": nxt,
@@ -1784,8 +1789,6 @@ async def _main(args: argparse.Namespace) -> int:
                 print(format_table(rec))
                 print(f"decider: {rec.get('cost_usd', 0)} usd, error: {rec.get('error')}")
             elif args.dry_run:
-                if rec.get("mode") == "decider":
-                    print("== forecast/latest.json is missing: decider-only mapping ==")
                 print(f"== CONTEXT given to the model ({rec.get('qset')}, {(rec.get('state_bytes') or {}).get('total')} bytes) ==")
                 _jprint(rec.get("inputs"))
                 print("state bytes per block:", json.dumps(rec.get("state_bytes")))
