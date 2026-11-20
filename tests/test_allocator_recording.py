@@ -140,7 +140,7 @@ def test_each_weights_run_records_the_four_paired_policies(root):
     assert pol["core_veto"] == pol["live"]  # kappa 0 and the veto live: live is exactly core plus the veto
     assert pol["live"]["trend"] == pytest.approx(0.1) and pol["core"]["trend"] > 0.3  # the veto halved live trend, not the core
     assert pol["core"]["carry"] == pol["live"]["carry"] and pol["tilt"]["trend"] > pol["core"]["trend"]  # tilt at kappa 1
-    assert jl(root / "allocator" / "policies.jsonl") == [{**{k: vr[k] for k in ("policies", "t_ms", "venue", "policy_state_version")},
+    assert jl(root / "allocator" / "policies.jsonl") == [{**{k: vr[k] for k in ("policies", "policy_enabled", "t_ms", "venue", "policy_state_version")},
                                                           "weights_mode": "computed"}]
 
 
@@ -433,3 +433,19 @@ def test_a_gzip_cut_short_leaves_the_archive_and_its_source_intact(tmp_path, mon
     monkeypatch.undo()
     DL._gzip(src)
     assert not src.exists() and [r["k"] for r in DL._lines(d / "decisions-2027-01-10.jsonl.gz")] == ["a", "b"]
+
+
+def test_a_switched_off_flat_book_is_recorded_without_exposure(root):
+    """The owner switched xsmom off and locked it; the control keeps its weight 0.3. Flat, it holds nothing: every policy
+    records 0 for it (and says it is off). Switched off but still holding positions, it keeps its exposure."""
+    put(root / "forecast" / "latest.json", forecast(T0 - 7200, kappa=0.0))
+    put(root / "xsmom" / "control.json", {"enabled": False, "weight": 0.3, "owner_lock": True})
+    put(root / "xsmom" / "status.json", {"state": "running", "equity_usdt": 1000.0, "start_equity_usdt": 1000.0, "positions": []})
+    vr = decide(_alloc(root), trigger="decide_now")["venues"]["bybit-demo"]
+    assert ctl(root, "xsmom")["weight"] == 0.3
+    assert {k: v["xsmom"] for k, v in vr["policies"].items()} == {"core": 0.0, "live": 0.0, "tilt": 0.0, "core_veto": 0.0}
+    assert {k: v["xsmom"] for k, v in vr["policy_enabled"].items()} == {"core": False, "live": False, "tilt": False, "core_veto": False}
+    put(root / "xsmom" / "status.json", {"state": "running", "equity_usdt": 1000.0, "start_equity_usdt": 1000.0,
+                                         "positions": [{"symbol": "BTCUSDT", "qty": 0.01, "mark_price": 60000.0}]})
+    vr = decide(_alloc(root), trigger="decide_now")["venues"]["bybit-demo"]
+    assert vr["policies"]["live"]["xsmom"] == 0.3  # off, not yet flat: still exposed

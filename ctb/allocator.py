@@ -1395,7 +1395,8 @@ class Allocator:
                                                           {**({"write_failed": failed} if failed else {}),
                                                            **({"final_cap": final_cap} if final_cap else {})})}
             if plan and self.primary.managed and kind != "refresh":
-                self._policy_jobs.append((self.primary, kind, fc, current, ids, p_now, self._held(plan, current, applied, dry_run)))
+                self._policy_jobs.append((self.primary, kind, fc, current, ids, p_now, self._held(plan, current, applied, dry_run),
+                                          self._held_on(plan, current, applied, dry_run)))
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1579,7 +1580,8 @@ class Allocator:
         return {**data, "kappa": 0.0}, dict(p_now), replace(self.calc, rules=replace(self.calc.rules, veto_live=True))
 
     def _policy_record(self, v: AllocVenue, kind: str, fc: Forecast, current: dict[str, Current], covered: list[str],
-                       p_now: dict[str, float | None], live_w: dict[str, float], now_ms: int, dry_run: bool) -> dict[str, Any]:
+                       p_now: dict[str, float | None], live_w: dict[str, float], live_on: dict[str, bool] | None = None, *,
+                       now_ms: int, dry_run: bool) -> dict[str, Any]:
         """The paired policies of one managed venue on a weights run, for its decision record (and policies.jsonl). Each
         shadow policy starts from its own weights (state.json policy_state; the live weights the first time) and its own
         day anchor, and goes through the same executable rules as live: buffer, step, exploration floor, drawdown floor,
@@ -1596,6 +1598,7 @@ class Allocator:
         books = ps["books"]
         day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
         policies: dict[str, dict[str, float]] = {}
+        enabled: dict[str, dict[str, bool]] = {}
         for name in SHADOW_POLICIES:
             key = self.vk(v.id, name)
             book = books.get(key) if isinstance(books.get(key), dict) else {}
@@ -1614,11 +1617,15 @@ class Allocator:
                                     "", None, derive_enabled=tuple(out["opt"]))
             plan = resolve(cur, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct)
             self._final_cap(v, plan, cur, {}, fc)
-            policies[name] = {sid: round(plan.weights[sid], 4) for sid in current}
-            books[key] = {"w": policies[name], "anchor": {"day": day, "w": aw}}
-        policies = {"core": policies["core"], "live": {sid: round(float(live_w[sid]), 4) for sid in current},
-                    "tilt": policies["tilt"], "core_veto": policies["core_veto"]}
-        rec = {"policies": policies, "t_ms": now_ms, "venue": v.id, "policy_state_version": POLICY_STATE_VERSION}
+            books[key] = {"w": {sid: round(plan.weights[sid], 4) for sid in current}, "anchor": {"day": day, "w": aw}}
+            enabled[name] = {sid: bool(plan.enabled[sid]) for sid in current}
+            policies[name] = {sid: self._exposure(plan.weights[sid], enabled[name][sid], cur[sid]) for sid in current}
+        live_on = live_on if live_on is not None else {sid: c.enabled for sid, c in current.items()}
+        enabled["live"] = {sid: bool(live_on.get(sid, current[sid].enabled)) for sid in current}
+        policies["live"] = {sid: self._exposure(float(live_w[sid]), enabled["live"][sid], current[sid]) for sid in current}
+        order = ("core", "live", "tilt", "core_veto")
+        rec = {"policies": {k: policies[k] for k in order}, "policy_enabled": {k: enabled[k] for k in order},
+               "t_ms": now_ms, "venue": v.id, "policy_state_version": POLICY_STATE_VERSION}
         if reset:
             rec["policy_state_reset"] = reset
         if not dry_run:
@@ -1635,6 +1642,19 @@ class Allocator:
             return dict(plan.weights)
         return {sid: (plan.weights[sid] if applied.get(sid) else c.weight) for sid, c in current.items()}
 
+    @staticmethod
+    def _exposure(weight: float, enabled: bool, c: Current) -> float:
+        """The weight a policy's book is exposed at: its weight, except a switched-off book whose status confirms it flat,
+        which holds nothing (a switched-off book that still holds positions keeps its exposure until the runner closes it)."""
+        return 0.0 if not enabled and c.confirmed_flat else round(float(weight), 4)
+
+    @staticmethod
+    def _held_on(plan: Plan, current: dict[str, Current], applied: dict[str, bool], dry_run: bool) -> dict[str, bool]:
+        """The same for enabled."""
+        if dry_run:
+            return dict(plan.enabled)
+        return {sid: (plan.enabled[sid] if applied.get(sid) else c.enabled) for sid, c in current.items()}
+
     def _record_policies(self, venues: dict[str, dict[str, Any]], kind: str, now_ms: int, dry_run: bool) -> str | None:
         """Runs the queued paired-policy recordings after every venue's live writes. Each venue's recording and each
         policies.jsonl line has its own try: a failure (a damaged state, a full disk, a bug) is logged and returned as the
@@ -1648,7 +1668,7 @@ class Allocator:
                 rec = self._policy_record(*job, now_ms=now_ms, dry_run=dry_run)
                 vr.update(rec)
                 if not dry_run:
-                    append_jsonl(self.dir / "policies.jsonl", {**{k: rec[k] for k in ("policies", "t_ms", "venue", "policy_state_version")},
+                    append_jsonl(self.dir / "policies.jsonl", {**{k: rec[k] for k in ("policies", "policy_enabled", "t_ms", "venue", "policy_state_version")},
                                                                "weights_mode": kind})
             except Exception as exc:  # noqa: BLE001 - recording only: it must never reach the live path
                 msg = f"{type(exc).__name__}: {exc}"[:300]
@@ -1778,7 +1798,8 @@ class Allocator:
         if final_cap:
             extra["final_cap"] = final_cap
         if v.managed and kind != "refresh":
-            self._policy_jobs.append((v, kind, fc, current, covered, p_now, self._held(plan, current, applied, dry_run)))
+            self._policy_jobs.append((v, kind, fc, current, covered, p_now, self._held(plan, current, applied, dry_run),
+                                      self._held_on(plan, current, applied, dry_run)))
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:

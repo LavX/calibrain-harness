@@ -198,7 +198,9 @@ budget and the status are written as always. An unusable `policy_state` restarts
   venue, the venue's part of the decision line carries
   `"policies": {"core": {sid: w}, "live": {sid: w}, "tilt": {sid: w}, "core_veto": {sid: w}}` with `t_ms`, `venue` and
   `policy_state_version`. `live` is what the books hold after the writes: the planned weight where it was written, the
-weight the book already had where it was not (owner-locked, a pending kill, paused meanwhile, a failed write). `core` is the inverse-vol core without tilt or veto, `tilt` the core
+weight the book already had where it was not (owner-locked, a pending kill, paused meanwhile, a failed write). Every
+policy's weights are exposures: a switched-off book whose status confirms it flat counts 0 (its control may keep a
+weight), one still holding positions keeps its weight; `policy_enabled` beside `policies` says which books are on. `core` is the inverse-vol core without tilt or veto, `tilt` the core
   with the forecast tilt at kappa 1 and no veto, `core_veto` the core with the decider veto and no tilt. Each shadow
   policy keeps its own weights and day anchor (`state.json` `policy_state`; the live weights the first time) and goes
   through the same rules as live: buffer, step from its own anchor, exploration floor, drawdown floor, owner locks (a
