@@ -149,7 +149,8 @@ equity drops when a spot leg is bought with USDT, which is not a loss. The accou
 all collateral, and "unattributed" compares like with like: the exchange's derivatives unrealised P&L minus the books'
 perp and future legs (markets linear, inverse and future; spot excluded) of the strategies that trade that account
 (`CTB_DASHBOARD_ACCOUNT`); it is unknown when any leg's market or uPnL is unknown. The exchange's positions feed holds
-USDT linear positions only, so the positions panel keeps the books' spot legs next to it. The account comes from the
+USDT linear positions only, so the positions panel keeps the books' spot legs next to it, and the books' legs of
+strategies on another registered account, labelled with that account. The account comes from the
 dashboard's own exchange read (the per-symbol bot's executor), which keeps its last snapshot when a sync fails: on a sync
 error or no good read for 60 s the line is marked STALE with its age, unattributed is not computed, the positions panel
 falls back to the books' legs (and says so), and an "account stale" alert is raised. Other venues show sums over their
@@ -165,7 +166,7 @@ Root: `CTB_LIVE_ROOT`, shared with `ctb.allocator` (default `data/live` in the r
 | `strategies.json` (id, label, unit, account) | runner, at start | dashboard |
 | `<id>/status.json` (at least every 60 s) | runner | dashboard |
 | `<id>/trades.jsonl` | runner | dashboard (last 12 fills) |
-| `<id>/control.json` (enabled, flatten, reset_latch, weight, set_by, owner_lock, reason) | dashboard and allocator | runner |
+| `<id>/control.json` (enabled, flatten, reset_latch, weight, set_by, owner_lock, reason) | dashboard and allocator (one lock per file in the harness); the runner clears flatten and enabled when a flatten is done (not under that lock) | runner |
 | `allocator/status.json`, `allocator/decisions.jsonl` | allocator | dashboard |
 | `allocator/control.json` (enabled, interval_min, decide_now) | dashboard | allocator |
 

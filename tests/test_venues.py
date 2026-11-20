@@ -630,8 +630,11 @@ def test_unattributed_counts_only_the_strategies_on_the_account(roots, tmp_path)
     (roots[0] / "strategies.json").write_text(json.dumps(reg))
     set_status(roots[0], "trend", positions=[{"symbol": "ETHUSDT", "side": "long", "qty": 1, "entry_price": 3000, "mark_price": 3007,
                                               "upnl_usdt": 7.0, "market": "linear"}])
-    a = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(ACCOUNT))["venues"][0]["account"]
+    v = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(ACCOUNT))["venues"][0]
+    a = v["account"]
     assert a["books_unrealised"] == pytest.approx(-5.0) and a["unattributed"] == pytest.approx(29.4)  # trend's +7 is not this account's
+    other = [r for r in v["positions"] if r.get("account") == "demo-other"]  # but its position stays on the page, labelled
+    assert [(r["symbol"], r["source"], r["held_by"]) for r in other] == [("ETHUSDT", "books", ["Trend"])] and "demo-other" in v["positions_note"]
 
 
 def test_a_spot_purchase_does_not_move_any_pnl_today(roots, tmp_path):
@@ -964,3 +967,36 @@ def test_api_kill_turns_the_bots_trading_off_even_when_the_venue_has_not_started
 
     status, body = run(go())
     assert status == 409 and "has not started" in body["error"] and body["bot_auto_trade"] == "off" and eng.s.trading_enabled is False
+
+
+def test_liveness_falls_back_to_the_venues_units_when_strategies_json_names_none(tmp_path):
+    root = tmp_path / "mynew"
+    (root / "trend").mkdir(parents=True)
+    (root / "strategies.json").write_text(json.dumps([{"id": "trend", "label": "Trend"}]))  # no unit per strategy
+    (root / "trend" / "status.json").write_text(json.dumps({"enabled": True, "state": "running", "updated_ms": int(NOW * 1000) - 5000,
+                                                           "equity_usdt": 100.0, "positions": [], "targets": []}))
+    unit = "calibrain-live-mynew.service"  # known only from CTB_LIVE_UNITS (extra units)
+    svc = st.StrategyService(root, run=FakeSystemd(active=[unit]), clock=lambda: NOW, extra_units=(unit,), dashboard_account="",
+                             shares_bot_account=False)
+    h = V.VenueHub([V.venue_config("bybit-demo", tmp_path / "none", unit=""), V.venue_config("mynew-demo", root)],
+                   {"bybit-demo": st.StrategyService(tmp_path / "none", run=FakeSystemd(), clock=lambda: NOW, extra_units=()), "mynew-demo": svc},
+                   state=tmp_path / "state", clock=lambda: NOW)
+    v = run(h.summary())["venues"][1]
+    assert v["presence"] == "live" and v["kill"]["ok"] is True
+    assert run(h.kill("mynew-demo"))["confirmed"] == ["trend"]
+
+
+def test_control_writes_never_share_the_runners_temp_file(roots, tmp_path):
+    seen = []
+    real = st.os.replace
+
+    def spy(src, dst):
+        seen.append(Path(src).name)
+        return real(src, dst)
+
+    st.os.replace = spy
+    try:
+        run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).service("okx-demo").act("trend", "pause", llm_trading=False, venue="demo"))
+    finally:
+        st.os.replace = real
+    assert seen and all(n != "control.json.tmp" and n.startswith(".control.json.") for n in seen)

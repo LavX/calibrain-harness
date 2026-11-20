@@ -34,6 +34,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -188,8 +189,9 @@ def tail_jsonl(path: Path, n: int = TRADES_TAIL) -> list[dict]:
 
 
 def write_control(path: Path, doc: dict) -> None:
-    """Atomic write: the runner never reads half a file."""
-    tmp = path.with_name(path.name + ".tmp")
+    """Atomic write: the runner never reads half a file. The temp name is unique to this process and thread: the runner
+    writes control.json through a fixed control.json.tmp, and two writers sharing one temp file can install a mixed file."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(doc, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 

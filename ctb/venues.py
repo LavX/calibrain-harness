@@ -43,6 +43,7 @@ from typing import Any, Callable
 
 from . import strategies as S
 from .config import ROOT
+from .control_lock import locked
 
 PRIMARY = "bybit-demo"  # the allocator venue
 VID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -146,12 +147,15 @@ def strategy_liveness(cfg: VenueConfig, view: dict, runners: list[dict], now_ms:
     """Is someone acting on this strategy's control.json right now: its own unit (or the venue's) active and its
     status.json fresh. Units may be per strategy (calibrain-live@<id>.service), so this is answered per strategy."""
     unit = view.get("unit") or cfg.unit or None
-    if not unit:  # a fresh status says the runner was alive minutes ago, not that it is alive now to read the flag
+    if unit:
+        u = next((r for r in runners if r.get("unit") == unit), None)
+        if u is None or not S.is_active(u):
+            state = "not installed" if u and u.get("load") == "not-found" else (u or {}).get("active") or "unknown"
+            return False, f"unit {unit} is {state}"
+    elif not runners:  # a fresh status says the runner was alive minutes ago, not that it is alive now to read the flag
         return False, "no runner unit is known for it, so no runner can be confirmed to read the flags"
-    u = next((r for r in runners if r.get("unit") == unit), None)
-    if u is None or not S.is_active(u):
-        state = "not installed" if u and u.get("load") == "not-found" else (u or {}).get("active") or "unknown"
-        return False, f"unit {unit} is {state}"
+    elif not any(S.is_active(r) for r in runners):  # strategies.json names none: the venue's units (CTB_LIVE_UNITS) decide
+        return False, f"no runner unit of the venue is active ({', '.join(r.get('unit', '?') for r in runners)})"
     st = view.get("status")
     if st and st.get("state") == "latched":  # the runner skips a latched strategy before it reads flatten (runner.py, latches)
         return False, "latched: the runner skips it until the latch is reset; the flatten runs after the reset"
@@ -352,6 +356,10 @@ class Baselines:
 
     def sample(self, vid: str, now_s: float, equities: dict[str, float], stale: tuple[str, ...] = ()) -> dict:
         """equities: strategies with a fresh status; stale: strategies whose status is too old to seed a baseline."""
+        with locked(self.path(vid)):  # the sampler and page requests both sample: one read-modify-write at a time
+            return self._sample(vid, now_s, equities, stale)
+
+    def _sample(self, vid: str, now_s: float, equities: dict[str, float], stale: tuple[str, ...]) -> dict:
         day, now_ms = utc_day(now_s), int(now_s * 1000)
         doc = self.get(vid, now_s)
         changed = doc is None
@@ -525,7 +533,7 @@ class VenueHub:
         base = self._sample(cfg, doc, now) if has_registry else None
         rows = [strategy_row(v, base, now_ms) for v in doc["strategies"]]
         entry_units = list(dict.fromkeys(s["unit"] for s in doc["strategies"] if s.get("unit")))
-        wanted = entry_units or ([cfg.unit] if cfg.unit else [])
+        wanted = entry_units or ([cfg.unit] if cfg.unit else []) or [r["unit"] for r in doc["runners"] if r.get("unit")]
         units = [u for u in doc["runners"] if u.get("unit") in wanted]
         pres, why = presence(cfg, has_registry=has_registry, reg_error=doc.get("error"), units=units,
                              statuses=[s.get("status") for s in doc["strategies"]], now_ms=now_ms, n_strategies=len(doc["strategies"]))
@@ -579,7 +587,14 @@ class VenueHub:
                              "stale": False, "sync_error": None, "sync_age_s": None}
         if acct and not acct_stale:
             positions, pos_source = exchange_positions(acct, acct_views), "exchange"
-            pos_note = "the exchange's perp positions plus the books' spot legs" if any(r["source"] == "books" for r in positions) else None
+            notes = ["the exchange's perp positions"] + (["the books' spot legs"] if any(r["source"] == "books" for r in positions) else [])
+            # strategies on another registered account are not in this exchange feed: their books' legs, labelled by account
+            others = [v for v in doc["strategies"] if mine and v.get("account") and v.get("account") != mine]
+            for other in sorted({v["account"] for v in others}):
+                positions += [{**r, "source": "books", "account": other} for r in net_positions([v for v in others if v["account"] == other])]
+            if others:
+                notes.append(f"the books of strategies on {', '.join(sorted({v['account'] for v in others}))}")
+            pos_note = " plus ".join(notes) if len(notes) > 1 else None
         else:
             positions, pos_source = net_positions(doc["strategies"]), "books"
             pos_note = "the exchange read is stale, so these are the books' legs netted per coin and market" if acct else None
@@ -617,7 +632,7 @@ class VenueHub:
         if not reg.entries:  # an empty strategies.json: nothing to flag, same as presence() "not started"
             raise S.StrategyError(409, kill_refusal(cfg, "absent", None))
         # the same "not started" test as presence(): no runner unit known and no strategy has written a status yet
-        if not (any(e.unit for e in reg.entries) or cfg.unit) and not any(S.read_json(cfg.root / e.id / "status.json") for e in reg.entries):
+        if not (reg.units or cfg.unit) and not any(S.read_json(cfg.root / e.id / "status.json") for e in reg.entries):
             raise S.StrategyError(409, kill_refusal(cfg, "absent", None))
         # write first: nothing (a slow systemctl, a broken status file) may delay or stop the flags
         res = svc.kill_all(pause_allocator=vid == self.primary_id)

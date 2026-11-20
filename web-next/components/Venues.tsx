@@ -21,7 +21,7 @@ export type VStrat = {
   unrealised: number | null; last_error: string | null; updated_ms: number | null; last_rebalance_ms: number | null; last_trade_ms: number | null;
   trades_today: number | null;
 };
-export type VPos = { symbol: string; market: string; side: string; size: number | null; entry: number | null; mark: number | null; upnl: number | null; held_by: string[]; legs: number | null; source?: "exchange" | "books" };
+export type VPos = { symbol: string; market: string; side: string; size: number | null; entry: number | null; mark: number | null; upnl: number | null; held_by: string[]; legs: number | null; source?: "exchange" | "books"; account?: string };
 export type VAccount = {
   source: "exchange" | "account.json"; ccy: string; equity: number | null; collateral_usd: number | null; available: number | null; unrealised: number | null;
   /** the books' perp and future legs' uPnL, the like-for-like figure the exchange's unrealised is compared with */
@@ -338,8 +338,8 @@ function PositionsPanel({ doc }: { doc: VenuesDoc }) {
           <table className="t">
             <thead><tr><th>Symbol</th><th className="r">uPnL ({v.ccy})</th><th>Side</th><th className="r">Size</th><th className="r">Entry</th><th className="r">Mark</th><th>Held by</th></tr></thead>
             <tbody>{v.positions.map((p) => (
-              <tr key={`${p.symbol}${p.market}`} className={v.presence !== "live" ? "stale-row" : ""}>
-                <td className="sym">{p.symbol}{p.market && p.market !== "linear" && <span className="tag flat"> {p.market.toUpperCase()}</span>}</td>
+              <tr key={`${p.symbol}:${p.market}:${p.source || ""}:${p.account || ""}`} className={v.presence !== "live" ? "stale-row" : ""}>
+                <td className="sym">{p.symbol}{p.market && p.market !== "linear" && <span className="tag flat"> {p.market.toUpperCase()}</span>}{p.account && <span className="tag flat" data-tip="A strategy on another account: from its book, not the exchange feed"> {p.account}</span>}</td>
                 <td className={`r ${ud(p.upnl)}`}>{sg(p.upnl, 2)}</td>
                 <td><span className={`tag ${p.side === "long" ? "long" : p.side === "short" ? "short" : "flat"}`}>{p.side.toUpperCase()}</span></td>
                 <td className="r">{isNum(p.size) ? Number(p.size).toLocaleString("en-US", { maximumFractionDigits: 6 }) : NA}</td>
