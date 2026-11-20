@@ -7,7 +7,7 @@ const cond = IBM_Plex_Sans_Condensed({ subsets: ["latin"], weight: ["500", "600"
 
 export const metadata: Metadata = {
   title: "Calibrain Harness",
-  description: "Calibrain Harness: forward-test trading on crypto perpetuals with calibrated classification models (Kairos today) on Bybit testnet, and measure whether the model has an edge.",
+  description: "Calibrain Harness: forward-test trading on crypto perpetuals with calibrated classification models and live demo strategies across exchanges, and measure whether there is an edge.",
 };
 
 export const viewport: Viewport = { width: "device-width", initialScale: 1, themeColor: "#000000" };

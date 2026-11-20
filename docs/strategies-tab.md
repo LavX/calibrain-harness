@@ -74,6 +74,92 @@ the newest `allocator/decisions.jsonl` line that carries the `core` breakdown, `
   decider, the series the tilt skill is judged on). The chart needs a forecast archived on or after go-live plus the next
   day's returns, so it starts empty.
 
+## Venues (several exchanges)
+
+One runner per exchange account, each with its own root and systemd user unit. The list comes from configuration, never
+from a directory glob (a quarantined root next to a real one stays invisible):
+
+```
+CTB_LIVE_ROOTS=bybit-demo=<root>,okx-demo=<root>,deribit-test=<root>,bitget-demo=<root>
+```
+
+| Venue id | Label | Unit | Currency | Controlled by |
+| --- | --- | --- | --- | --- |
+| bybit-demo | BYBIT·DEMO | calibrain-live.service | USDT | the LLM allocator |
+| okx-demo | OKX·DEMO | calibrain-live-okx.service | USDT | the owner |
+| deribit-test | DERIBIT·TEST | calibrain-live-deribit.service | USDC | the owner |
+| bitget-demo | BITGET·DEMO | calibrain-live-bitget.service | USDT | the owner |
+
+bybit-demo must be listed: the allocator, the predictions panel and the per-symbol bot's guard stay bound to it, and
+`/api/strategies` (and its actions) are aliases of `/api/venues/bybit-demo/...`. Unset, the dashboard has one venue,
+bybit-demo at `CTB_LIVE_ROOT`, as before. Each venue has a presence: **live** (unit active, a status.json fresher than
+3 min), **stale** (unit active, every status.json older), **stopped** (unit not active), **absent** (no root or no
+strategies.json, an empty one, or no known unit and no status.json yet: "not started") and **error** (strategies.json unusable).
+Two venues may not share a root (refused at startup, like a malformed entry). A strategy whose own unit is down while the
+venue is up raises a "unit down" alert. Unit start times are read as unix seconds and shown in UTC.
+
+Routes: `GET /api/venues` (every venue: presence, books, account, P&L today, strategies, netted positions, alerts),
+`GET /api/venues/{vid}/strategies`, `POST /api/venues/{vid}/strategies/{sid}/{enable|disable|pause|unlock|flatten|reset}`,
+`POST /api/venues/{vid}/runner/{start|stop}`, `POST /api/venues/{vid}/kill`, `POST /api/kill-all`.
+
+KILL always records the owner's intent: it pauses the allocator (bybit-demo), and pauses every strategy of the venue
+(owner-locked) with its flatten flag set, every strategy, also one whose status shows it flat: a status can predate
+a fill or a working order (it lists no orders at all). The answer names a strategy "already flat" only when its runner is
+confirmed live and its own fresh status, written after the runner saw the pause (`enabled: false`), lists positions as an
+empty list and no non-zero target; the flag is still written and that runner clears it on its next loop. A venue that is
+not live never answers 200. Enabling a strategy with a pending flag always needs the owner's cancel, whatever its status
+shows. It then answers 200 only when every written strategy's runner unit is active and
+its status.json is fresh (checked per strategy, since units can be per strategy). Otherwise it answers 409 "written, NOT
+confirmed" naming the strategies nobody may be acting for yet: a hung or restarting runner reads the flags when it comes
+back. A failed write answers 500 with what was and was not written. The flags are written before any systemd call (only
+strategies.json and the status files are read first, to tell a venue that has not started), and a strategy with no known runner unit is never reported confirmed. Neither is a latched strategy: the runner skips a
+latched strategy before it reads `flatten`, so its kill runs only after the latch is reset (the answer, the preview and
+a critical alert say so). A strategy listed in
+strategies.json without a directory is named as not flagged. F1's KILL button applies the same per-strategy test, so its
+preview and the answer agree. Only a venue that has not started, or whose
+strategies.json is unusable, is refused with nothing written. KILL ALL does every venue and reports each one (a venue
+that has not started is skipped) and then switches the per-symbol bot's AUTO-TRADE off. In mode PER-SYMBOL BOT it also
+kills the bot (every position on its account closed, orders cancelled); bybit-demo's strategies are killed as in every
+mode, because that mode pauses them and stops their runner only when the bot trades the same account. In the other modes the bot is not touched on the exchange: its kill closes
+every position on the account, which would close the strategies' netted legs behind their runner. The answer reports
+the bot's part on its own. `/api/kill` (the old header
+button) is the bybit-demo kill in LLM DECIDES and MANUAL.
+
+A pending kill (`flatten: true`) ends in one of two ways only: the runner, once flat, clears the flag itself
+(`research/live/runner.py` `_flatten_clear`: it writes `enabled: false, flatten: false`), or the owner cancels it. The
+card switch, the MANUAL header switch and UNLOCK TO LLM answer 409 "a kill is pending" for such a strategy unless the
+request carries `cancel_kill: true`, which the page sends only after a confirm that says that, if the runner has not
+started closing yet, the positions will not be closed (closes already sent still land). The card also has CANCEL KILL (`/strategies/{sid}/cancel_kill`: flatten cleared, and the strategy paused and
+owner-locked, also when it was an enabled strategy's FLATTEN request). The MANUAL header switch takes `cancel_kill` as the
+list of ids the confirm named; any other target with a pending kill is refused, also when the kill lands while the runner
+is being started (rechecked at the write).
+The allocator never switches on a strategy whose control.json has `flatten: true` (it logs why and skips it). A decision
+that was still running when the allocator was paused (AUTO-TRADE OFF, or a switch to MANUAL or PER-SYMBOL BOT) writes only
+what reduces risk (switching off, a lower weight); the decision feed marks the rest "allocator paused during the decision". The "kill
+pending" alert shows only while the book still holds positions (or is switched on); flat and paused is done.
+UNLOCK TO LLM is refused on an owner-controlled venue (no allocator).
+
+P&L today uses the harness's own 00:00 UTC baseline, one small JSON file per venue under the harness data directory
+(next to the database: `data/venues/baseline-<vid>.json`). A background task samples every minute, so the file is
+written within a minute of midnight while the dashboard runs and survives restarts. Every P&L today figure carries the
+real time of its baseline: "since 00:00 UTC" only for a sample taken in the first 90 s of the UTC day, else "since
+HH:MM UTC" (a 00:04 sample reads 00:04). A strategy first seen later in the day gets its own baseline. Only a fresh status (written
+in the last 3 minutes) seeds a baseline: a runner stopped or hung across midnight would otherwise carry yesterday's
+equity into today, so such a strategy is counted from its first fresh status. A venue whose strategies' baselines differ
+is marked partial with the reason (the harness's first sample of the day was late, a strategy's status was stale until
+later, a strategy appeared later and is counted from then, or a strategy has no fresh status yet). There is no account-level P&L today on bybit-demo: the USDT coin's
+equity drops when a spot leg is bought with USDT, which is not a loss. The account line shows the USDT equity apart from
+all collateral, and "unattributed" compares like with like: the exchange's derivatives unrealised P&L minus the books'
+perp and future legs (markets linear, inverse and future; spot excluded) of the strategies that trade that account
+(`CTB_DASHBOARD_ACCOUNT`); it is unknown when any leg's market or uPnL is unknown. The exchange's positions feed holds
+USDT linear positions only, so the positions panel keeps the books' spot legs next to it, and the books' legs of
+strategies on another registered account, labelled with that account. The account comes from the
+dashboard's own exchange read (the per-symbol bot's executor), which keeps its last snapshot when a sync fails: on a sync
+error or no good read for 60 s the line is marked STALE with its age, unattributed is not computed, the positions panel
+falls back to the books' legs (and says so), and an "account stale" alert is raised. Other venues show sums over their
+books until the runner publishes `<root>/account.json` (read when it exists). The MANUAL header set is kept in the same directory
+(`auto-set-bybit-demo.json`), not in the browser.
+
 ## Files (the contract with the runner)
 
 Root: `CTB_LIVE_ROOT`, shared with `ctb.allocator` (default `data/live` in the repo; on aurora4 the unit sets `/home/lavx/Documents/calibrain-study/data/live`).
@@ -83,7 +169,7 @@ Root: `CTB_LIVE_ROOT`, shared with `ctb.allocator` (default `data/live` in the r
 | `strategies.json` (id, label, unit, account) | runner, at start | dashboard |
 | `<id>/status.json` (at least every 60 s) | runner | dashboard |
 | `<id>/trades.jsonl` | runner | dashboard (last 12 fills) |
-| `<id>/control.json` (enabled, flatten, reset_latch, weight, set_by, owner_lock, reason) | dashboard and allocator | runner |
+| `<id>/control.json` (enabled, flatten, reset_latch, weight, set_by, owner_lock, reason) | dashboard and allocator (one lock per file in the harness); the runner clears flatten and enabled when a flatten is done (not under that lock) | runner |
 | `allocator/status.json`, `allocator/decisions.jsonl` | allocator | dashboard |
 | `allocator/control.json` (enabled, interval_min, decide_now) | dashboard | allocator |
 

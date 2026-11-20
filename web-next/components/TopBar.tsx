@@ -3,11 +3,12 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { post } from "@/lib/api";
 import { loadOverview, selectSymbol, selectTf } from "@/lib/data";
 import { getState, setState, useStore } from "@/lib/store";
-import { age, hhmm, short } from "@/lib/format";
+import { age, NA, short } from "@/lib/format";
 import { MODE_LABEL, headerAuto, switchMode, type StratDoc } from "./Strategies";
+import { killAll, VenueList, type VenuesDoc } from "./Venues";
 
-const CITIES: [string, string][] = [["New York", "America/New_York"], ["London", "Europe/London"], ["Dubai", "Asia/Dubai"], ["Mumbai", "Asia/Kolkata"],
-  ["Singapore", "Asia/Singapore"], ["Hong Kong", "Asia/Hong_Kong"], ["Tokyo", "Asia/Tokyo"], ["Sydney", "Australia/Sydney"], ["UTC", "UTC"]];
+/** One line of clocks: UTC first (every time on screen is UTC), then Budapest and New York. */
+const CITIES: [string, string][] = [["UTC", "UTC"], ["BUD", "Europe/Budapest"], ["NY", "America/New_York"]];
 
 export function useNow(ms = 1000) {
   const [now, setNow] = useState(() => Date.now());
@@ -21,17 +22,12 @@ export function useNow(ms = 1000) {
 export function Clocks() {
   const now = useNow();
   const [fmt] = useState(() => Object.fromEntries(CITIES.map(([, tz]) =>
-    [tz, new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" })])));
-  const [local, setLocal] = useState("");
-  useEffect(() => setLocal(Intl.DateTimeFormat().resolvedOptions().timeZone), []);
+    [tz, new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" })])));
+  const [ready, setReady] = useState(false);
+  useEffect(() => setReady(true), []);
   return (
-    <div className="clocks">
-      {CITIES.map(([c, tz]) => (
-        <div key={tz} className={`clock${tz === local ? " local" : ""}`}>
-          <div className="t" suppressHydrationWarning>{local ? fmt[tz].format(now) : "--:--:--"}</div>
-          <div className="c">{c}{tz === local && <span className="mk">LOCAL</span>}</div>
-        </div>
-      ))}
+    <div className="clocks" suppressHydrationWarning>
+      {CITIES.map(([c, tz], i) => <span key={tz}>{i > 0 && " · "}<span className="c">{c}</span> <b>{ready ? fmt[tz].format(now) : "--:--"}</b></span>)}
     </div>
   );
 }
@@ -47,23 +43,40 @@ function BrandMark() {
   );
 }
 
-/** The auto-trade mode, as the header shows it: "bot" until the strategies are known (an older install without them behaves as before). */
+/** The auto-trade mode, as the header shows it: "unknown" until /api/strategies has answered (never assume the bot), "bot" for
+ * an older install without strategies or an allocator (it behaves as before), else the mode. */
 function modeOf(strat: StratDoc | null): string {
-  return strat && (strat.strategies.length > 0 || strat.allocator?.available) ? strat.mode : "bot";
+  if (!strat) return "unknown";
+  return strat.strategies.length > 0 || strat.allocator?.available ? strat.mode : "bot";
 }
 /** True only in mode "bot". In LLM DECIDES and MANUAL the per-symbol bot is observe-only, so its controls are locked. */
 export const useBotMode = () => useStore((s) => modeOf(s.strat as StratDoc | null) === "bot");
 const botMode = () => modeOf(getState().strat as StratDoc | null) === "bot";
 export const BOT_ONLY_TIP = "per-symbol bot only: switch the header mode to PER-SYMBOL BOT";
 
-/** Groups controls that only the per-symbol bot uses. Outside mode "bot" they are disabled, dimmed and carry the tooltip
- * (a fieldset disables every control inside it, and the wrapper takes the pointer so the tooltip shows on disabled buttons). */
-export function BotOnly({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  const bot = useBotMode();
-  return <fieldset className={`botonly ${bot ? "" : "locked"} ${className}`} disabled={!bot} data-tip={bot ? undefined : BOT_ONLY_TIP}>{children}</fieldset>;
+/** Renders its children only in mode "bot": controls of an inactive mode are hidden, not dimmed. */
+export function BotOnly({ children }: { children: React.ReactNode }) {
+  return useBotMode() ? <>{children}</> : null;
 }
 
-const PLACEHOLDER = "BTC · ETH · SOL · ASK · EVAL · KEYS · HELP";
+const PLACEHOLDER = "BTC · ETH · SOL · MARKET · BOT · STRATEGIES · KEYS · HELP";
+
+/** The per-symbol bot's EXPLORE switch (F9 and the header, mode PER-SYMBOL BOT only). */
+export function ExploreSwitch() {
+  const ov = useStore((s) => s.ov);
+  const onExplore = async (on: boolean) => {
+    if (!botMode()) return;
+    if (on && !confirm(`EXPLORE: the per-symbol bot trades the model's preferred side even when the strict gates say the edge is unproven.\n\nRisk per exploration trade: ${ov?.settings.explore_risk_pct ?? 0.1}% of equity. Safety gates still apply. Orders are only placed while AUTO-TRADE is also on.`)) return;
+    try { await post("/api/settings", { exploration_mode: on }); } catch (err: any) { alert(err.message); }
+    loadOverview();
+  };
+  return (
+    <label className="arm explore" data-tip="Exploration: the per-symbol bot trades the model's preferred side even when strict quality gates block it, at reduced risk. Safety gates still apply.">
+      <input type="checkbox" checked={!!ov?.settings.exploration_mode} onChange={(e) => onExplore(e.target.checked)} />
+      <span className="arm-box" /><span>EXPLORE</span>
+    </label>
+  );
+}
 
 export function CommandBar() {
   const symbol = useStore((s) => s.symbol);
@@ -87,8 +100,9 @@ export function CommandBar() {
     const tfm = ({ "1M": "1", "5M": "5", "15M": "15", "1H": "60", "4H": "240" } as Record<string, string>)[raw];
     const pc = raw.match(/^(?:POS|MAXPOS)\s+(\d+)$/);
     const ttf = raw.match(/^(?:TF|TRADE)\s+(1M|5M|15M|1H)$/);
-    const views: Record<string, any> = { MON: "mon", EVAL: "eval", VALID: "valid", VAL: "valid", STRATEGIES: "strat", STRATS: "strat", TRD: "trades", TRADES: "trades", NEWS: "news", N: "news", LOG: "log" };
-    if ((pc || ttf || raw === "ASK" || raw === "PRB") && !botMode()) return flash(BOT_ONLY_TIP.toUpperCase());
+    const views: Record<string, any> = { MON: "mon", EVAL: "eval", VALID: "valid", VAL: "valid", STRATEGIES: "strat", STRATS: "strat", STRAT: "strat", STRATEGY: "strat",
+      TRD: "trades", TRADES: "trades", NEWS: "news", N: "news", LOG: "log", MARKET: "market", MKT: "market", BOT: "bot" };
+    if ((pc || ttf || raw === "ASK" || raw === "PRB" || raw === "BRACKETS") && !botMode()) return flash(BOT_ONLY_TIP.toUpperCase());
     if (pc) return setPosCap(Number(pc[1]));
     if (ttf) return setState({ modal: { kind: "tf", data: ({ "1M": "1", "5M": "5", "15M": "15", "1H": "60" } as any)[ttf[1]] } });
     if (sym) return selectSymbol(sym);
@@ -96,14 +110,16 @@ export function CommandBar() {
     if (views[raw]) return setState({ view: views[raw] });
     if (raw === "ASK" || raw === "PRB") return ask(raw === "PRB");
     if (raw === "KEYS") return setState({ modal: { kind: "keys" } });
-    if (raw === "STRAT" || raw === "STRATEGY") return setState({ modal: { kind: "strategy" } });
+    if (raw === "BRACKETS") return setState({ modal: { kind: "strategy" } });
     if (raw === "UNIV" || raw === "SYMBOLS" || raw === "SYM") return setState({ modal: { kind: "universe" } });
     if (raw === "HELP" || raw === "?") return setState({ modal: { kind: "help" } });
     flash(`UNKNOWN COMMAND "${raw}" · type HELP`);
   };
 
+  const venues = useStore((s) => s.venues) as VenuesDoc | null;
+  const botVenue = ov?.settings?.venue_label || "the bot's venue";
   const onTrading = async (on: boolean) => {
-    if (on && !confirm(`Enable AUTO-TRADE: the bot will place orders on your ${ov?.settings?.venue_label || "BYBIT TESTNET"} account when ${ov?.kairos?.label || "model"} signals pass all gates.`)) return;
+    if (on && !confirm(`Enable the per-symbol bot's AUTO-TRADE: it will place orders on your ${botVenue} account when ${ov?.kairos?.label || "model"} signals pass all gates.`)) return;
     try {
       await post("/api/trading", { enabled: on });
     } catch (err: any) {
@@ -112,21 +128,25 @@ export function CommandBar() {
     }
     loadOverview();
   };
-  const onExplore = async (on: boolean) => {
-    if (!botMode()) return;
-    if (on && !confirm(`EXPLORE: trade the model's preferred side even when the strict gates say the edge is unproven.\n\nRisk per exploration trade: ${ov?.settings.explore_risk_pct ?? 0.1}% of equity. Safety gates still apply. Orders are only placed while AUTO-TRADE is also on.`)) return;
-    try { await post("/api/settings", { exploration_mode: on }); } catch (err: any) { alert(err.message); }
-    loadOverview();
-  };
-  const onKill = async () => {
-    if (confirm("KILL: close all bot positions on testnet, cancel orders and stop auto-trade?")) {
-      await post("/api/kill");
-      loadOverview();
-    }
-  };
-
   const hasModes = !!strat && (strat.strategies.length > 0 || strat.allocator?.available);
-  const mode = hasModes ? strat!.mode : "bot";
+  const mode = modeOf(strat);
+  const allocVenue = venues?.venues.find((v) => v.id === venues.primary)?.label || "BYBIT·DEMO";
+  const onKill = async () => {
+    if (mode === "bot") {
+      if (confirm(`KILL the per-symbol bot: close all its positions on ${botVenue}, cancel its orders and switch its AUTO-TRADE off?`)) {
+        try { await post("/api/kill"); } catch (err: any) { alert(err.message); }
+        loadOverview();
+      }
+      return;
+    }
+    await killAll(venues);
+  };
+  const autoTip = mode === "unknown" ? "Loading the strategies' state: the switch works once it is known" : mode === "bot"
+    ? `Allow the per-symbol bot to place orders on ${botVenue}`
+    : mode === "llm"
+      ? `${allocVenue} only (the allocator venue). On: the LLM allocator decides which strategies trade there and how much. Off: the allocator pauses and every ${allocVenue} strategy is paused; positions stay open (use KILL to close them). Other venues are switched per strategy on F7.`
+      : `${allocVenue} only. On: the strategies in the header set (F7) are switched on. Off: every ${allocVenue} strategy is paused; positions stay open (use KILL to close them).`;
+
   return (
     <header className="cmdbar">
       <div className="brand" title="Calibrain Harness · forward-testing harness for classification models (under development)">
@@ -135,31 +155,28 @@ export function CommandBar() {
         <span className="brand-tag">BETA</span>
       </div>
       <form className="cmd" autoComplete="off" onSubmit={onSubmit}>
-        <span className="cmd-sec">{symbol ?? "—"} PERP</span>
+        <span className="cmd-sec">{symbol ?? NA} PERP</span>
         <input id="cmd" ref={input} spellCheck={false} placeholder={hint ?? PLACEHOLDER} />
-        <button className="go" type="submit">GO</button>
+        <button className="go" type="submit" data-tip="Run the command (or press Enter)">ENTER</button>
       </form>
       <div className="cmd-right">
-        <BotOnly>
-          <label className="arm explore" data-tip="Exploration: trade the model's preferred side even when strict quality gates block it, at reduced risk. Safety gates still apply.">
-            <input type="checkbox" checked={!!ov?.settings.exploration_mode} onChange={(e) => onExplore(e.target.checked)} />
-            <span className="arm-box" /><span>EXPLORE</span>
-          </label>
-        </BotOnly>
+        <BotOnly><ExploreSwitch /></BotOnly>
         {hasModes && (
-          <span className="seg modeseg" data-tip="Who trades the demo account: the LLM allocator decides which strategies trade (LLM DECIDES), you switch strategies per card (MANUAL), or the older per-symbol LLM bot trades. Only one at a time.">
+          <span className="seg modeseg" data-tip={`Who trades the ${allocVenue} account: the LLM allocator decides which strategies trade (LLM DECIDES), you switch strategies per card (MANUAL), or the older per-symbol LLM bot trades. Only one at a time. Other venues are owner-controlled and not affected.`}>
             {(["llm", "manual", "bot"] as const).map((m) => (
-              <button key={m} className={mode === m ? "on" : ""} onClick={() => switchMode(mode, m)}>{MODE_LABEL[m]}</button>
+              <button key={m} className={mode === m ? "on" : ""} onClick={() => switchMode(mode, m, strat)}>{MODE_LABEL[m]}</button>
             ))}
           </span>
         )}
-        <label className="arm" data-tip={mode === "bot" ? "Allow the bot to place orders on your Bybit testnet account" : mode === "llm" ? "On: the LLM allocator decides which strategies trade on the demo account. Off: allocator paused and every strategy off." : "On: switch the selected strategies on. Off: every strategy off."}>
-          <input type="checkbox" checked={mode === "bot" ? !!ov?.settings.trading_enabled : !!strat?.auto_on}
-            onChange={(e) => (mode === "bot" || !strat ? onTrading(e.target.checked) : headerAuto(strat, e.target.checked))} />
-          <span className="arm-box" /><span>AUTO-TRADE</span>
+        <label className="arm" data-tip={autoTip}>
+          <input type="checkbox" disabled={mode === "unknown"} checked={mode === "bot" ? !!ov?.settings.trading_enabled : !!strat?.auto_on}
+            onChange={(e) => (mode === "bot" ? onTrading(e.target.checked) : strat && headerAuto(strat, e.target.checked, allocVenue))} />
+          <span className="arm-box" /><span>AUTO-TRADE{mode !== "bot" && mode !== "unknown" ? ` · ${allocVenue}` : ""}</span>
         </label>
         <button className="kbtn" onClick={() => setState({ modal: { kind: "keys" } })}>KEYS</button>
-        <button className="kbtn red" onClick={onKill} data-tip="Close bot positions, cancel orders, stop trading">KILL</button>
+        <span data-tip={mode === "bot" ? `Close the per-symbol bot's positions on ${botVenue}, cancel its orders, stop its trading` : !venues ? "Loading the venues: KILL ALL works once they are known (F1 has per-venue KILL)" : "KILL ALL: pause and flag to flatten every venue that has started (per-venue KILL is on F1). The answer says, per venue, whether the runner confirms."}>
+          <button className="kbtn red" disabled={mode === "bot" ? false : !venues} onClick={onKill}>{mode === "bot" ? "KILL" : "KILL ALL"}</button>
+        </span>
       </div>
     </header>
   );
@@ -168,9 +185,10 @@ export function CommandBar() {
 export async function ask(probe: boolean) {
   const sym = getState().symbol;
   if (!sym || !botMode()) return;
-  setState({ cmdHint: `ASKING KAIROS · ${sym}${probe ? " + probes" : ""}…` });
+  setState({ cmdHint: `ASKING THE MODEL · ${sym}${probe ? " + probes" : ""}…` });
   try {
-    await post("/api/decide", { symbol: sym, probe });
+    const r = await post("/api/decide", { symbol: sym, probe });
+    if (r?.skipped) alert(`Not asked: ${r.why || "skipped"}`);
   } catch (e: any) {
     alert(e.message);
   }
@@ -194,7 +212,26 @@ export async function setPosCap(v?: number) {
   }
 }
 
-const VIEWS = [["mon", "F1", "MON"], ["eval", "F2", "EVAL"], ["trades", "F3", "TRADES"], ["news", "F4", "NEWS"], ["log", "F5", "LOG"], ["valid", "F6", "VALID"], ["strat", "F7", "STRATEGIES"]] as const;
+const VIEWS = [["mon", "F1", "STRATEGIES WORLD"], ["eval", "F2", "EVAL"], ["trades", "F3", "TRADES"], ["news", "F4", "NEWS"], ["log", "F5", "LOG"],
+  ["valid", "F6", "VALID"], ["strat", "F7", "STRATEGIES"], ["market", "F8", "MARKET"], ["bot", "F9", "BOT"]] as const;
+
+/** The per-symbol bot's trade timeframe picker (mode PER-SYMBOL BOT only). */
+export function TradeTf() {
+  const st = useStore((s) => s.ov?.settings);
+  if (!st) return null;
+  return (
+    <span className="tradetf" data-tip="How often the per-symbol bot's model is asked and trades are decided. The chart buttons only change the view.">
+      <span className="tt-l">TRADE TF</span>
+      <span className="seg">
+        {Object.entries<any>(st.tf_profiles).map(([tf, p]) => (
+          <button key={tf} className={tf === st.decision_tf ? "on" : ""} onClick={() => setState({ modal: { kind: "tf", data: tf } })}
+            data-tip={`${p.label}: decide every ${p.label} close · hold ≤ ${p.horizon_minutes}m · stop from ${p.atr_tf}m ATR · ~${p.required_rph} model req/h`}>{p.label}</button>
+        ))}
+      </span>
+      <span className="tt-h">hold ≤ {st.horizon_minutes >= 60 ? `${st.horizon_minutes / 60}h` : `${st.horizon_minutes}m`} · stop {st.atr_tf}m ATR</span>
+    </span>
+  );
+}
 
 export function FKeys() {
   const bot = useBotMode();
@@ -206,32 +243,16 @@ export function FKeys() {
         <button key={v} className={view === v ? "on" : ""} onClick={() => setState({ view: v })}><b>{k}</b>{l}</button>
       ))}
       <span className="fk-spacer" />
-      {st && (bot ? (
-        <>
-          <BotOnly className="tradetf-wrap"><span className="tradetf" data-tip="How often the model is asked and trades are decided. The chart buttons only change the view.">
-            <span className="tt-l">TRADE TF</span>
-            <span className="seg">
-              {Object.entries<any>(st.tf_profiles).map(([tf, p]) => (
-                <button key={tf} className={tf === st.decision_tf ? "on" : ""} onClick={() => setState({ modal: { kind: "tf", data: tf } })}
-                  data-tip={`${p.label}: decide every ${p.label} close · hold ≤ ${p.horizon_minutes}m · stop from ${p.atr_tf}m ATR · ~${p.required_rph} model req/h`}>{p.label}</button>
-              ))}
-            </span>
-            <span className="tt-h">hold ≤ {st.horizon_minutes >= 60 ? `${st.horizon_minutes / 60}h` : `${st.horizon_minutes}m`} · stop {st.atr_tf}m ATR</span>
-          </span></BotOnly>
-          <ModelSwitch />
-        </>
-      ) : (
-        <span className="botchip" data-tip={`TRADE TF, hold and stop, and the MODEL picker only drive the per-symbol bot, which is observe-only in this mode. ${BOT_ONLY_TIP}`}>PER-SYMBOL BOT SETTINGS (inactive)</span>
-      ))}
-      {st && <button className="kbtn stratbtn" onClick={() => setState({ modal: { kind: "strategy" } })}
-        data-tip="Brackets, entries, mirror averaging, trade trigger, filters, sizing, drift action">STRATEGY</button>}
-      <span className="venue">VENUE <b>{st?.venue_label || "BYBIT TESTNET"}</b> · SIGNALS <b>BYBIT MAINNET</b> · MODEL <b>{String(st?.model_id || "—").toUpperCase()}</b></span>
+      {st && bot && <span className="tradetf-wrap"><TradeTf /></span>}
+      {st && bot && <span className="tradetf-wrap"><ModelSwitch /></span>}
+      <VenueList />
+      {st && bot && <span className="venue">BOT <b>{st.venue_label || NA}</b> · SIGNALS <b>BYBIT MAINNET</b> · MODEL <b>{String(st.model_id || NA).toUpperCase()}</b></span>}
     </nav>
   );
 }
 
-/** Which classification model makes the decisions. Switching is only allowed while flat and starts a new run. */
-function ModelSwitch() {
+/** Which classification model the per-symbol bot asks. Switching is only allowed while flat and starts a new run. */
+export function ModelSwitch() {
   const st = useStore((s) => s.ov?.settings);
   if (!st?.models) return null;
   const pick = async (provider: string) => {
@@ -251,7 +272,7 @@ function ModelSwitch() {
     loadOverview();
   };
   return (
-    <BotOnly className="tradetf-wrap"><span className="tradetf" data-tip="Classification model that answers the questions. Switching starts a new run.">
+    <span className="tradetf" data-tip="Classification model the per-symbol bot asks. Switching starts a new run.">
       <span className="tt-l">MODEL</span>
       <span className="seg">
         {Object.entries<any>(st.models).map(([p, m]) => (
@@ -259,7 +280,7 @@ function ModelSwitch() {
             data-tip={`${m.label} · ${m.vendor} · ${m.model_id}${m.configured ? "" : " · no key yet"}`}>{m.label.toUpperCase()}</button>
         ))}
       </span>
-    </span></BotOnly>
+    </span>
   );
 }
 
@@ -271,8 +292,8 @@ export function Alerts() {
   if (!ov.kairos.configured) a.push(<div key="k" className="alert"><b>{String(ov.kairos.label || "MODEL").toUpperCase()} KEY NOT SET.</b> Market data is live; no decisions are made. <a href="#" onClick={(e) => { e.preventDefault(); setState({ modal: { kind: "keys" } }); }}>Add key ›</a></div>);
   if (ov.kairos.last_error) a.push(<div key="ke" className="alert crit"><b>{String(ov.kairos.label || "MODEL").toUpperCase()} ERROR</b> {ov.kairos.last_error}</div>);
   if (ov.account?.halted_reason) a.push(<div key="h" className="alert crit"><b>TRADING HALTED</b> {ov.account.halted_reason}</div>);
-  if (ov.executor_error) a.push(<div key="x" className="alert crit"><b>{ov.settings?.venue_label?.replace("BYBIT ", "") || "TESTNET"}</b> {ov.executor_error}</div>);
-  if (!sock) a.push(<div key="s" className="alert"><b>LIVE STREAM RECONNECTING.</b> Prices and the account update again as soon as the socket is back.</div>);
+  if (ov.executor_error) a.push(<div key="x" className="alert crit"><b>{ov.settings?.venue_label || "BOT VENUE"} ACCOUNT</b> {ov.executor_error}</div>);
+  if (!sock) a.push(<div key="s" className="alert"><b>UI SOCKET RECONNECTING.</b> Prices and the account update again as soon as the socket is back.</div>);
   return <div>{a}</div>;
 }
 
@@ -281,8 +302,7 @@ export function StatusLine() {
   const sock = useStore((s) => s.socket);
   const symbol = useStore((s) => s.symbol);
   const mon = useStore((s) => s.mon);
-  const strat = useStore((s) => s.strat) as StratDoc | null;
-  const predAt = useStore((s) => s.pred?.allocator?.t_ms ?? null) as number | null;
+  const venues = useStore((s) => s.venues) as VenuesDoc | null;
   const bot = useBotMode();
   const now = useNow();
   if (!ov) return <footer className="statusline" />;
@@ -290,44 +310,44 @@ export function StatusLine() {
   const row = mon?.rows.find((r: any) => r.symbol === symbol);
   const fund = row?.next_funding_ms ? Math.max(0, row.next_funding_ms - now) / 1000 : null;
   const two = (n: number) => String(n | 0).padStart(2, "0");
-  const fundTxt = fund === null ? "—" : `${two(fund / 3600)}:${two((fund % 3600) / 60)}:${two(fund % 60)}`;
+  const fundTxt = fund === null ? NA : `${two(fund / 3600)}:${two((fund % 3600) / 60)}:${two(fund % 60)}`;
   const Dot = ({ c }: { c: string }) => <span className={`dot ${c}`} />;
   const stale = sock.lastMsg ? (now - sock.lastMsg) / 1000 : null;
   return (
     <footer className="statusline">
-      <span><Dot c={d.ws_connected ? "ok" : "bad"} />BYBIT <b>{d.ws_connected ? "LIVE" : "DOWN"}</b> {Number(d.ws_messages).toLocaleString()} msgs</span>
+      <span data-tip="Bybit mainnet market data (prices, books, flow)"><Dot c={d.ws_connected ? "ok" : "bad"} />BYBIT FEED <b>{d.ws_connected ? "OK" : "DOWN"}</b> {Number(d.ws_messages).toLocaleString()} msgs</span>
       <span data-tip="Browser ⇄ terminal WebSocket. Latency = server push time to screen.">
-        <Dot c={sock.connected && stale !== null && stale < 3 ? "ok" : sock.connected ? "warn" : "bad"} />UI SOCKET <b>{sock.connected ? "LIVE" : "DOWN"}</b>
+        <Dot c={sock.connected && stale !== null && stale < 3 ? "ok" : sock.connected ? "warn" : "bad"} />UI SOCKET <b>{sock.connected ? "OK" : "DOWN"}</b>
         {sock.latencyMs !== null && <> · <b>{sock.latencyMs.toFixed(0)}</b> ms</>}
       </span>
-      <span><Dot c={ov.executor_error ? "bad" : a?.private_stream ? "ok" : "warn"} />{st?.venue_label?.replace("BYBIT ", "") || "TESTNET"} <b>{ov.executor_error ? "OFFLINE" : a?.private_stream ? "STREAMING" : "POLLING"}</b>{a?.last_sync ? ` · sync ${age(now / 1000 - a.last_sync)}` : ""}</span>
       {bot ? (
         <>
+          <span><Dot c={ov.executor_error ? "bad" : a?.private_stream ? "ok" : "warn"} />{st?.venue_label || NA} <b>{ov.executor_error ? "OFFLINE" : a?.private_stream ? "STREAMING" : "POLLING"}</b>{a?.last_sync ? ` · sync ${age(now / 1000 - a.last_sync)} ago` : ""}</span>
           <span><Dot c={!k.configured ? "warn" : k.last_error ? "bad" : "ok"} />{String(k.label || "MODEL").toUpperCase()} <b>{k.configured ? (k.last_error ? "ERROR" : "READY") : "NO KEY"}</b> {k.requests_last_hour}/{k.budget_per_hour} req/h</span>
           {ov.run && <span data-tip={ov.run.name}>RUN <b className="amb">{ov.run.id}</b></span>}
           <span>MODE <b className={a?.trading_enabled ? "up" : ""}>{a?.trading_enabled ? "AUTO-TRADE" : "OBSERVE"}</b>{st.exploration_mode && <b className="amb"> · EXPLORE</b>}</span>
           <span>TRADE TF <b className="amb">{st.tf_profiles[st.decision_tf]?.label || st.decision_tf}</b> · HOLD ≤ <b>{st.horizon_minutes}m</b></span>
           <span>LABELLED <b>{ov.labelled_total}</b></span>
+          <span>{short(symbol || "")} FUNDING IN <b>{fundTxt}</b></span>
         </>
-      ) : <StrategiesStatus doc={strat} predAt={predAt} />}
-      <span>{short(symbol || "")} FUNDING IN <b>{fundTxt}</b></span>
+      ) : <StrategiesStatus doc={venues} />}
       <span style={{ marginLeft: "auto" }} suppressHydrationWarning>UTC <b>{new Date(now).toISOString().slice(11, 19)}</b></span>
     </footer>
   );
 }
 
-/** Status bar in LLM DECIDES and MANUAL: what the strategies are doing. The per-symbol bot's model, run, mode, trade TF and
- * labelled count are left out because that bot is observe-only here and they would read as live trading state. */
-function StrategiesStatus({ doc, predAt }: { doc: StratDoc | null; predAt: number | null }) {
-  if (!doc) return <span>STRATEGIES <b>n/a</b></span>;
-  const running = doc.strategies.filter((s) => s.pill === "running").length;
-  const lastMs = doc.allocator?.status?.last_decision_ms ?? predAt;
+/** Status bar in LLM DECIDES and MANUAL: what the strategies on every venue are doing. */
+function StrategiesStatus({ doc }: { doc: VenuesDoc | null }) {
+  if (!doc) return <span>STRATEGIES <b>{NA}</b></span>;
+  const up = doc.venues.filter((v) => v.presence !== "absent");
+  const sum = (k: "running" | "idle" | "total" | "abnormal") => up.reduce((n, v) => n + v.counts[k], 0);
+  const down = up.filter((v) => v.presence !== "live");
   return (
-    <span data-tip="Strategies that trade the demo account. The per-symbol bot is observe-only in this mode, so its model, run, mode and labelled count are not shown.">
-      STRATEGIES <b className={running ? "up" : ""}>{running}/{doc.strategies.length} running</b>
-      {" · "}AUTO <b className={doc.auto_on ? "up" : ""}>{doc.auto_on ? "ON" : "OFF"}</b>
-      {" · "}ALLOCATOR <b>{MODE_LABEL[doc.mode]}</b>
-      {" · "}LAST DECISION <b>{lastMs ? hhmm(lastMs / 1000) : "none yet"}</b>
+    <span data-tip="Strategies on every venue that has started. The per-symbol bot is inactive in this mode, so its model, run and labelled count are on F9.">
+      STRATEGIES <b>{sum("running")} running · {sum("idle")} idle / {sum("total")}</b> on {up.length} venue{up.length === 1 ? "" : "s"}
+      {sum("abnormal") > 0 && <b className="amb"> · {sum("abnormal")} need attention</b>}
+      {down.length > 0 && <b className="dn"> · {down.map((v) => v.label).join(", ")} not up</b>}
+      {" · "}ALERTS <b className={doc.alerts.some((x) => x.level === "crit") ? "dn" : doc.alerts.length ? "amb" : ""}>{doc.alerts.length}</b>
     </span>
   );
 }

@@ -34,6 +34,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -41,13 +42,22 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .config import ROOT
+from .control_lock import locked
 
 DEFAULT_ROOT = ROOT / "data" / "live"  # the same default as ctb.allocator; on aurora4 CTB_LIVE_ROOT points at the runner's root
 UNIT_RE = re.compile(r"^[A-Za-z0-9_.:-]+(@[A-Za-z0-9_.:-]+)?\.service$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-ACTIONS = ("enable", "pause", "unlock", "flatten", "reset")
+ACTIONS = ("enable", "pause", "unlock", "flatten", "reset", "cancel_kill")
+# A pending kill (control.json flatten: true) ends only when the runner, flat, clears the flag itself (research/live/runner.py
+# _flatten_clear), or when the owner explicitly cancels it. Nothing else may clear it or switch the strategy on over it.
+KILL_PENDING_MSG = ("a kill is pending for {names}: the runner has not reported it flat yet. Cancel the kill first (its positions "
+                    "then stay open), or wait until the runner closes them and clears the flag.")
 MODES = ("llm", "manual", "bot")
 ALLOCATOR = "allocator"  # data/live/allocator/ holds the LLM allocator's files; not a strategy id
+# The one map from strategy id to the short name every screen shows (F1 matrix, F7 cards, alerts). Unknown ids fall back
+# to the label up to its first bracket, then the id.
+SHORT_NAMES = {"carry": "Carry", "dated_carry": "Dated carry", "trend": "Trend", "xsmom": "Momentum", "basis": "Basis",
+               "longvol": "Long-only", "events": "Events"}
 FEED_N = 15
 RUNNER_ACTIONS = ("start", "stop")
 CACHE_S = 15.0
@@ -60,15 +70,23 @@ EQUITY_POINTS = 720
 
 
 class StrategyError(Exception):
-    """A refusal with an HTTP status and a message fit to show the owner."""
+    """A refusal with an HTTP status and a message fit to show the owner. `detail` carries what was done anyway (a kill
+    that wrote its flags but could not confirm the runner reads them), returned next to the message."""
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, detail: dict | None = None) -> None:
         super().__init__(message)
-        self.status, self.message = status, message
+        self.status, self.message, self.detail = status, message, detail or {}
 
 
 def live_root() -> Path:
     return Path(os.environ.get("CTB_LIVE_ROOT") or DEFAULT_ROOT)
+
+
+def short_name(sid: str, label: str = "") -> str:
+    if sid in SHORT_NAMES:
+        return SHORT_NAMES[sid]
+    head = re.split(r"[ (]", label.strip(), maxsplit=1)[0] if label.strip() else ""
+    return head or sid
 
 
 # ------------------------------------------------------------------------------------------------ registry
@@ -171,8 +189,9 @@ def tail_jsonl(path: Path, n: int = TRADES_TAIL) -> list[dict]:
 
 
 def write_control(path: Path, doc: dict) -> None:
-    """Atomic write: the runner never reads half a file."""
-    tmp = path.with_name(path.name + ".tmp")
+    """Atomic write: the runner never reads half a file. The temp name is unique to this process and thread: the runner
+    writes control.json through a fixed control.json.tmp, and two writers sharing one temp file can install a mixed file."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(doc, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
@@ -186,13 +205,16 @@ def clean_status(doc: dict | None) -> dict | None:
     if doc is None:
         return None
     pos = []
-    for p in doc.get("positions") or []:
+    for p in doc.get("positions") if isinstance(doc.get("positions"), list) else []:
         if isinstance(p, dict):
             pos.append({"symbol": str(p.get("symbol", "")), "side": str(p.get("side", "")), "market": str(p.get("market", "")),
                         **{k: _num(p.get(k)) for k in ("qty", "entry_price", "mark_price", "upnl_usdt")}})
     tgt = [{"symbol": str(t.get("symbol", "")), "market": str(t.get("market", "")), "target_qty": _num(t.get("target_qty"))}
-           for t in doc.get("targets") or [] if isinstance(t, dict)]
+           for t in (doc.get("targets") if isinstance(doc.get("targets"), list) else []) if isinstance(t, dict)]
     return {"enabled": bool(doc.get("enabled")), "state": str(doc.get("state") or "error"),
+            # what the runner applied (control.json is only the request): weight, who set it, why, and the owner lock
+            "weight": _num(doc.get("weight")), "set_by": doc.get("set_by") if doc.get("set_by") in ("llm", "owner") else None,
+            "reason": str(doc["reason"])[:500] if doc.get("reason") else None, "owner_lock": bool(doc.get("owner_lock")),
             "updated_ms": _num(doc.get("updated_ms")), "last_rebalance_ms": _num(doc.get("last_rebalance_ms")),
             "next_rebalance_ms": _num(doc.get("next_rebalance_ms")),
             "last_error": str(doc["last_error"])[:500] if doc.get("last_error") else None,
@@ -202,6 +224,11 @@ def clean_status(doc: dict | None) -> dict | None:
             "trades_total": int(doc["trades_total"]) if isinstance(doc.get("trades_total"), int) else None}
 
 
+def is_idle(status: dict) -> bool:
+    """Switched on and running, but holding nothing and wanting nothing: no position, no non-zero target."""
+    return not status["positions"] and not any(t.get("target_qty") for t in status["targets"])
+
+
 def pill(status: dict | None, now_ms: float, runner_active: bool) -> str:
     if status is None:
         return "no_data"
@@ -209,7 +236,9 @@ def pill(status: dict | None, now_ms: float, runner_active: bool) -> str:
         return "stale" if runner_active else "runner_stopped"
     if status["state"] in ("latched", "error"):
         return status["state"]
-    return "running" if status["enabled"] and status["state"] == "running" else "paused"
+    if status["enabled"] and status["state"] == "running":
+        return "idle" if is_idle(status) else "running"
+    return "paused"
 
 
 # ------------------------------------------------------------------------------------------------ systemd
@@ -241,12 +270,19 @@ async def run_cmd(argv: list[str], *, timeout: float = CMD_TIMEOUT_S) -> tuple[i
 
 
 async def unit_state(run: Runner, unit: str) -> dict[str, Any]:
-    rc, out, err = await run(["systemctl", "--user", "show", f"--property={SHOW_PROPS}", "--", unit], timeout=5)
+    """`systemctl --user show` of one unit. Timestamps are asked for as unix seconds ("@1795170550", systemd 248+), so the
+    page can show them in UTC; an older systemd that rejects the flag is asked again without it (host-local text)."""
+    argv = ["systemctl", "--user", "show", "--timestamp=unix", f"--property={SHOW_PROPS}", "--", unit]
+    rc, out, err = await run(argv, timeout=5)
+    if rc != 0 and "=" not in out:
+        rc, out, err = await run([a for a in argv if a != "--timestamp=unix"], timeout=5)
     props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
     if rc != 0 and not props:
         return {"unit": unit, "load": "unknown", "active": "unknown", "error": (err or "systemctl failed").strip()[:200]}
+    since = props.get("ActiveEnterTimestamp", "")
     return {"unit": unit, "load": props.get("LoadState", ""), "active": props.get("ActiveState", ""), "sub": props.get("SubState", ""),
-            "enabled": props.get("UnitFileState", ""), "result": props.get("Result", ""), "since": props.get("ActiveEnterTimestamp", "")}
+            "enabled": props.get("UnitFileState", ""), "result": props.get("Result", ""), "since": since,
+            "since_s": int(since[1:]) if since.startswith("@") and since[1:].isdigit() else None}
 
 
 def is_active(st: dict[str, Any]) -> bool:
@@ -254,7 +290,8 @@ def is_active(st: dict[str, Any]) -> bool:
 
 
 # ------------------------------------------------------------------------------------------------ service
-DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "risk_floor", "error")
+DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "skipped_kill_pending",
+                 "skipped_paused", "risk_floor", "error")
 
 
 def clean_allocator(status: dict | None, control: dict | None, decisions: list[dict]) -> dict[str, Any]:
@@ -262,7 +299,11 @@ def clean_allocator(status: dict | None, control: dict | None, decisions: list[d
     stt = None
     if status is not None:
         stt = {"state": str(status.get("state") or "error"), "model": status.get("model"),
-               **{k: _num(status.get(k)) for k in ("last_decision_ms", "next_decision_ms", "cost_usd_today")},
+               # last/next_weights_ms: when the daily weights were last written and are next due (the hourly decision only
+               # refreshes the decider's p); updated_ms: the loop's last tick
+               **{k: _num(status.get(k)) for k in ("last_decision_ms", "next_decision_ms", "cost_usd_today", "last_weights_ms",
+                                                   "next_weights_ms", "updated_ms")},
+               "weights_mode": status.get("weights_mode") if isinstance(status.get("weights_mode"), str) else None,
                "last_error": str(status["last_error"])[:500] if status.get("last_error") else None}
     ctl = {"enabled": bool(control and control.get("enabled")), "interval_min": int(control["interval_min"]) if control and isinstance(control.get("interval_min"), int) else None,
            "decide_now_pending": bool(control and control.get("decide_now"))}
@@ -273,14 +314,21 @@ def control_view(ctl: dict, st: dict | None) -> dict[str, Any]:
     return {"enabled": bool(ctl["enabled"]) if "enabled" in ctl else (st["enabled"] if st else False),
             "weight": _num(ctl.get("weight")), "set_by": ctl.get("set_by") if ctl.get("set_by") in ("llm", "owner") else None,
             "owner_lock": bool(ctl.get("owner_lock")), "reason": str(ctl["reason"])[:500] if ctl.get("reason") else None,
-            "flatten_pending": bool(ctl.get("flatten")), "reset_pending": bool(ctl.get("reset_latch"))}
+            "flatten_pending": bool(ctl.get("flatten")), "reset_pending": bool(ctl.get("reset_latch")), "updated_ms": _num(ctl.get("updated_ms"))}
 
 
 class StrategyService:
     def __init__(self, root: Path | None = None, run: Runner = run_cmd, clock: Callable[[], float] = time.time,
                  extra_units: tuple[str, ...] | None = None, dashboard_account: str | None = None,
-                 allocator_available: bool = False, allocator: Any = None) -> None:
+                 allocator_available: bool = False, allocator: Any = None, shares_bot_account: bool = True,
+                 auto_set_path: Path | None = None, has_allocator: bool = True) -> None:
         self.root = root if root is not None else live_root()
+        # False for a venue on another exchange (OKX, Deribit, Bitget): the per-symbol bot never trades there, so the
+        # one-mode-at-a-time guard does not apply to its strategies.
+        self.shares_bot_account = shares_bot_account
+        # False for an owner-controlled venue: no LLM allocator writes its controls, so "unlock to the LLM" is refused there.
+        self.has_allocator = has_allocator
+        self.auto_set_path = auto_set_path  # the MANUAL header set, kept by the harness (None: every strategy)
         self.run, self.clock = run, clock
         self.extra_units = extra_units if extra_units is not None else extra_units_from_env()
         self.dashboard_account = dashboard_account if dashboard_account is not None else (os.environ.get("CTB_DASHBOARD_ACCOUNT") or None)
@@ -297,7 +345,7 @@ class StrategyService:
     # ----------------------------------------------------------------- the guard
     def conflicting_units(self, reg: Registry, venue: str) -> list[str]:
         """Runner units that trade the account the bot's own auto-trade would use. Only the demo venue can collide."""
-        if venue != "demo":
+        if venue != "demo" or not self.shares_bot_account:
             return []
         mine = self.dashboard_account
         accounts: dict[str, set[str]] = {}
@@ -331,32 +379,57 @@ class StrategyService:
         reg = self.registry()
         self._write_allocator(enabled=self.mode(reg) == "llm")
 
-    def _write(self, e: Entry, **changes: Any) -> None:
-        """Merge changes into the strategy's control.json (unknown keys the runner may use are kept), atomically."""
+    def _write(self, e: Entry, *, refuse_if_kill: bool = False, require_kill: bool = False, derive: Callable[[dict], dict] | None = None,
+               **changes: Any) -> None:
+        """Merge changes into the strategy's control.json (unknown keys the runner may use are kept), atomically, under the
+        file's lock (ctb.control_lock, shared with the allocator). refuse_if_kill re-checks the kill flag inside the lock, so
+        an enable that awaited (systemctl) in between cannot switch on over a kill written meanwhile; derive computes changes
+        from the current file inside the lock."""
         path = self.root / e.id / "control.json"
-        cur = read_json(path) or {}
-        ctl = {**cur, "enabled": self._enabled(e), "flatten": bool(cur.get("flatten")), "reset_latch": bool(cur.get("reset_latch")),
-               **changes, "updated_ms": int(self.clock() * 1000)}
-        try:
-            write_control(path, ctl)
-        except OSError as exc:
-            raise StrategyError(500, f"cannot write control.json: {exc.strerror or exc}") from exc
+        with locked(path):
+            cur = read_json(path) or {}
+            if refuse_if_kill and cur.get("flatten") is True:  # never cleared here: only the runner (flat) or the owner's cancel ends it
+                raise StrategyError(409, KILL_PENDING_MSG.format(names=e.label), detail={"kill_pending": [e.id]})
+            if require_kill and cur.get("flatten") is not True:  # checked here, at the write: the runner may have just cleared it
+                raise StrategyError(409, f"no kill is pending for {e.label}")
+            ctl = {**cur, "enabled": self._enabled(e), "flatten": bool(cur.get("flatten")), "reset_latch": bool(cur.get("reset_latch")),
+                   **(derive(cur) if derive else {}), **changes, "updated_ms": int(self.clock() * 1000)}
+            try:
+                write_control(path, ctl)
+            except OSError as exc:
+                raise StrategyError(500, f"cannot write control.json: {exc.strerror or exc}") from exc
 
-    def _write_owner(self, e: Entry, enabled: bool) -> None:
-        """The owner flips a switch: the allocator may not change this strategy until it is unlocked."""
-        cur = self._control(e)
-        w = _num(cur.get("weight"))
-        self._write(e, enabled=enabled, owner_lock=True, set_by="owner", reason="owner",
-                    weight=1.0 if enabled and not w else (w if w is not None else 1.0))
+    def _write_owner(self, e: Entry, enabled: bool, *, cancel_kill: bool = False) -> None:
+        """The owner flips a switch: the allocator may not change this strategy until it is unlocked. A pending kill is left
+        alone unless the owner explicitly cancels it (cancel_kill), which clears flatten so the runner does not close the book;
+        without cancel_kill an "on" is refused if a kill is pending when the write happens."""
+        def weight(cur: dict) -> dict:
+            w = _num(cur.get("weight"))
+            return {"weight": 1.0 if enabled and not w else (w if w is not None else 1.0)}
+
+        self._write(e, refuse_if_kill=enabled and not cancel_kill, derive=weight, enabled=enabled, owner_lock=True, set_by="owner",
+                    reason="owner", **({"flatten": False} if cancel_kill else {}))
+
+    def _kill_pending(self, e: Entry) -> bool:
+        return self._control(e).get("flatten") is True
+
+    def _refuse_if_kill_pending(self, entries: list[Entry], cancel_kill: bool) -> None:
+        """A status.json that shows no position does not prove the book flat (it can predate a fill or a working order), so a
+        pending kill is never waved through here: the runner clears it when flat, or the owner cancels it."""
+        pending = [e for e in entries if self._kill_pending(e)]
+        if pending and not cancel_kill:
+            raise StrategyError(409, KILL_PENDING_MSG.format(names=", ".join(e.label for e in pending)),
+                                detail={"kill_pending": [e.id for e in pending]})
 
     def _write_allocator(self, **changes: Any) -> None:
         d = self.root / ALLOCATOR
         try:
             d.mkdir(parents=True, exist_ok=True)
-            cur = read_json(d / "control.json") or {}
-            write_control(d / "control.json", {"enabled": bool(cur.get("enabled")), "interval_min": cur.get("interval_min", 60),
-                                               "decide_now": bool(cur.get("decide_now")), **cur, **changes,
-                                               "updated_ms": int(self.clock() * 1000)})
+            with locked(d / "control.json"):
+                cur = read_json(d / "control.json") or {}
+                write_control(d / "control.json", {"enabled": bool(cur.get("enabled")), "interval_min": cur.get("interval_min", 60),
+                                                   "decide_now": bool(cur.get("decide_now")), **cur, **changes,
+                                                   "updated_ms": int(self.clock() * 1000)})
         except OSError as exc:
             raise StrategyError(500, f"cannot write the allocator's control.json: {exc.strerror or exc}") from exc
 
@@ -454,9 +527,13 @@ class StrategyService:
         if self.mode(reg) == "bot":
             raise StrategyError(409, "the auto-trade mode is PER-SYMBOL BOT. Switch the mode to LLM DECIDES or MANUAL first.")
 
-    async def auto(self, enabled: bool, ids: list[str] | None, *, llm_trading: bool, venue: str) -> dict[str, Any]:
+    async def auto(self, enabled: bool, ids: list[str] | None, *, llm_trading: bool, venue: str,
+                   cancel_kill: bool | list[str] = False) -> dict[str, Any]:
         """The header switch. LLM DECIDES: the allocator on (and the runner running), or the allocator off and every strategy paused.
-        MANUAL: the selected strategies on (owner-locked, runner running), or every strategy off."""
+        MANUAL: the selected strategies on (owner-locked, runner running), or every strategy off. In MANUAL a selected strategy with a
+        pending kill is refused unless cancel_kill names it (a list of the ids the owner confirmed; True means every target); a
+        kill on any other target is refused, also when it lands while the runner is being started (rechecked at the write). The
+        allocator itself never switches on a strategy with a pending kill."""
         reg = self.registry()
         mode = self.mode(reg)
         if mode == "bot":
@@ -469,6 +546,8 @@ class StrategyService:
             return {"ok": True, "enabled": []}
         if reg.error:
             raise StrategyError(409, f"strategies.json is unusable: {reg.error}")
+        if ids is None and mode == "manual":
+            ids = self.auto_set()
         targets = list(reg.entries) if mode == "llm" else [e for e in reg.entries if ids is None or e.id in ids]
         if not targets:
             raise StrategyError(409, "no strategy selected")
@@ -476,6 +555,9 @@ class StrategyService:
             self._may_trade(reg, e, llm_trading=llm_trading, venue=venue)
             if mode == "manual" and not (self.root / e.id).is_dir():
                 raise StrategyError(409, f"{self.root / e.id} does not exist: the runner has not created {e.label} yet")
+        cancel_ids = {e.id for e in targets} if cancel_kill is True else set(cancel_kill or [])
+        if mode == "manual":
+            self._refuse_if_kill_pending([e for e in targets if e.id not in cancel_ids], False)
         if mode == "llm" and not self.allocator_available:
             raise StrategyError(409, "the LLM allocator is not installed in this build (ctb.allocator); use MANUAL")
         await self._ensure_running([e.unit for e in targets if e.unit])
@@ -483,9 +565,33 @@ class StrategyService:
             self._write_allocator(enabled=True)
         else:
             for e in targets:
-                self._write_owner(e, True)
+                self._write_owner(e, True, cancel_kill=e.id in cancel_ids)
         self._cache = None
         return {"ok": True, "enabled": [e.id for e in targets]}
+
+    def auto_set(self) -> list[str] | None:
+        """Strategy ids the header switch turns on in MANUAL mode, or None for every strategy (nothing saved yet)."""
+        if self.auto_set_path is None:
+            return None
+        doc = read_json(self.auto_set_path)
+        ids = doc.get("ids") if doc else None
+        return [str(i) for i in ids if isinstance(i, str)] if isinstance(ids, list) else None
+
+    def set_auto_set(self, ids: Any) -> dict[str, Any]:
+        if self.auto_set_path is None:
+            raise StrategyError(409, "this venue has no header set")
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise StrategyError(400, "ids must be a list of strategy ids")
+        known = {e.id for e in self.registry().entries}
+        if unknown := sorted(set(ids) - known):
+            raise StrategyError(400, f"unknown strategy ids: {', '.join(unknown)}")
+        try:
+            self.auto_set_path.parent.mkdir(parents=True, exist_ok=True)
+            write_control(self.auto_set_path, {"ids": sorted(set(ids)), "updated_ms": int(self.clock() * 1000)})
+        except OSError as exc:
+            raise StrategyError(500, f"cannot save the header set: {exc.strerror or exc}") from exc
+        self._cache = None
+        return {"ok": True, "ids": sorted(set(ids))}
 
     # ----------------------------------------------------------------- reads
     def _read(self, e: Entry) -> dict[str, Any]:
@@ -520,6 +626,7 @@ class StrategyService:
                 doc["allocator"] = alloc
                 doc["strategies"] = [{**v, "control": control_view(self._control_by_id(v["id"]), v["status"])} for v in doc["strategies"]]
                 doc["auto_on"] = alloc["control"]["enabled"] if doc["mode"] == "llm" else any(v["control"]["enabled"] for v in doc["strategies"])
+                doc["auto_set"] = self.auto_set()
                 return doc
             reg = self.registry()
             units = {u: await unit_state(self.run, u) for u in reg.units}
@@ -532,7 +639,7 @@ class StrategyService:
                 u = units.get(e.unit) if e.unit else None
                 runner_active = bool(u and is_active(u))
                 views.append({
-                    "id": e.id, "label": e.label, "unit": e.unit, "account": e.account, "status": st,
+                    "id": e.id, "name": short_name(e.id, e.label), "label": e.label, "unit": e.unit, "account": e.account, "status": st,
                     "pill": pill(st, now * 1000, runner_active),
                     "control": control_view(ctl, st),
                     "trades": r["trades"], "equity_history": self._sample(e.id, now, st["equity_usdt"] if st else None),
@@ -541,7 +648,7 @@ class StrategyService:
             mode = self.mode(reg)
             doc = {"mode": mode, "error": reg.error, "root": str(self.root), "dashboard_account": self.dashboard_account, "generated_at": now,
                    "auto_on": alloc["control"]["enabled"] if mode == "llm" else any(v["control"]["enabled"] for v in views),
-                   "allocator": alloc, "runners": list(units.values()), "strategies": views}
+                   "allocator": alloc, "runners": list(units.values()), "strategies": views, "auto_set": self.auto_set()}
             self._cache = (now, doc)
             return doc
 
@@ -550,23 +657,41 @@ class StrategyService:
         """True when the live strategies (not the per-symbol bot) own the demo account: any mode but "bot"."""
         return self.mode(self.registry()) != "bot"
 
-    def kill_all(self) -> list[str]:
-        """Dashboard kill switch while the strategies own the account: pause the allocator, then pause every strategy
-        (owner-locked) and ask the runner to flatten it. The runner closes positions through its own books."""
+    def kill_all(self, pause_allocator: bool = True) -> dict[str, Any]:
+        """Dashboard kill switch: pause the allocator, then pause every strategy (owner-locked) and ask the runner to
+        flatten it. The runner closes positions through its own books. Always records the owner's intent, whether or not
+        the runner is up (ctb.venues.VenueHub.kill says whether it is confirmed). A failed write does not stop the others.
+        Every strategy gets the flatten flag, also one whose status shows it flat: a status can predate a fill or a working
+        order, and a live runner clears the flag itself on its first loop when the book really is flat.
+        Returns {"written": [flagged ids], "failed": {id or "allocator": why}, "missing": [ids without a directory],
+        "allocator_paused": bool}."""
         reg = self.registry()
-        self._write_allocator(enabled=False)
-        done = []
+        failed: dict[str, str] = {}
+        if pause_allocator:
+            try:
+                self._write_allocator(enabled=False)
+            except StrategyError as exc:
+                failed[ALLOCATOR] = exc.message
+        done: list[str] = []
+        missing: list[str] = []
         for e in reg.entries:
             if not (self.root / e.id).is_dir():
+                missing.append(e.id)  # no directory: nothing to write into; named so the answer can say so
                 continue
-            self._write_owner(e, False)
-            self._write(e, flatten=True, reason="kill switch from the dashboard")
-            done.append(e.id)
+            try:
+                self._write_owner(e, False)
+                self._write(e, flatten=True, reason="kill switch from the dashboard")
+                done.append(e.id)
+            except StrategyError as exc:
+                failed[e.id] = exc.message
         self._cache = None
-        return done
+        return {"written": done, "failed": failed, "missing": missing, "allocator_paused": pause_allocator and ALLOCATOR not in failed}
 
-    async def act(self, sid: str, action: str, *, llm_trading: bool, venue: str) -> dict[str, Any]:
-        """Per-card actions: enable / pause (the Auto trade switch, owner-locked), unlock (back to the LLM), flatten, reset."""
+    async def act(self, sid: str, action: str, *, llm_trading: bool, venue: str, cancel_kill: bool = False) -> dict[str, Any]:
+        """Per-card actions: enable / pause (the Auto trade switch, owner-locked), unlock (back to the LLM), flatten, reset, and
+        cancel_kill (clear a pending kill's flatten flag: the positions stay open). enable and unlock are refused while a kill is
+        pending unless cancel_kill is set (the page asks first, saying the positions will NOT be closed)."""
+        action = "pause" if action == "disable" else action  # "disable" reads better in the venue routes; same switch
         reg = self.registry()
         e = reg.get(sid)
         if e is None or action not in ACTIONS:
@@ -576,13 +701,21 @@ class StrategyService:
         st = clean_status(read_json(self.root / e.id / "status.json"))
         if action == "enable":
             self._may_trade(reg, e, llm_trading=llm_trading, venue=venue)
+            self._refuse_if_kill_pending([e], cancel_kill)
             if e.unit:
                 await self._ensure_running([e.unit])
-            self._write_owner(e, True)
+            self._write_owner(e, True, cancel_kill=cancel_kill)
         elif action == "pause":
             self._write_owner(e, False)
         elif action == "unlock":
-            self._write(e, owner_lock=False, set_by="llm", reason="unlocked: the LLM decides at its next decision")
+            if not self.has_allocator:
+                raise StrategyError(409, "this venue is controlled by the owner: there is no LLM allocator to hand the strategy to")
+            self._refuse_if_kill_pending([e], cancel_kill)
+            self._write(e, refuse_if_kill=not cancel_kill, owner_lock=False, set_by="llm", reason="unlocked: the LLM decides at its next decision",
+                        **({"flatten": False} if cancel_kill else {}))
+        elif action == "cancel_kill":  # cleared, and the strategy paused and owner-locked, as the page's confirm says
+            self._write(e, require_kill=True, flatten=False, enabled=False, owner_lock=True, set_by="owner",
+                        reason="kill cancelled by the owner: positions stay open, paused")
         else:
             if not (e.unit and is_active(await unit_state(self.run, e.unit))):
                 raise StrategyError(409, f"the runner ({e.unit or 'unit unknown'}) is not running, so nobody would act on a {action}. Start it first.")

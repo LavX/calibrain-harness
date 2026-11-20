@@ -1,9 +1,10 @@
 "use client";
 import { useEffect } from "react";
-import { connectSocket, loadDecisions, loadMarket, loadMonitor, loadNews, loadOverview, loadPerf, loadPredictions, loadStrat } from "@/lib/data";
+import { connectSocket, loadDecisions, loadMarket, loadMonitor, loadNews, loadOverview, loadPerf, loadPredictions, loadStrat, loadVenues } from "@/lib/data";
 import { setState, useStore } from "@/lib/store";
 import { Alerts, Clocks, CommandBar, FKeys, StatusLine } from "./TopBar";
-import { MonitorView } from "./Monitor";
+import { BotView, MarketView } from "./Monitor";
+import { WorldView } from "./Venues";
 import { EvalView, LogView, NewsView, TradesView } from "./Views";
 import { Modals } from "./Modals";
 import { ValidationView } from "./Validation";
@@ -27,11 +28,13 @@ export default function Terminal() {
     (async () => {
       await loadOverview().catch(() => {});
       loadStrat().catch(() => {});
+      loadVenues().catch(() => {});
       loadPredictions().catch(() => {});
       await Promise.all([loadMonitor(), loadMarket(), loadDecisions(), loadPerf(), loadNews()].map((p) => p.catch(() => {})));
       stop = [
         connectSocket(),
         every(10_000, loadStrat), // live strategies, allocator and the auto-trade mode
+        every(10_000, loadVenues), // F1: every venue, the matrix, alerts and positions
         every(30_000, loadPredictions), // predictions panel and scoreboard (the server caches 30 s)
         every(10_000, loadOverview), // settings, budgets, labelled count (account itself is pushed)
         every(5_000, loadMonitor), // universe map, macro, tape, headlines, sparklines (ticks are pushed)
@@ -42,7 +45,7 @@ export default function Terminal() {
       ];
     })();
     const onKey = (e: KeyboardEvent) => {
-      const fk = ({ F1: "mon", F2: "eval", F3: "trades", F4: "news", F5: "log", F6: "valid", F7: "strat" } as const)[e.key as "F1"];
+      const fk = ({ F1: "mon", F2: "eval", F3: "trades", F4: "news", F5: "log", F6: "valid", F7: "strat", F8: "market", F9: "bot" } as const)[e.key as "F1"];
       if (fk) {
         e.preventDefault();
         setState({ view: fk });
@@ -69,7 +72,10 @@ export default function Terminal() {
       <Alerts />
       {ready ? (
         <>
-          <MonitorView hidden={view !== "mon"} />
+          {view === "mon" && <WorldView />}
+          {/* always mounted: the chart keeps its candles and the socket keeps watching the selected symbol */}
+          <MarketView hidden={view !== "market"} />
+          {view === "bot" && <BotView />}
           {view === "eval" && <EvalView />}
           {view === "valid" && <ValidationView />}
           {view === "strat" && <StrategiesView />}

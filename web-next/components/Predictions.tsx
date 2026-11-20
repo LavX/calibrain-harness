@@ -3,7 +3,7 @@
 // prediction layer's files (regime, forecast, scores, returns) and the allocator's newest weights line. A missing file shows
 // "not computed yet", never a zero. The panels sit under the allocator panel and above the strategy cards.
 import { useStore } from "@/lib/store";
-import { age, fx, isNum, sg, ud } from "@/lib/format";
+import { age, fx, isNum, NA, sg, ud } from "@/lib/format";
 
 type Feature = { key: string; meaning: string; unit: string; value: number | null };
 type P7 = { state: string; p: number | null; help: string };
@@ -36,11 +36,11 @@ export type PredDoc = {
 
 const KS = ["base", "regime", "ridge", "structural", "decider"] as const;
 const NOT_YET = "not computed yet";
-const pct = (x: number | null | undefined, nd = 1) => (isNum(x) ? sg(x, nd, "%") : "n/a");
-const num = (x: number | null | undefined, nd = 2) => (isNum(x) ? fx(x, nd) : "n/a");
+const pct = (x: number | null | undefined, nd = 1) => (isNum(x) ? sg(x, nd, "%") : NA);
+const num = (x: number | null | undefined, nd = 2) => (isNum(x) ? fx(x, nd) : NA);
 const SIGNED = new Set(["btc_trend", "vol_ratio", "funding_level"]); // the others cannot be negative
 const featValue = (f: Feature) => {
-  if (!isNum(f.value)) return "n/a";
+  if (!isNum(f.value)) return NA;
   const v = Number(f.value) * (f.unit === "pct" ? 100 : 1), suf = f.unit === "pct" ? "%" : "";
   return SIGNED.has(f.key) ? sg(v, f.unit === "pct" ? 1 : 2, suf) : fx(v, f.unit === "pct" ? 1 : 2) + suf;
 };
@@ -64,7 +64,7 @@ function RegimeBlock({ doc }: { doc: PredDoc }) {
             <div key={p.state} className={`pbar ${p.state === r.state ? "now" : ""}`} role="listitem" data-tip={p.help}>
               <span className="pbar-l">{p.state}</span>
               <span className="pbar-t"><span className="pbar-f" style={{ width: `${isNum(p.p) ? Math.round(Number(p.p) * 100) : 0}%` }} /></span>
-              <span className="pbar-v">{isNum(p.p) ? `${(Number(p.p) * 100).toFixed(0)}%` : "n/a"}</span>
+              <span className="pbar-v">{isNum(p.p) ? `${(Number(p.p) * 100).toFixed(0)}%` : NA}</span>
             </div>
           ))}
         </div>
@@ -96,11 +96,11 @@ function ForecastTable({ doc }: { doc: PredDoc }) {
             <tr key={s.id}>
               <td className="sym" data-tip={s.label}>{s.id}</td>
               <td className="r">{num(s.core)}</td>
-              <td className={`r ${ud(s.shadow_tau)}`}>{isNum(s.shadow_tau) ? sg(Number(s.shadow_tau) * 100, 0, "%") : "n/a"}</td>
-              <td className={`r ${ud(s.sr)}`}>{isNum(s.sr) ? sg(s.sr, 2) : "n/a"}</td>
-              {KS.map((k) => <td key={k} className={`r ${ud(s.mu_ann_pct[k])}`}>{k in s.mu_ann_pct ? pct(s.mu_ann_pct[k]) : "n/a"}</td>)}
+              <td className={`r ${ud(s.shadow_tau)}`}>{isNum(s.shadow_tau) ? sg(Number(s.shadow_tau) * 100, 0, "%") : NA}</td>
+              <td className={`r ${ud(s.sr)}`}>{isNum(s.sr) ? sg(s.sr, 2) : NA}</td>
+              {KS.map((k) => <td key={k} className={`r ${ud(s.mu_ann_pct[k])}`}>{k in s.mu_ann_pct ? pct(s.mu_ann_pct[k]) : NA}</td>)}
               <td className={`r ${ud(s.mu_ann_pct.combined)}`}><b>{pct(s.mu_ann_pct.combined)}</b></td>
-              <td className="r">{isNum(s.sigma_ann_pct) ? `${fx(s.sigma_ann_pct, 1)}%` : "n/a"}</td>
+              <td className="r">{isNum(s.sigma_ann_pct) ? `${fx(s.sigma_ann_pct, 1)}%` : NA}</td>
               <td className="r">{num(s.p_decider, 2)}</td>
               <td className="r"><b className="w">{num(s.live_weight)}</b></td>
             </tr>,
@@ -180,7 +180,7 @@ export function ScoreboardPanel() {
             <b>{t.line}</b>
             <div className="pred-prog" aria-hidden="true"><span style={{ width: `${Math.min(100, Math.round((t.n_days / t.days_needed) * 100))}%` }} /></div>
             <span className="muted">
-              kappa {num(t.kappa)} · tilt skill (shadow tilted minus core): 90-day {isNum(t.skill_90_ann_pct) ? `${pct(t.skill_90_ann_pct, 2)}/yr` : "n/a"}, 180-day {isNum(t.skill_180_ann_pct) ? `${pct(t.skill_180_ann_pct, 2)}/yr` : "n/a"}
+              kappa {num(t.kappa)} · tilt skill (shadow tilted minus core): 90-day {isNum(t.skill_90_ann_pct) ? `${pct(t.skill_90_ann_pct, 2)}/yr` : NA}, 180-day {isNum(t.skill_180_ann_pct) ? `${pct(t.skill_180_ann_pct, 2)}/yr` : NA}
               {!isNum(t.skill_90_ann_pct) ? " (a window has no value until it has all its days)" : ""}
             </span>
           </div>
@@ -196,17 +196,17 @@ export function ScoreboardPanel() {
               <tbody>{sb.per_strategy.map((s) => (
                 <tr key={s.id}>
                   <td className="sym">{s.id}</td>
-                  {KS.map((k) => <td key={k} className="r">{k in s.loss || k in s.weight ? <>{isNum(s.loss[k]) ? fx(s.loss[k], 3) : "n/a"} <span className="muted">/ {isNum(s.weight[k]) ? fx(s.weight[k], 2) : "n/a"}</span></> : <span className="muted">n/a</span>}</td>)}
-                  <td className={`r ${isNum(s.brier) && isNum(s.brier_base) ? (s.brier < s.brier_base ? "up" : "dn") : ""}`}>{isNum(s.brier) ? fx(s.brier, 3) : "n/a"}</td>
-                  <td className="r">{isNum(s.brier_base) ? fx(s.brier_base, 3) : "n/a"}</td>
-                  <td className="r">{s.n_brier ?? "n/a"}{s.decider_no_skill ? <span className="tag err" data-tip="No better than the base rate after 30 scored days: the decider's weight is held at the floor"> NO SKILL</span> : null}</td>
-                  <td className="r">{s.n_scored ?? "n/a"}</td>
+                  {KS.map((k) => <td key={k} className="r">{k in s.loss || k in s.weight ? <>{isNum(s.loss[k]) ? fx(s.loss[k], 3) : NA} <span className="muted">/ {isNum(s.weight[k]) ? fx(s.weight[k], 2) : NA}</span></> : <span className="muted">{NA}</span>}</td>)}
+                  <td className={`r ${isNum(s.brier) && isNum(s.brier_base) ? (s.brier < s.brier_base ? "up" : "dn") : ""}`}>{isNum(s.brier) ? fx(s.brier, 3) : NA}</td>
+                  <td className="r">{isNum(s.brier_base) ? fx(s.brier_base, 3) : NA}</td>
+                  <td className="r">{s.n_brier ?? NA}{s.decider_no_skill ? <span className="tag err" data-tip="No better than the base rate after 30 scored days: the decider's weight is held at the floor"> NO SKILL</span> : null}</td>
+                  <td className="r">{s.n_scored ?? NA}</td>
                 </tr>
               ))}</tbody>
             </table>
           </div>
         )}
-        <div className="ph sub"><span className="code">LIVE</span>Live P&amp;L against the modelled shadow since go-live ({doc.go_live})
+        <div className="ph sub"><span className="code">PNL</span>Demo P&amp;L against the modelled shadow since go-live ({doc.go_live})
           <span className="ph-r">shadow = returns/&lt;id&gt;.csv, weight 1, to yesterday; live = status.json since the book started</span></div>
         {doc.pnl.length ? (
           <div className="pred-scroll">

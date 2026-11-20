@@ -74,6 +74,7 @@ import aiohttp
 from . import allocator_context as X
 from . import allocator_math as M
 from .config import ROOT, Settings
+from .control_lock import locked
 from .kairos.allocator_prompt import REASONING_MAX_CHARS, build_messages, build_schema, retry_messages
 from .kairos.allocator_questions import (BEST_QID, NONE_ID, QUESTION_SET_VERSION, SCORED_QSETS, MappingParams, batches,
                                          build_questions, map_answers, pos_qid)
@@ -666,6 +667,8 @@ class Allocator:
         # mode "decider": llm.ask(state, questions) answers alloc-v1.0; mode "chat": llm.ask_json(messages, schema) answers a JSON
         # allocation. Unset: chat when the client has ask_json, else decider (create_allocator always sets it).
         self.root = Path(root)
+        self._kill_skips: list[str] = []  # the last _apply: strategies not switched on because a kill is pending
+        self._paused_skips: list[str] = []  # the last _apply: not written because the allocator was paused meanwhile
         self.llm = llm
         self.market = market
         self.model = model
@@ -1002,20 +1005,38 @@ class Allocator:
         """Read-modify-write one strategy's control.json. Returns False when the owner locked it
         (checked again here, right before the write)."""
         path = self.root / sid / "control.json"
-        ctl = read_json(path)
-        ctl = ctl if isinstance(ctl, dict) else {}
-        if ctl.get("owner_lock") is True:
-            return False
-        ctl.update({"enabled": enabled, "weight": weight, "set_by": "llm", "reason": reason[:REASONING_MAX_CHARS],
-                    "updated_ms": now_ms})
-        if flatten_on_zero:
-            ctl["flatten_on_zero"] = True
-        write_json_atomic(path, ctl)
+        with locked(path):  # one read-modify-write at a time per file, shared with the dashboard (ctb.control_lock)
+            ctl = read_json(path)
+            ctl = ctl if isinstance(ctl, dict) else {}
+            if ctl.get("owner_lock") is True:
+                return False
+            if enabled and ctl.get("flatten") is True:  # a pending kill or flatten ends when the runner, flat, clears it, or the owner cancels it
+                log.info("allocator: %s not switched on: a kill or flatten is pending (control.json flatten true)", sid)
+                self._kill_skips.append(sid)
+                return False
+            # A decision can take minutes (the model call); the owner may have paused the allocator meanwhile (AUTO-TRADE OFF, or
+            # a switch to MANUAL or PER-SYMBOL BOT). Read its control again here, at the write: while paused only a write that
+            # reduces risk goes through (switching off, or a lower weight on a strategy that is on), never an enable or a raise.
+            if not self.control()["enabled"]:
+                cur_on = ctl.get("enabled") is True
+                cur_w = _num(ctl.get("weight"))
+                reducing = (not enabled) or (cur_on and cur_w is not None and weight <= cur_w + 1e-12)
+                if not reducing:
+                    log.info("allocator: %s not written: the allocator was paused while this decision ran", sid)
+                    self._paused_skips.append(sid)
+                    return False
+            ctl.update({"enabled": enabled, "weight": weight, "set_by": "llm", "reason": reason[:REASONING_MAX_CHARS],
+                        "updated_ms": now_ms})
+            if flatten_on_zero:
+                ctl["flatten_on_zero"] = True
+            write_json_atomic(path, ctl)
         return True
 
     def _apply(self, plan: Plan, current: dict[str, Current], reasons: dict[str, str], now_ms: int, *,
                refresh_reasons: bool = False) -> dict[str, bool]:
         applied: dict[str, bool] = {}
+        self._kill_skips = []  # filled by _write_control: strategies not switched on because a kill is pending
+        self._paused_skips = []  # and those not written because the allocator was paused while the decision ran
         for sid, c in current.items():
             if sid in plan.skipped_owner_lock:
                 applied[sid] = False
@@ -1104,6 +1125,8 @@ class Allocator:
                 "requested": {"weights": decision.weights, "enabled": decision.enabled} if decision else None,
                 "mode": self.mode,
                 "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
+                "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                "skipped_paused": [x for x in self._paused_skips if x in applied],
                 "risk_floor": plan.floored if plan else [], "step_limited": plan.step_limited if plan else [],
                 "explore_floor": explored,
                 "error": error, "dry_run": dry_run,
@@ -1178,6 +1201,8 @@ class Allocator:
                 "weights": plan.weights if plan else {}, "enabled": plan.enabled if plan else {},
                 "reasoning": why, "confidence": None, "requested": None, "mode": self.mode, "weights_mode": kind,
                 "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
+                "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                "skipped_paused": [x for x in self._paused_skips if x in applied],
                 "risk_floor": plan.floored if plan else [],
                 "step_limited": next((st["changed"] for st in (calc_out or {}).get("steps", []) if st["step"] == "step"), []),
                 "p_decider": p_now,
@@ -1236,7 +1261,9 @@ class Allocator:
             applied = self._apply(partial, {s: current[s] for s in todo}, reasons, now_ms)
             record = {"t_ms": now_ms, "model": "risk-floor", "trigger": "risk", "weights": plan.weights, "enabled": plan.enabled,
                       "reasoning": "; ".join(reasons.values()), "inputs": {"drawdown_pct": {s: _r(current[s].drawdown_pct, 2) for s in todo}},
-                      "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock, "risk_floor": todo, "attempts": 0}
+                      "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock,
+                      "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                "skipped_paused": [x for x in self._paused_skips if x in applied], "risk_floor": todo, "attempts": 0}
             append_jsonl(self.dir / "decisions.jsonl", record)
             self._save_state()
             return record
@@ -1310,10 +1337,11 @@ class Allocator:
         last = _num(st.get("last_decision_ms"))
         due = last is None or now_ms >= last + ctl["interval_min"] * 60_000
         if ctl["decide_now"]:
-            raw = read_json(self.dir / "control.json")
-            raw = raw if isinstance(raw, dict) else {}
-            raw["decide_now"] = False
-            write_json_atomic(self.dir / "control.json", raw)
+            with locked(self.dir / "control.json"):  # the dashboard writes this file too (pause, interval)
+                raw = read_json(self.dir / "control.json")
+                raw = raw if isinstance(raw, dict) else {}
+                raw["decide_now"] = False
+                write_json_atomic(self.dir / "control.json", raw)
             await self.decide(trigger="decide_now")
         elif self.mode == "decider" and self.load_forecast(now_ms).state == "fresh" and self.weights_due(now_ms):
             await self.decide(trigger="daily")  # the 23:50 UTC slot (or the first run): ask the decider, then set the weights

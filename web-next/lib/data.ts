@@ -14,6 +14,14 @@ export async function loadOverview() {
 export async function loadStrat() {
   setState({ strat: await api("/api/strategies") });
 }
+export async function loadVenues() {
+  setState({ venues: await api("/api/venues") });
+}
+/** F7 on a venue other than the allocator venue (that one is loadStrat, which the header also reads). */
+export async function loadVenueStrat(vid: string) {
+  const doc = await api(`/api/venues/${encodeURIComponent(vid)}/strategies`);
+  setState((s) => ({ venueStrat: { ...s.venueStrat, [vid]: doc } }));
+}
 export async function loadPredictions() {
   setState({ pred: await api("/api/predictions") });
 }

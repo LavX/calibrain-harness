@@ -491,8 +491,9 @@ def test_allocator_loop_writes_strategy_controls_only_in_llm_mode(root):
 def test_kill_switch_in_strategies_mode_flattens_through_the_runner(root):
     s = svc(root, FakeSystemd(), mode="manual")
     assert s.owns_account()
-    done = s.kill_all()
-    assert done
+    out = s.kill_all()
+    done = out["written"]
+    assert done and out["failed"] == {} and out["allocator_paused"] is True
     for sid in done:
         ctl = json.loads((root / sid / "control.json").read_text())
         assert ctl["enabled"] is False and ctl["owner_lock"] is True and ctl["flatten"] is True

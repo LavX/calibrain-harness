@@ -27,6 +27,7 @@ from . import predictions as pred_mod
 from . import strategies as strat_mod
 from . import universe as universe_mod
 from . import venue as venue_mod
+from . import venues as venues_mod
 
 log = logging.getLogger("ctb.server")
 NEXT_OUT = ROOT / "web-next" / "out"
@@ -95,16 +96,64 @@ async def same_origin_only(request: web.Request, handler):
             return j({"error": "cross-origin request refused"}, 403)
         if not request.content_type.startswith("application/json"):
             return j({"error": "Content-Type must be application/json"}, 415)
-    return await handler(request)
+    try:
+        return await handler(request)
+    except json.JSONDecodeError:  # a handler's `await req.json()` on a malformed or empty body: the client's error, not ours
+        return j({"error": "the request body is not valid JSON"}, 400)
 
 
-def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = None) -> web.Application:
+VENUE_SAMPLE_S = 60.0  # the venue sampler: 00:00 UTC baselines and sparklines fill even with no browser open
+
+
+def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = None,
+             hub: venues_mod.VenueHub | None = None) -> web.Application:
     s = engine.s
     app = web.Application(middlewares=[dev_cors, same_origin_only])
     routes = web.RouteTableDef()
-    strat = strategies_svc or strat_mod.StrategyService()
+    # Venues (CTB_LIVE_ROOTS): one strategy service per runner root. The allocator, the predictions panel and the per-symbol
+    # bot's guard stay bound to bybit-demo (hub.primary); the old /api/strategies routes are its aliases.
+    hub = hub or (venues_mod.VenueHub.single(strategies_svc) if strategies_svc else venues_mod.VenueHub.from_env())
+    strat = hub.primary
     preds = pred_mod.PredictionsService(root=strat.root)
     engine.strategies_own_account = strat.owns_account  # the per-symbol bot makes no model decisions while the strategies own the account
+
+    def bot_account() -> dict | None:
+        """The per-symbol bot's exchange account, only when it is the Bybit demo account (the strategies' venue)."""
+        ex = getattr(engine, "executor", None)
+        if ex is None or not hasattr(ex, "account_view") or venue_mod.name() != "demo":
+            return None
+        try:
+            return ex.account_view()
+        except Exception:  # noqa: BLE001 - the venues page must not fail on the bot's account
+            return None
+
+    async def cancel_kill(req: web.Request) -> bool:
+        """The explicit owner choice to cancel a pending kill, sent by the page only after a confirm. No body means no; a
+        malformed body is the client's error (the middleware answers 400)."""
+        if not req.can_read_body:
+            return False
+        body = await req.json()
+        return isinstance(body, dict) and body.get("cancel_kill") is True
+
+    async def bot_kill(ex: Any, reason: str) -> dict[str, Any]:
+        """The per-symbol bot's kill, verified. Executor.kill logs a failed close and ignores a failed cancel, so its return
+        proves nothing: the account is read again and the answer says what is still open (or that it could not be read)."""
+        try:
+            await ex.kill(reason)
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            return {"killed": False, "why": f"per-symbol bot kill failed: {exc}"}
+        await ex.sync()  # a fresh account read (sync keeps the old snapshot and sets sync_error when it fails)
+        if ex.sync_error:
+            return {"killed": False, "why": f"per-symbol bot: kill sent, but the account could not be read back to verify it ({ex.sync_error})"}
+        left = [str(p.get("symbol", "?")) for p in ex.positions]
+        orders = len(ex.open_orders)
+        if left or orders:
+            return {"killed": False, "why": (f"per-symbol bot: still open after the kill: {len(left)} positions ({', '.join(left) or 'none'}), "
+                                             f"{orders} open orders. A close may still be filling; check F9 and kill again.")}
+        return {"killed": True, "why": "per-symbol bot: verified on a fresh account read: no positions, no open orders, trading off"}
+
+    def refused(exc: strat_mod.StrategyError) -> web.Response:
+        return j({"error": exc.message, **exc.detail}, exc.status)
 
     def bot_only() -> web.Response | None:
         """409 when the strategies own the demo account (mode is not "bot"); None when the old bot's settings may change."""
@@ -308,10 +357,96 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     # ---------------------------------------------------------------- live demo strategies
     @routes.get("/api/strategies")
     async def strategies_get(_: web.Request) -> web.Response:
-        doc = dict(await strat.snapshot())
+        """Alias of /api/venues/bybit-demo/strategies (the allocator venue)."""
+        doc = await hub.venue_doc(hub.primary_id, account=bot_account())
         doc["venue"] = venue_mod.name()
         doc["llm_trading_enabled"] = bool(s.trading_enabled)
         return j(doc)
+
+    # ---------------------------------------------------------------- venues (one runner root per exchange account)
+    @routes.get("/api/venues")
+    async def venues_get(_: web.Request) -> web.Response:
+        return j(await hub.summary(bot_account()))
+
+    @routes.get("/api/venues/{vid}/strategies")
+    async def venue_strategies(req: web.Request) -> web.Response:
+        try:
+            doc = await hub.venue_doc(req.match_info["vid"], account=bot_account())
+        except strat_mod.StrategyError as exc:
+            return refused(exc)
+        doc["venue"] = venue_mod.name()
+        doc["llm_trading_enabled"] = bool(s.trading_enabled)
+        return j(doc)
+
+    @routes.post("/api/venues/{vid}/strategies/{sid}/{action}")
+    async def venue_strategy_act(req: web.Request) -> web.Response:
+        try:
+            svc = hub.service(req.match_info["vid"])
+            return j(await svc.act(req.match_info["sid"], req.match_info["action"], llm_trading=bool(s.trading_enabled),
+                                   venue=venue_mod.name(), cancel_kill=await cancel_kill(req)))
+        except strat_mod.StrategyError as exc:
+            return refused(exc)
+
+    @routes.post("/api/venues/{vid}/runner/{action}")
+    async def venue_runner_act(req: web.Request) -> web.Response:
+        body = await req.json()
+        try:
+            svc = hub.service(req.match_info["vid"])
+            return j(await svc.runner_act(str(body.get("unit", "")) if isinstance(body, dict) else "", req.match_info["action"],
+                                          llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+        except strat_mod.StrategyError as exc:
+            return refused(exc)
+
+    @routes.post("/api/venues/{vid}/kill")
+    async def venue_kill(req: web.Request) -> web.Response:
+        """Pause and flag to flatten every strategy of one venue (and the allocator on bybit-demo). 200 when the runner
+        confirms; 409 "written, NOT confirmed" when it is down or stale; 409 with nothing written when the venue has not
+        started or its strategies.json is unusable."""
+        try:
+            out = await hub.kill(req.match_info["vid"])
+        except strat_mod.StrategyError as exc:
+            engine.emit("event", engine.db.event("warn", "killed", f"kill: {exc.message}"))
+            return refused(exc)
+        engine.emit("event", engine.db.event("warn", "killed", f"{out['label']} kill: strategies flattening: {', '.join(out['flattening'])}"))
+        return j(out)
+
+    @routes.post("/api/kill-all")
+    async def kill_all(_: web.Request) -> web.Response:
+        """Every venue that has started gets its kill flags written and says whether that is confirmed (bybit-demo too, in
+        every mode: switching to PER-SYMBOL BOT pauses its strategies only when they share the bot's account, so nothing is
+        assumed), and the per-symbol bot is killed when the header mode is PER-SYMBOL BOT: its positions closed, orders
+        cancelled, trading off, reported on its own ("bot"). Outside that mode the bot is not touched on the exchange:
+        Executor.kill closes every position on its account, which can be the strategies' account with their netted legs."""
+        bot_mode = not strat.owns_account()
+        bot_open = bool(engine.db.one("SELECT id FROM trades WHERE status IN ('open','opening') LIMIT 1"))
+        out = await hub.kill_all()
+        ex = getattr(engine, "executor", None)
+        if bot_mode and ex is not None:
+            bot = await bot_kill(ex, "dashboard KILL ALL")
+        elif bot_mode:
+            bot = {"killed": False, "why": "per-symbol bot: no executor (no keys for its venue), nothing to close"}
+        elif bot_open:
+            bot = {"killed": False, "why": ("per-symbol bot has open trades but the strategies own the account: not closed here, "
+                                            "because closing a symbol would close the strategies' netted legs too")}
+        else:
+            bot = {"killed": False, "why": "per-symbol bot is not active and holds no trades"}
+        s.trading_enabled = False
+        out["bot"] = {**bot, "auto_trade": "off"}
+        out["bot_auto_trade"] = "off"
+        if bot_mode or bot_open:
+            out["ok"] = out["ok"] and bot["killed"]
+        msg = "; ".join(f"{r['label']}: {'flattening ' + ', '.join(r['flattening']) if r['ok'] else r['error']}" for r in out["venues"]) + f"; {bot['why']}"
+        engine.emit("event", engine.db.event("warn", "killed", f"kill all: {msg}"))
+        return j(out)
+
+    @routes.post("/api/strategies/auto-set")
+    async def auto_set(req: web.Request) -> web.Response:
+        """The strategies the header AUTO-TRADE switch turns on in MANUAL mode, kept by the harness (not the browser)."""
+        body = await req.json()
+        try:
+            return j(strat.set_auto_set(body.get("ids") if isinstance(body, dict) else None))
+        except strat_mod.StrategyError as exc:
+            return refused(exc)
 
     @routes.get("/api/predictions")
     async def predictions_get(_: web.Request) -> web.Response:
@@ -322,9 +457,9 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     async def strategies_act(req: web.Request) -> web.Response:
         try:
             return j(await strat.act(req.match_info["sid"], req.match_info["action"],
-                                     llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+                                     llm_trading=bool(s.trading_enabled), venue=venue_mod.name(), cancel_kill=await cancel_kill(req)))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.post("/api/mode")
     async def trading_mode(req: web.Request) -> web.Response:
@@ -334,7 +469,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         try:
             out = await strat.set_mode(str(body.get("mode", "")) if isinstance(body, dict) else "", venue=venue_mod.name(), bot_open=bot_open)
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
         if out["llm_off"] and s.trading_enabled:
             s.trading_enabled = False
             engine.emit("event", engine.db.event("warn", "trading_toggled", "per-symbol bot auto-trade switched OFF: the mode is no longer PER-SYMBOL BOT"))
@@ -348,9 +483,11 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         ids = body.get("ids")
         try:
             return j(await strat.auto(bool(body.get("enabled")), [str(i) for i in ids] if isinstance(ids, list) else None,
-                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name(),
+                                      cancel_kill=([str(i) for i in body["cancel_kill"]] if isinstance(body.get("cancel_kill"), list)
+                                                   else body.get("cancel_kill") is True)))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.get("/api/allocator")
     async def allocator_status(req: web.Request) -> web.Response:
@@ -376,7 +513,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         try:
             return j(await strat.allocator_act(req.match_info["action"], body.get("interval_min") if isinstance(body, dict) else None))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.post("/api/runner/{action}")
     async def runner_act(req: web.Request) -> web.Response:
@@ -385,7 +522,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             return j(await strat.runner_act(str(body.get("unit", "")) if isinstance(body, dict) else "", req.match_info["action"],
                                             llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.post("/api/close")
     async def close(req: web.Request) -> web.Response:
@@ -401,14 +538,21 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     @routes.post("/api/kill")
     async def kill(_: web.Request) -> web.Response:
         if strat.owns_account():  # the runner owns the positions: flatten through its books, never behind its back
-            s.trading_enabled = False
-            done = strat.kill_all()
+            s.trading_enabled = False  # whatever the venue answers, the per-symbol bot's auto-trade goes off with a KILL
+            try:  # alias of /api/venues/bybit-demo/kill: written always, confirmed only when the runner is up and fresh
+                out = await hub.kill(hub.primary_id)
+            except strat_mod.StrategyError as exc:
+                exc.detail["bot_auto_trade"] = "off"
+                engine.emit("event", engine.db.event("warn", "killed", f"kill: {exc.message}"))
+                return refused(exc)
+            done = out["flattening"]
             engine.emit("event", engine.db.event("warn", "killed", f"kill switch: allocator paused, strategies flattening: {', '.join(done)}"))
-            return j({"ok": True, "flattening": done})
-        if engine.executor:
-            await engine.executor.kill("dashboard kill switch")
+            return j({**out, "ok": True, "flattening": done, "bot_auto_trade": "off"})
         s.trading_enabled = False
-        return j({"killed": True})
+        if not engine.executor:
+            return j({"killed": False, "why": "per-symbol bot: no executor (no keys for its venue), nothing to close", "bot_auto_trade": "off"})
+        bot = await bot_kill(engine.executor, "dashboard kill switch")
+        return j({**bot, "bot_auto_trade": "off", **({} if bot["killed"] else {"error": bot["why"]})}, 200 if bot["killed"] else 409)
 
     @routes.post("/api/decide")
     async def decide_now(req: web.Request) -> web.Response:
@@ -418,8 +562,14 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             return j({"error": "unknown symbol"}, 404)
         if not engine.kairos.configured:
             return j({"error": f"{engine.kairos.spec.key_env} is not set"}, 400)
+        if strat.owns_account():  # engine._bot_paused: no model calls while the strategies own the account
+            return j({"error": f"the per-symbol bot makes no model calls in mode {strat.mode(strat.registry()).upper()}: {BOT_ONLY_MSG}"}, 409)
         row = await engine.decide(sym, force_probe=bool(body.get("probe")))
-        return j(engine._decision_view(row) if row else {"skipped": True})
+        if row:
+            return j(engine._decision_view(row))
+        why = ("a request for this symbol is already in flight" if sym in engine.inflight
+               else "the hourly model request budget is used up (raise it or wait)")
+        return j({"skipped": True, "why": why})
 
     @routes.post("/api/decision-tf")
     async def decision_tf(req: web.Request) -> web.Response:
@@ -796,9 +946,18 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
                 log.exception("strategy guard check failed")
             await asyncio.sleep(strat_mod.CACHE_S)
 
+    async def venue_sampler() -> None:
+        while True:
+            try:
+                await hub.sample_all(bot_account())
+            except Exception:  # noqa: BLE001 - a failed sample must not stop the sampler
+                log.exception("venue sample failed")
+            await asyncio.sleep(VENUE_SAMPLE_S)
+
     async def on_startup(app_: web.Application) -> None:
         await engine.start()
         app_["strategy_guard"] = asyncio.create_task(strategy_guard())
+        app_["venue_sampler"] = asyncio.create_task(venue_sampler())
         # The LLM allocator (docs/allocator.md). attach_allocator first writes allocator/control.json from the mode, because the
         # loop treats a missing file as enabled: it writes strategy controls only in LLM DECIDES (control enabled true).
         try:
@@ -811,6 +970,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
 
     async def on_cleanup(app_: web.Application) -> None:
         app_["strategy_guard"].cancel()
+        app_["venue_sampler"].cancel()
         if "allocator" in app_:
             app_["allocator"].stop()
             app_["allocator_task"].cancel()

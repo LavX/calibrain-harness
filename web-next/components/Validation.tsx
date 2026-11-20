@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { setState, useStore } from "@/lib/store";
-import { fx, isNum, sg, short, ud } from "@/lib/format";
+import { fx, isNum, NA, sg, short, ud } from "@/lib/format";
 import { KV } from "./Monitor";
 
 const Panel = ({ code, title, span2, tight, children }: { code: string; title: string; span2?: boolean; tight?: boolean; children: React.ReactNode }) => (
@@ -12,11 +12,11 @@ const Panel = ({ code, title, span2, tight, children }: { code: string; title: s
 );
 
 const VERDICT: Record<string, string> = { skill: "up", "no skill": "dn", undecided: "amb", "not enough data": "muted" };
-const ci = (c: any) => (c && isNum(c[0]) ? `[${sg(c[0], 2)}, ${sg(c[1], 2)}]` : "—");
-const dist = (d: any, unit = "bp") => (d ? `${sg(d.mean, 1)}${unit} mean · p50 ${sg(d.p50, 1)} · p90 ${sg(d.p90, 1)} (n=${d.n})` : "—");
+const ci = (c: any) => (c && isNum(c[0]) ? `[${sg(c[0], 2)}, ${sg(c[1], 2)}]` : NA);
+const dist = (d: any, unit = "bp") => (d ? `${sg(d.mean, 1)}${unit} mean · p50 ${sg(d.p50, 1)} · p90 ${sg(d.p90, 1)} (n=${d.n})` : NA);
 
 function Verdict({ v }: { v?: string }) {
-  return <span className={`vchip ${VERDICT[v || ""] || ""}`}>{(v || "—").toUpperCase()}</span>;
+  return <span className={`vchip ${VERDICT[v || ""] || ""}`}>{(v || NA).toUpperCase()}</span>;
 }
 
 /** Rolling skill as a sparkline: above the zero line = the model beat the base rates in that window. */
@@ -43,8 +43,8 @@ function GroupTable({ rows, label }: { rows: any[]; label: string }) {
       <tbody>{rows.map((r) => (
         <tr key={String(r.key)}><td className="amb">{String(r.key)}</td><td className="r">{r.independent_windows}</td>
           <td className={`r ${ud(r.bracket_skill)}`}>{sg(r.bracket_skill, 3)}</td><td className={`r ${ud(r.model_side_mean_r)}`}>{sg(r.model_side_mean_r, 2)}</td>
-          <td className="r">{r.trades}</td><td className={`r ${ud(r.trade_pnl)}`}>{r.trades ? sg(r.trade_pnl) : "—"}</td>
-          <td className="r">{isNum(r.trade_win_rate) ? `${(100 * r.trade_win_rate).toFixed(0)}%` : "—"}</td><td className={`r ${ud(r.trade_avg_r)}`}>{sg(r.trade_avg_r, 2)}</td></tr>
+          <td className="r">{r.trades}</td><td className={`r ${ud(r.trade_pnl)}`}>{r.trades ? sg(r.trade_pnl) : NA}</td>
+          <td className="r">{isNum(r.trade_win_rate) ? `${(100 * r.trade_win_rate).toFixed(0)}%` : NA}</td><td className={`r ${ud(r.trade_avg_r)}`}>{sg(r.trade_avg_r, 2)}</td></tr>
       ))}</tbody>
     </table>
   );
@@ -105,10 +105,10 @@ export function ValidationView() {
   const em = ec.model_side_all_bars || {};
   const cells: [string, React.ReactNode, string][] = [
     ["Independent windows", v.independent_windows, `of ${v.labelled} labelled · ${v.decisions} decisions`],
-    ["Bracket skill", <span key="b" className={ud(ov.bracket?.skill)}>{sg(ov.bracket?.skill, 3)}</span>, `90% ${ci(ov.bracket?.ci90)} · ${ov.bracket?.verdict ?? "—"}`],
-    ["Big-move skill", <span key="m" className={ud(ov.big_move?.skill)}>{sg(ov.big_move?.skill, 3)}</span>, `90% ${ci(ov.big_move?.ci90)} · ${ov.big_move?.verdict ?? "—"}`],
+    ["Bracket skill", <span key="b" className={ud(ov.bracket?.skill)}>{sg(ov.bracket?.skill, 3)}</span>, `90% ${ci(ov.bracket?.ci90)} · ${ov.bracket?.verdict ?? NA}`],
+    ["Big-move skill", <span key="m" className={ud(ov.big_move?.skill)}>{sg(ov.big_move?.skill, 3)}</span>, `90% ${ci(ov.big_move?.ci90)} · ${ov.big_move?.verdict ?? NA}`],
     ["Out-of-sample skill", <span key="o" className={ud(wf.oos_bracket_skill)}>{sg(wf.oos_bracket_skill, 3)}</span>, `${wf.folds?.length || 0} walk-forward folds`],
-    ["Gross edge", <span key="g" className={ud(em.gross_edge_bp)}>{isNum(em.gross_edge_bp) ? sg(em.gross_edge_bp, 1) + "bp" : "—"}</span>, `cost ${fx(em.cost_bp, 1)}bp · net ${sg(em.net_bp, 1)}bp`],
+    ["Gross edge", <span key="g" className={ud(em.gross_edge_bp)}>{isNum(em.gross_edge_bp) ? sg(em.gross_edge_bp, 1) + "bp" : NA}</span>, `cost ${fx(em.cost_bp, 1)}bp · net ${sg(em.net_bp, 1)}bp`],
     ["Drift", <span key="d" className={dr.alarm ? "dn" : "up"}>{dr.alarm ? "ALARM" : "OK"}</span>, dr.alarm ? `on ${(dr.questions || []).join(", ")}` : "Page-Hinkley on Brier gap"],
   ];
   const syms = Object.entries<any>(v.per_symbol || {});
@@ -153,8 +153,8 @@ export function ValidationView() {
           <table className="t">
             <thead><tr><th>Set</th><th className="r">n</th><th className="r">Gross</th><th className="r">Cost</th><th className="r">Net</th><th className="r">Gross R</th><th className="r">Net R</th></tr></thead>
             <tbody>{Object.entries<any>(ec).map(([k, r]) => (
-              <tr key={k}><td className="amb">{k.replace(/_/g, " ")}</td><td className="r">{r.n}</td><td className={`r ${ud(r.gross_edge_bp)}`}>{r.n ? sg(r.gross_edge_bp, 1) + "bp" : "—"}</td>
-                <td className="r">{r.n ? fx(r.cost_bp, 1) + "bp" : "—"}</td><td className={`r ${ud(r.net_bp)}`}>{r.n ? sg(r.net_bp, 1) + "bp" : "—"}</td>
+              <tr key={k}><td className="amb">{k.replace(/_/g, " ")}</td><td className="r">{r.n}</td><td className={`r ${ud(r.gross_edge_bp)}`}>{r.n ? sg(r.gross_edge_bp, 1) + "bp" : NA}</td>
+                <td className="r">{r.n ? fx(r.cost_bp, 1) + "bp" : NA}</td><td className={`r ${ud(r.net_bp)}`}>{r.n ? sg(r.net_bp, 1) + "bp" : NA}</td>
                 <td className={`r ${ud(r.gross_edge_r)}`}>{sg(r.gross_edge_r, 3)}</td><td className={`r ${ud(r.net_r)}`}>{sg(r.net_r, 3)}</td></tr>
             ))}</tbody>
           </table>
@@ -171,12 +171,12 @@ export function ValidationView() {
           <div className="muted" style={{ padding: "4px 8px" }}>On alarm the model's weight drops to 0 for that question (DRIFT ACTION base), or trading pauses (pause).</div>
         </Panel>
         <Panel code="EXEC" title="Execution quality" tight><KV rows={[
-          ["Implementation shortfall", dist(ex.implementation_shortfall_bp), "Fill vs the mainnet price the decision was made on; includes testnet divergence"],
-          ["Entry slip vs testnet", dist(ex.entry_slip_vs_testnet_bp)], ["Stop exit slip", dist(ex.stop_exit_slip_bp)],
+          ["Implementation shortfall", dist(ex.implementation_shortfall_bp), "Fill vs the mainnet price the decision was made on; includes the bot venue's divergence from mainnet"],
+          ["Entry slip vs venue book", dist(ex.entry_slip_vs_testnet_bp)], ["Stop exit slip", dist(ex.stop_exit_slip_bp)],
           ["Fees", dist(ex.fees_bp)], ["Impact proxy", dist(ex.impact_proxy_bp), "Our notional ÷ mainnet depth within 10bp × 10bp"],
           ["Markout +1m", dist(ex.markout_bp_after_entry?.["1"]), "Price move in our favour after entry"], ["Markout +5m", dist(ex.markout_bp_after_entry?.["5"])],
           ["Markout +15m", dist(ex.markout_bp_after_entry?.["15"])],
-          ["Maker entries", ex.maker?.orders ? `${ex.maker.filled}/${ex.maker.orders} filled (${fx(100 * (ex.maker.fill_rate || 0), 0)}%) · missed ${ex.maker.missed_trades}, their R ${sg(ex.maker.missed_mean_r, 2)}` : "—"],
+          ["Maker entries", ex.maker?.orders ? `${ex.maker.filled}/${ex.maker.orders} filled (${fx(100 * (ex.maker.fill_rate || 0), 0)}%) · missed ${ex.maker.missed_trades}, their R ${sg(ex.maker.missed_mean_r, 2)}` : NA],
         ]} /></Panel>
         <Panel code="CAL" title="Calibration weights in use (independent windows)" tight>
           <table className="t">
