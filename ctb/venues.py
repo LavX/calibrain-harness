@@ -256,6 +256,18 @@ def net_positions(strategies: list[dict]) -> list[dict]:
     return out
 
 
+def books_positions(strategies: list[dict]) -> list[dict]:
+    """The books' legs netted per coin and market, and per account when the strategies trade more than one: a long on one
+    account and a short on another are two exposures, never one flat row. Rows carry their account when there are several."""
+    accounts = sorted({v.get("account") or "" for v in strategies})
+    if len(accounts) <= 1:
+        return net_positions(strategies)
+    out = [{**r, "account": a or "(no account)"} for a in accounts
+           for r in net_positions([v for v in strategies if (v.get("account") or "") == a])]
+    out.sort(key=lambda x: -abs(x["upnl"] or 0))
+    return out
+
+
 def exchange_positions(account: dict, strategies: list[dict]) -> list[dict]:
     """bybit-demo with the exchange account: its netted positions, each with the strategies that hold a leg in it."""
     held: dict[str, list[str]] = {}
@@ -618,8 +630,10 @@ class VenueHub:
                 notes.append(f"the books of strategies on {', '.join(sorted({v['account'] for v in others}))}")
             pos_note = " plus ".join(notes) if len(notes) > 1 else None
         else:
-            positions, pos_source = net_positions(doc["strategies"]), "books"
+            positions, pos_source = books_positions(doc["strategies"]), "books"
             pos_note = "the exchange read is stale, so these are the books' legs netted per coin and market" if acct else None
+            if len({v.get("account") or "" for v in doc["strategies"]}) > 1:
+                pos_note = (pos_note + ", " if pos_note else "the books' legs, ") + "netted per account"
         counts = {k: sum(1 for r in rows if r["pill"] == k) for k in ("running", "idle", "paused")}
         counts["total"] = len(rows)
         counts["abnormal"] = counts["total"] - counts["running"] - counts["idle"] - counts["paused"]

@@ -1019,3 +1019,19 @@ def test_control_writes_never_share_the_runners_temp_file(roots, tmp_path):
     finally:
         st.os.replace = real
     assert seen and all(n != "control.json.tmp" and n.startswith(".control.json.") for n in seen)
+
+
+def test_the_books_fallback_keeps_accounts_apart(roots, tmp_path):
+    bybit = roots[0]
+    reg = json.loads((bybit / "strategies.json").read_text())
+    for e in reg:
+        if e["id"] == "trend":
+            e["account"] = "demo-other"
+    (bybit / "strategies.json").write_text(json.dumps(reg))
+    leg = {"symbol": "ETHUSDT", "market": "linear", "qty": 1, "entry_price": 3000, "mark_price": 3000, "upnl_usdt": 0.0}
+    set_status(bybit, "carry", positions=[{**leg, "side": "long"}])  # demo-main long
+    set_status(bybit, "trend", positions=[{**leg, "side": "short"}])  # demo-other short: not a flat pair
+    stale = {**ACCOUNT, "sync_error": "HTTP 503"}  # the exchange read failed: the books fallback
+    v = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(stale))["venues"][0]
+    rows = sorted((r["account"], r["side"], r["size"]) for r in v["positions"] if r["symbol"] == "ETHUSDT")
+    assert rows == [("demo-main", "long", 1.0), ("demo-other", "short", 1.0)] and "per account" in v["positions_note"]
