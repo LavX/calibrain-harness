@@ -7,7 +7,9 @@ archives older than KEEP_DAYS are deleted. The newest archive stays uncompressed
 the feed and the predictions panel can read the hours just before midnight cheaply.
 
 Archiving is never in the way of a decision: append() runs the rotation in its own try and writes the line to the
-current file whatever happens (rotation_error() says why the last rotation failed; it is retried after RETRY_MS). 
+current file whatever happens (rotation_error() says why the last rotation failed; it is retried after RETRY_MS). A
+.gz is written to a temp file, synced and renamed, never appended to. Readers skip what they cannot read of a damaged
+archive and report it once.
 
 Readers: tail() for the newest lines (current file, the file being split, then the archives), iter_all() for everything
 kept, oldest first (the scorers). No other module writes these files.
@@ -101,7 +103,7 @@ def _raw_lines(path: Path, strict: bool = False) -> Iterator[bytes]:
                 yield raw if raw.endswith(b"\n") else raw + b"\n"
     except FileNotFoundError:
         return
-    except (OSError, EOFError) as exc:
+    except Exception as exc:  # noqa: BLE001 - zlib.error, BadGzipFile, EOFError, OSError: a damaged archive is skipped
         if strict:
             raise
         if str(path) not in _unreadable:
@@ -116,9 +118,25 @@ def _sync_close(f: BinaryIO) -> None:
 
 
 def _gzip(src: Path) -> None:
+    """Compress a plain archive to decisions-<day>.jsonl.gz atomically: a temp file (holding what is readable of an
+    existing .gz of that day first) is written, synced and renamed over the .gz; only then is the plain file removed. A
+    crash leaves the old .gz and the plain file as they were (at worst a later run holds some lines twice)."""
     dst = src.with_name(src.name + ".gz")
-    with open(src, "rb") as fin, gzip.open(dst, "ab") as fout:  # "ab": a second member if the day was split, gzip reads both
-        shutil.copyfileobj(fin, fout)
+    tmp = src.with_name(f".{dst.name}.tmp")
+    raw = open(tmp, "wb")
+    try:
+        with gzip.GzipFile(fileobj=raw, mode="wb") as gz:
+            if dst.exists():
+                for line in _raw_lines(dst):
+                    gz.write(line)
+            with open(src, "rb") as fin:
+                shutil.copyfileobj(fin, gz)
+        _sync_close(raw)
+    except BaseException:
+        raw.close()
+        _unlink(tmp)
+        raise
+    _replace(tmp, dst)
     _unlink(src)
 
 

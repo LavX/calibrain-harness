@@ -383,3 +383,53 @@ def test_a_failing_rotation_never_stops_a_weights_run(root, monkeypatch, step):
     b = make(root, llm)
     assert len(b.budget.calls) == 1  # the restart's budget seed counts the one attempt once
     DL._failures.clear()
+
+
+@pytest.mark.parametrize("damage", ["truncated", "corrupt"])
+def test_a_damaged_archive_is_skipped_by_every_reader(root, damage):
+    import gzip as gz
+
+    from ctb import decision_log as DL
+    from ctb import predictions as P
+
+    d = root / "allocator"
+    d.mkdir(exist_ok=True)
+    now = int(T0 * 1000)
+    rows = [{"t_ms": now - 2 * DAY * 1000 + i, "attempts": 0, "k": i} for i in range(200)]
+    blob = gz.compress("".join(json.dumps(r) + "\n" for r in rows).encode())
+    if damage == "truncated":
+        bad = blob[: len(blob) // 2]  # cut in half: BadGzipFile or EOFError
+    else:
+        bad = blob[:20] + b"\xff\x00\xff\x00" + blob[24:]  # garbage in the deflate stream: zlib.error
+    (d / "decisions-2027-01-13.jsonl.gz").write_bytes(bad)
+    (d / "decisions.jsonl").write_text(json.dumps({"t_ms": now - 60_000, "attempts": 1, "core": {"carry": 0.4}}) + "\n")
+    got = DL.tail(d, 500)
+    assert got[-1]["t_ms"] == now - 60_000 and all(r["k"] == i for i, r in enumerate(got[:-1]))  # any readable part, in order
+    assert [r["t_ms"] for r in DL.iter_all(d)][-1] == now - 60_000
+    a = make(root, FakeDecider(answers({"carry": 0.6, "trend": 0.6, "xsmom": 0.6})))  # the budget seed reads it
+    assert len(a.budget.calls) == 1 and a.cost_usd_today(now) == 0.0 and len(a.decisions(50)) >= 1
+    A.score_decisions(root, now_ms=now)
+    assert P.newest_with(d, "core")["core"] == {"carry": 0.4}
+
+
+def test_a_gzip_cut_short_leaves_the_archive_and_its_source_intact(tmp_path, monkeypatch):
+    import gzip as gz
+
+    from ctb import decision_log as DL
+
+    d = tmp_path / "allocator"
+    d.mkdir()
+    (d / "decisions-2027-01-10.jsonl.gz").write_bytes(gz.compress(b'{"t_ms":1,"k":"a"}\n'))
+    src = d / "decisions-2027-01-10.jsonl"
+    src.write_text('{"t_ms":2,"k":"b"}\n')
+
+    def fail(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(DL, "_fsync", fail)
+    with pytest.raises(OSError):
+        DL._gzip(src)
+    assert src.exists() and [r["k"] for r in DL._lines(d / "decisions-2027-01-10.jsonl.gz")] == ["a"] and not list(d.glob(".*.tmp"))
+    monkeypatch.undo()
+    DL._gzip(src)
+    assert not src.exists() and [r["k"] for r in DL._lines(d / "decisions-2027-01-10.jsonl.gz")] == ["a", "b"]
