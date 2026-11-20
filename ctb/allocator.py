@@ -255,6 +255,9 @@ class Decision:
     reasoning: str
     confidence: float | None
     derive_enabled: tuple[str, ...] = ()  # ids whose enabled flag follows their final weight (decision model mapping)
+    # ids the decision model left unanswered (decider-only mapping): their weights are the decision venue's own allocation,
+    # kept; every other venue keeps its own allocation for them too
+    held: tuple[str, ...] = ()
 
 
 def validate_decision(raw: Any, ids: list[str]) -> Decision:
@@ -1035,7 +1038,8 @@ class Allocator:
                              "best": None if best is None else {k: round(v, 4) for k, v in best.items()}},
                  "unanswered": [q for q in qs if q not in parsed], "issues": issues_all[:6] if len(parsed) < len(qs) else []}
         decision = Decision(weights, enabled, summary[:REASONING_MAX_CHARS], round(sum(conf) / len(conf), 3) if conf else None,
-                            derive_enabled=tuple(sid for sid in ids if not mapping[sid]["held"]))
+                            derive_enabled=tuple(sid for sid in ids if not mapping[sid]["held"]),
+                            held=tuple(sid for sid in ids if mapping[sid]["held"]))
         return decision, cost, attempts, extra
 
     async def _ask_chat(self, ctx: dict[str, Any], ids: list[str], labels: dict[str, str]) -> tuple[Decision, float, int, dict[str, Any]]:
@@ -1331,11 +1335,13 @@ class Allocator:
 
     def _legacy_venue(self, v: AllocVenue, decision: Decision | None, now_ms: int, dry_run: bool) -> dict[str, Any]:
         """The decider-only (or chat) decision on another venue: its strategies that the decision covers take the decided
-        weight under that venue's step limit, drawdown floor, exploration floor and owner locks; the others are held."""
+        weight under that venue's step limit, drawdown floor, exploration floor and owner locks; the others are held at this
+        venue's own allocation: a strategy the decision venue does not list, and one the decision model left unanswered
+        (its decided weight is only the decision venue's current allocation, kept)."""
         current = self._read_current(now_ms, v)
         if not current:
             return {"label": v.label, "managed": v.managed, "strategies": [], "note": "no usable strategies.json (missing or invalid): nothing applied"}
-        decided = [s for s in current if decision is not None and s in decision.weights]
+        decided = [s for s in current if decision is not None and s in decision.weights and s not in decision.held]
         sub = None if decision is None else Decision(
             {s: decision.weights[s] if s in decided else current[s].weight for s in current},
             {s: decision.enabled[s] if s in decided else current[s].enabled for s in current},
@@ -1348,6 +1354,8 @@ class Allocator:
                 reasons[sid] = self._floor_reason(v, c)
             elif decision is None:
                 reasons[sid] = "kept (allocator error)"
+            elif sid not in decided and sid in decision.held:
+                reasons[sid] = "no decision: the decision model gave no valid answer for it, held"
             elif sid not in decided:
                 reasons[sid] = f"no decision: strategy not on the decision venue ({self.primary.label}), held"
             else:

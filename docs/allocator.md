@@ -30,7 +30,8 @@ Layout under the live root (`CTB_LIVE_ROOT`, default `data/live`; on aurora4
 The allocator lives in the bybit-demo root (its control, status, decisions and state files, and the forecast and regime
 it reads) and makes one decision per strategy there. It applies that decision to every venue in `CTB_LIVE_ROOTS` that it
 controls (`CTB_ALLOCATOR_VENUES`, default all) and whose runner's strategies.json lists the strategy; a strategy a venue
-does not list is never written there, and a strategy no decision covers (not on bybit-demo) is held. Each venue is its own
+does not list is never written there, and a strategy no decision covers (not on bybit-demo, or left unanswered by the
+decision model) is held at that venue's own allocation. Each venue is its own
 account: the vol cap is computed over that venue's strategies, the drawdown floor, the day anchor of the daily step and
 the exploration floor are per (venue, strategy), and every write checks that venue's owner lock and pending kill and the
 allocator's pause. `state.json` keys peaks, history and the day anchor as `<venue>/<strategy>` (files from before are
