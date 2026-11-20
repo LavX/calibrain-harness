@@ -1376,11 +1376,14 @@ class Allocator:
             record["venues"] = venues
             # only a weights run rewrites every book: an hourly refresh or a held run leaves earlier failures standing
             not_applied = self._write_failures(venues, now_ms, dry_run, replace=kind == "computed")
-            infeasible = self._cap_infeasible(venues)
+            # Refreshes do not check the cap, so only a weights run can clear its last error.
+            infeasible = self._cap_infeasible(venues) if kind != "refresh" else self._state().get("cap_error")
             record["error"] = _join_errors(record["error"], infeasible, not_applied)
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
-                self.last_error = _join_errors(error, infeasible, not_applied)  # the forecast's error is said by write_status, as before
+                if kind != "refresh":
+                    self._state()["cap_error"] = infeasible
+                self.last_error = _join_errors(error, not_applied)  # forecast and persistent cap errors are added by write_status
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
@@ -1714,7 +1717,7 @@ class Allocator:
         nxt = None if paused or not last else int(last) + ctl["interval_min"] * 60_000
         last_dec = (self.decisions(1) or [{}])[0]
         fc = self.load_forecast(now_ms) if self.mode == "decider" else None
-        err = self.last_error or (fc.error if fc else None)  # an unusable forecast is an error; a missing one is a mode
+        err = _join_errors(self.last_error, self._state().get("cap_error")) or (fc.error if fc else None)
         floor = [f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in self.floor_errors.values()]
         if floor:  # the drawdown floor could not cut a book: said even while paused
             err = "; ".join(([err] if err else []) + [f"drawdown floor could not write control.json ({'; '.join(floor)})"])
