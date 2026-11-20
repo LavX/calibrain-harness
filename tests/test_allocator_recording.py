@@ -503,3 +503,16 @@ def test_a_switched_off_book_stays_off_in_the_shadows_until_the_rules_switch_it(
         vr = decide(a, trigger="decide_now")["venues"]["bybit-demo"]
         assert {k: v["xsmom"] for k, v in vr["policies"].items()} == {"core": 0.0, "live": 0.0, "tilt": 0.0, "core_veto": 0.0}, run
         assert not any(v["xsmom"] for v in vr["policy_enabled"].values()), run
+
+
+def test_a_book_the_floor_switches_off_keeps_its_exposure_until_it_is_flat(root):
+    put(root / "forecast" / "latest.json", forecast(T0 - 7200, kappa=0.0))
+    put(root / "trend" / "control.json", {"enabled": True, "weight": 0.5, "owner_lock": False})
+    put(root / "trend" / "status.json", {"state": "running", "equity_usdt": 800.0, "start_equity_usdt": 1000.0,
+                                         "positions": [{"symbol": "BTCUSDT", "qty": 0.01, "mark_price": 60000.0}]})
+    vr = decide(_alloc(root), trigger="decide_now")["venues"]["bybit-demo"]
+    assert ctl(root, "trend")["weight"] == 0.0 and ctl(root, "trend")["enabled"] is False  # floored: written off, not flat yet
+    assert {k: v["trend"] for k, v in vr["policies"].items()} == {"core": 0.5, "live": 0.5, "tilt": 0.5, "core_veto": 0.5}
+    put(root / "trend" / "status.json", {"state": "running", "equity_usdt": 800.0, "start_equity_usdt": 1000.0, "positions": []})
+    vr = decide(_alloc(root), trigger="decide_now")["venues"]["bybit-demo"]
+    assert vr["policies"]["live"]["trend"] == 0.0  # flat now: nothing held

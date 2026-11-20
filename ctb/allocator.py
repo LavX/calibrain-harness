@@ -1649,9 +1649,12 @@ class Allocator:
 
     @staticmethod
     def _exposure(weight: float, enabled: bool, c: Current) -> float:
-        """The weight a policy's book is exposed at: its weight, except a switched-off book whose status confirms it flat,
-        which holds nothing (a switched-off book that still holds positions keeps its exposure until the runner closes it)."""
-        return 0.0 if not enabled and c.confirmed_flat else round(float(weight), 4)
+        """The weight a policy's book is exposed at: its weight while it is on. Switched off, it holds nothing once its
+        status confirms it flat; until then it keeps the exposure it had before (c.weight), even when the write that
+        switched it off also set weight 0 (the drawdown floor): the positions are still open. Like _final_cap."""
+        if enabled:
+            return round(float(weight), 4)
+        return 0.0 if c.confirmed_flat else round(float(c.weight), 4)
 
     @staticmethod
     def _held_on(plan: Plan, current: dict[str, Current], applied: dict[str, bool], dry_run: bool) -> dict[str, bool]:
