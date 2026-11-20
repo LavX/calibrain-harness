@@ -261,3 +261,15 @@ def test_a_recording_failure_never_stops_or_changes_a_weights_run(tmp_path, monk
     else:
         assert "evaluation recording failed, live weights unaffected" in lines[0]["error"] and "evaluation recording failed" in status["last_error"]
         assert all("policies_error" in lines[0]["venues"][vid] for vid, _ in FIVE)
+
+
+def test_the_live_policy_is_what_the_books_hold_after_the_writes(root, monkeypatch):
+    put(root / "forecast" / "latest.json", forecast(T0 - 7200, kappa=0.0))
+    real = A.write_json_atomic
+    monkeypatch.setattr(A, "write_json_atomic", lambda path, obj: (_ for _ in ()).throw(OSError(13, "Permission denied"))
+                        if path == root / "trend" / "control.json" else real(path, obj))
+    rec = decide(_alloc(root), trigger="decide_now")
+    vr = rec["venues"]["bybit-demo"]
+    assert "trend" in vr["write_failed"] and rec["weights"]["trend"] != 0.2  # the plan moved trend, the write failed
+    assert vr["policies"]["live"]["trend"] == 0.2 == ctl(root, "trend")["weight"]  # live records what the book holds
+    assert vr["policies"]["live"]["carry"] == ctl(root, "carry")["weight"] == rec["weights"]["carry"]

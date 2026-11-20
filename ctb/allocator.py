@@ -1387,7 +1387,7 @@ class Allocator:
                                                           {**({"write_failed": failed} if failed else {}),
                                                            **({"final_cap": final_cap} if final_cap else {})})}
             if plan and self.primary.managed and kind != "refresh":
-                self._policy_jobs.append((self.primary, kind, fc, current, ids, p_now, dict(plan.weights)))
+                self._policy_jobs.append((self.primary, kind, fc, current, ids, p_now, self._held(plan, current, applied, dry_run)))
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1611,6 +1611,15 @@ class Allocator:
             self._dirty = True
         return rec
 
+    @staticmethod
+    def _held(plan: Plan, current: dict[str, Current], applied: dict[str, bool], dry_run: bool) -> dict[str, float]:
+        """The live policy as the books hold it after the writes: the planned weight where it was written, the weight the
+        book already had where it was not (unchanged, owner-locked, a pending kill, paused meanwhile, a failed write). A
+        dry run writes nothing and shows the plan."""
+        if dry_run:
+            return dict(plan.weights)
+        return {sid: (plan.weights[sid] if applied.get(sid) else c.weight) for sid, c in current.items()}
+
     def _record_policies(self, venues: dict[str, dict[str, Any]], kind: str, now_ms: int, dry_run: bool) -> str | None:
         """Runs the queued paired-policy recordings after every venue's live writes. Each venue's recording and each
         policies.jsonl line has its own try: a failure (a damaged state, a full disk, a bug) is logged and returned as the
@@ -1754,7 +1763,7 @@ class Allocator:
         if final_cap:
             extra["final_cap"] = final_cap
         if v.managed and kind != "refresh":
-            self._policy_jobs.append((v, kind, fc, current, covered, p_now, dict(plan.weights)))
+            self._policy_jobs.append((v, kind, fc, current, covered, p_now, self._held(plan, current, applied, dry_run)))
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:
