@@ -314,3 +314,24 @@ def test_the_drawdown_floor_keeps_running_on_every_venue_while_the_allocator_is_
     c = ctl(okx, "trend")
     assert c["weight"] == 0.0 and c["enabled"] is False and c["flatten_on_zero"] is True
     assert a.status()["state"] == "paused"  # no decision ran
+
+
+def test_an_opted_out_allocator_venue_refuses_unlock_and_hand_over(roots, monkeypatch):
+    bybit, okx = roots
+    book(bybit, "trend", owner_lock=True)
+    book(okx, "trend", owner_lock=True)
+    monkeypatch.setenv("CTB_LIVE_ROOTS", f"bybit-demo={bybit},okx-demo={okx}")
+    monkeypatch.setenv("CTB_ALLOCATOR_VENUES", "okx-demo")  # bybit-demo is the owner's
+    h = V.VenueHub.from_env()
+    assert h.services["bybit-demo"].has_allocator is False and h.services["okx-demo"].has_allocator is True
+    assert [(v.id, v.managed) for v in h.allocator_venues()] == [("bybit-demo", False), ("okx-demo", True)]
+    for svc in (h.services["bybit-demo"],):
+        svc.run = FakeSystemd()
+        with pytest.raises(st.StrategyError) as e:
+            svc.hand_to_allocator()
+        assert e.value.status == 409 and "not controlled by the LLM allocator" in e.value.message
+        with pytest.raises(st.StrategyError) as e:
+            asyncio.run(svc.act("trend", "unlock", llm_trading=False, venue="demo"))
+        assert e.value.status == 409
+    assert ctl(bybit, "trend")["owner_lock"] is True
+    assert h.services["okx-demo"].hand_to_allocator()["handed"] == ["trend"]  # the managed venue still can

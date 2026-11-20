@@ -505,9 +505,10 @@ class VenueHub:
         services: dict[str, S.StrategyService] = {}
         for v in venues:
             auto = sdir / f"auto-set-{v.id}.json"
-            if v.id == PRIMARY:
+            if v.id == PRIMARY:  # has_allocator from the managed set here too: an opted-out allocator venue refuses unlock
                 extra = S.extra_units_from_env() + ((v.unit,) if v.unit else ())
-                services[v.id] = S.StrategyService(v.root, extra_units=tuple(dict.fromkeys(extra)), auto_set_path=auto)
+                services[v.id] = S.StrategyService(v.root, extra_units=tuple(dict.fromkeys(extra)), auto_set_path=auto,
+                                                   has_allocator=v.controlled_by == "allocator")
             else:
                 services[v.id] = S.StrategyService(v.root, extra_units=(v.unit,) if v.unit else (), dashboard_account="",
                                                    shares_bot_account=False, auto_set_path=None,
