@@ -40,7 +40,7 @@ export const pf = (x: Num): string => {
   if (!isNum(x)) return NA;
   const n = Number(Number(x).toPrecision(8));
   if (Math.abs(n) < 1e-6) return String(n);
-  const t = n.toFixed(Math.max(0, 8 - Math.floor(Math.log10(Math.abs(n) || 1)) - 1));
+  const t = n.toFixed(Math.min(20, Math.max(0, 8 - Math.floor(Math.log10(Math.abs(n) || 1)) - 1))); // toFixed accepts 0..100; >= 1e8 needs 0
   return px(t.includes(".") ? t.replace(/0+$/, "").replace(/\.$/, "") : t);
 };
 

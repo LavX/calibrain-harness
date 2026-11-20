@@ -527,9 +527,32 @@ def test_bybit_account_block_compares_like_with_like(roots, tmp_path):
     assert a["books_unrealised"] == pytest.approx(-5.0) and a["unattributed"] == pytest.approx(24.4 + 5.0)
     assert b["books"]["unrealised"] == pytest.approx(-0.5)  # the books' own figure keeps both legs
     assert b["positions"][0]["held_by"] == ["Carry"] and b["positions_source"] == "exchange"  # the exchange's netted row, with who holds a leg
+    rows = {(r["symbol"], r["market"]): r["source"] for r in b["positions"]}  # the exchange feed is linear only: the books' spot leg stays
+    assert rows == {("BTCUSDT", "linear"): "exchange", ("BTCUSDT", "spot"): "books"} and "spot legs" in b["positions_note"]
+    assert b["pnl_today_partial"] is True and "equity unknown for Momentum" in b["pnl_today_note"]  # xsmom has no equity
     assert a["stale"] is False and not any(x["kind"] == "account_stale" for x in doc["alerts"])
     okx = doc["venues"][1]
     assert okx["account"] is None and okx["books"]["equity"] == 20004.0  # other venues: books only
+
+
+def test_an_unknown_market_makes_unattributed_unknown(roots, tmp_path):
+    doc = json.loads((roots[0] / "carry" / "status.json").read_text())
+    doc["positions"][1]["market"] = ""  # the spot leg without a market: not guessed to be a derivative
+    (roots[0] / "carry" / "status.json").write_text(json.dumps(doc))
+    a = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(ACCOUNT))["venues"][0]["account"]
+    assert a["books_unrealised"] is None and a["unattributed"] is None
+
+
+def test_unattributed_counts_only_the_strategies_on_the_account(roots, tmp_path):
+    reg = json.loads((roots[0] / "strategies.json").read_text())
+    for e in reg:
+        if e["id"] == "trend":
+            e["account"] = "demo-other"  # trades another account
+    (roots[0] / "strategies.json").write_text(json.dumps(reg))
+    set_status(roots[0], "trend", positions=[{"symbol": "ETHUSDT", "side": "long", "qty": 1, "entry_price": 3000, "mark_price": 3007,
+                                              "upnl_usdt": 7.0, "market": "linear"}])
+    a = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(ACCOUNT))["venues"][0]["account"]
+    assert a["books_unrealised"] == pytest.approx(-5.0) and a["unattributed"] == pytest.approx(29.4)  # trend's +7 is not this account's
 
 
 def test_a_spot_purchase_does_not_move_any_pnl_today(roots, tmp_path):

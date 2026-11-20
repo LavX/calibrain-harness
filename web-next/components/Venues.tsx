@@ -21,7 +21,7 @@ export type VStrat = {
   unrealised: number | null; last_error: string | null; updated_ms: number | null; last_rebalance_ms: number | null; last_trade_ms: number | null;
   trades_today: number | null;
 };
-export type VPos = { symbol: string; market: string; side: string; size: number | null; entry: number | null; mark: number | null; upnl: number | null; held_by: string[]; legs: number | null };
+export type VPos = { symbol: string; market: string; side: string; size: number | null; entry: number | null; mark: number | null; upnl: number | null; held_by: string[]; legs: number | null; source?: "exchange" | "books" };
 export type VAccount = {
   source: "exchange" | "account.json"; ccy: string; equity: number | null; collateral_usd: number | null; available: number | null; unrealised: number | null;
   /** the books' perp and future legs' uPnL, the like-for-like figure the exchange's unrealised is compared with */
@@ -327,7 +327,7 @@ function PositionsPanel({ doc }: { doc: VenuesDoc }) {
       <span className="seg">{present.map((x) => (
         <button key={x.id} className={x.id === v?.id ? "on" : ""} onClick={() => setSel(x.id)}>{x.label} {x.positions.length}</button>
       ))}</span>
-      <span className={`ph-r ${v?.positions_note ? "amb" : ""}`}>{v?.positions_source === "exchange" ? "the exchange's netted positions; close them from F7 (FLATTEN) or KILL" : v?.positions_note || "the books' legs netted per coin and market"}</span>
+      <span className={`ph-r ${v?.positions_note ? "amb" : ""}`}>{v?.positions_source === "exchange" ? `${v.positions_note || "the exchange's netted positions"}; close them from F7 (FLATTEN) or KILL` : v?.positions_note || "the books' legs netted per coin and market"}</span>
     </div>
   );
   if (!v) return <>{head}<div className="empty">No venue has started</div></>;

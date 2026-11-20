@@ -164,9 +164,22 @@ def _sum_known(vals: list[float | None]) -> float | None:
     return None if any(v is None for v in vals) else float(sum(vals))  # type: ignore[arg-type]
 
 
-def _derivative(p: dict) -> bool:
-    """A perp or future leg, the kind the exchange's unrealised P&L covers (a spot leg's value sits in the coin balance)."""
-    return str(p.get("market", "")).lower() != "spot"
+DERIVATIVE_MARKETS = ("linear", "inverse", "future")
+
+
+def _market_kind(p: dict) -> str | None:
+    """"derivative" (the kind the exchange's unrealised P&L covers), "spot" (its value sits in the coin balance), or None for
+    a market the dashboard does not know: unknown, never guessed."""
+    m = str(p.get("market", "")).lower()
+    return "derivative" if m in DERIVATIVE_MARKETS else "spot" if m == "spot" else None
+
+
+def _derivative_unrealised(positions: list[dict]) -> float | None:
+    """The derivative legs' uPnL summed; unknown when a leg's market or uPnL is unknown."""
+    kinds = [_market_kind(p) for p in positions]
+    if any(k is None for k in kinds):
+        return None
+    return _sum_known([p.get("upnl_usdt") for p, k in zip(positions, kinds) if k == "derivative"])
 
 
 def _signed(side: str, qty: float) -> float:
@@ -219,7 +232,9 @@ def exchange_positions(account: dict, strategies: list[dict]) -> list[dict]:
                 names.append(s["name"])
     out = [{"symbol": p.get("symbol", ""), "market": "linear", "side": p.get("side", ""), "size": _num(p.get("size")),
             "entry": _num(p.get("entry")), "mark": _num(p.get("mark")), "upnl": _num(p.get("upnl")),
-            "held_by": held.get(p.get("symbol", ""), []), "legs": None} for p in account.get("positions") or []]
+            "held_by": held.get(p.get("symbol", ""), []), "legs": None, "source": "exchange"} for p in account.get("positions") or []]
+    # the exchange feed holds USDT linear positions only (bybit_rest.positions): the books' spot legs are kept next to it
+    out += [{**r, "source": "books"} for r in net_positions(strategies) if r["market"] == "spot"]
     out.sort(key=lambda x: -abs(x["upnl"] or 0))
     return out
 
@@ -234,6 +249,7 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
     last_trade = max((t.get("t_ms") for t in trades if _num(t.get("t_ms")) is not None), default=None)
     return {
         "id": v["id"], "name": v.get("name") or S.short_name(v["id"], v.get("label", "")), "label": v.get("label", v["id"]), "unit": v.get("unit"),
+        "account": v.get("account"),
         "pill": v.get("pill"), "enabled": bool(st and st["enabled"]),
         "weight": st.get("weight") if st else None, "weight_requested": ctl.get("weight"),
         "set_by": st.get("set_by") if st and st.get("set_by") else ctl.get("set_by"),
@@ -249,7 +265,7 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
         "pnl_today": pnl_today, "pnl_today_since_ms": b.get("t_ms") if b and pnl_today is not None else None,
         "pnl_today_since": since_label(b.get("t_ms")) if b and pnl_today is not None else None,
         "unrealised": _sum_known([p.get("upnl_usdt") for p in st["positions"]]) if st else None,
-        "unrealised_derivatives": _sum_known([p.get("upnl_usdt") for p in st["positions"] if _derivative(p)]) if st else None,
+        "unrealised_derivatives": _derivative_unrealised(st["positions"]) if st else None,
         "last_error": st.get("last_error") if st else None,
         "updated_ms": st.get("updated_ms") if st else None, "last_rebalance_ms": st.get("last_rebalance_ms") if st else None,
         "last_trade_ms": last_trade, "trades_today": st.get("trades_today") if st else None,
@@ -367,9 +383,11 @@ def today_basis(rows: list[dict], base: dict | None, now_ms: float | None = None
     (runner stopped or hung across midnight) or it appeared later in the day (counted from then), or a strategy has no
     sample yet (left out of the sum)."""
     counted = [r for r in rows if r["pnl_today"] is not None]
-    gone = [r for r in rows if r["pnl_today"] is None and r["equity"] is not None]
-    stale_now = [r["name"] for r in gone if now_ms is not None and r["updated_ms"] is not None and now_ms - r["updated_ms"] > S.STALE_S * 1000]
-    missing = [r["name"] for r in gone if r["name"] not in stale_now]
+    gone = [r for r in rows if r["pnl_today"] is None]  # left out of the sum, whatever the reason: the sum is partial
+    unknown_eq = [r["name"] for r in gone if r["equity"] is None]
+    stale_now = [r["name"] for r in gone if r["equity"] is not None and now_ms is not None and r["updated_ms"] is not None
+                 and now_ms - r["updated_ms"] > S.STALE_S * 1000]
+    missing = [r["name"] for r in gone if r["equity"] is not None and r["name"] not in stale_now]
     entries = (base or {}).get("strategies", {})
     stamps = [r["pnl_today_since_ms"] for r in counted if r["pnl_today_since_ms"] is not None]
     notes: list[str] = []
@@ -388,6 +406,8 @@ def today_basis(rows: list[dict], base: dict | None, now_ms: float | None = None
         notes.append(f"no fresh status yet today for {', '.join(stale_now)} (runner stopped or hung; left out)")
     if missing:
         notes.append(f"no sample yet for {', '.join(missing)} (left out)")
+    if unknown_eq:
+        notes.append(f"equity unknown for {', '.join(unknown_eq)} (no readable status.json equity; left out)")
     mixed = bool(stamps) and max(stamps) - min(stamps) > MIDNIGHT_SLACK_MS
     label = None if not stamps or mixed else since_label(min(stamps))
     return label, mixed or bool(gone), "; ".join(notes) or None
@@ -514,6 +534,9 @@ class VenueHub:
         acct = self._account_for(cfg, doc, account)
         account_block = None
         acct_stale = False
+        # the exchange account is one account: compare it only with the books of the strategies that trade it
+        mine = self.primary.dashboard_account
+        acct_views = [v for v in doc["strategies"] if not mine or v.get("account") == mine] if acct else []
         if acct:
             w = acct["wallet"]
             # The dashboard's own exchange read (the per-symbol bot's executor) keeps its last wallet and positions when a
@@ -522,7 +545,7 @@ class VenueHub:
             age = max(0.0, now - last) if last else None
             acct_stale = bool(acct.get("sync_error")) or age is None or age > ACCOUNT_STALE_S
             acc_unreal = _num(w.get("unrealized_pnl")) if last else None  # the USDT coin's unrealised P&L: perps and futures only
-            books_deriv = books["unrealised_derivatives"]
+            books_deriv = _sum_known([r["unrealised_derivatives"] for r in rows if not mine or r["account"] == mine]) if rows else None
             account_block = {
                 "source": "exchange", "ccy": "USDT", "equity": _num(w.get("usdt_equity")) if last else None,
                 "collateral_usd": _num(w.get("equity")) if last else None, "available": _num(w.get("available")) if last else None,
@@ -543,7 +566,8 @@ class VenueHub:
                              "unattributed": None, "positions_n": None, "last_sync": _num(extra.get("updated_ms")),
                              "stale": False, "sync_error": None, "sync_age_s": None}
         if acct and not acct_stale:
-            positions, pos_source, pos_note = exchange_positions(acct, doc["strategies"]), "exchange", None
+            positions, pos_source = exchange_positions(acct, acct_views), "exchange"
+            pos_note = "the exchange's perp positions plus the books' spot legs" if any(r["source"] == "books" for r in positions) else None
         else:
             positions, pos_source = net_positions(doc["strategies"]), "books"
             pos_note = "the exchange read is stale, so these are the books' legs netted per coin and market" if acct else None

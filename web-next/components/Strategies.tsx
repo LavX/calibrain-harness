@@ -431,7 +431,7 @@ export function StrategiesView() {
       {v && v.account && <div className="muted strat-help">{doc.venue_label} account: {v.account.ccy} equity {money(v.account.equity, v.account.ccy)} · {v.account.source === "exchange" ? "derivatives unrealised" : "unrealised"} {smoney(v.account.unrealised, v.account.ccy)}</div>}
       <div className="strat-grid">
         {doc.strategies.map((s) => (
-          <Card key={s.id} s={s} doc={doc} inSet={set.includes(s.id)} toggleSet={() => toggleSet(s.id)} />
+          <Card key={`${doc.venue_id}:${s.id}`} s={s} doc={doc} inSet={set.includes(s.id)} toggleSet={() => toggleSet(s.id)} />
         ))}
       </div>
     </main>
