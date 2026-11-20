@@ -58,6 +58,7 @@ IDLE_ALERT_S = 24 * 3600  # an enabled strategy that held nothing and traded not
 # was up at midnight samples within this window. Anything later is labelled with its real time ("since 00:04 UTC").
 MIDNIGHT_SLACK_MS = 90 * 1000
 PRESENCE = ("live", "stale", "stopped", "absent", "error")
+ACCOUNT_STALE_S = 60.0  # the executor's own rule (Executor.check_guards): a sync error, or no good sync for 60 s, is stale
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,11 @@ def alerts(v: dict, now_ms: float) -> list[dict]:
         out.append({"venue": v["id"], "venue_label": v["label"], "strategy": sid, "name": name, "kind": kind, "level": level, "text": text})
 
     pres = v["presence"]
+    a = v.get("account") or {}
+    if a.get("stale"):
+        last = f"last good read {int(a['sync_age_s'] // 60)} min ago" if a.get("sync_age_s") is not None else "no good read yet"
+        add("warn", "account_stale", f"the dashboard's own exchange read is failing ({a.get('sync_error') or 'no recent sync'}; {last}): "
+            "the account figures are stale and positions are shown from the books")
     if pres == "stopped":
         add("crit", "unit_down", f"runner {v['presence_text']}: nothing trades or flattens on this venue")
     elif pres == "stale":
@@ -503,18 +509,26 @@ class VenueHub:
         since, partial, note = today_basis(rows, base, now_ms)
         acct = self._account_for(cfg, doc, account)
         account_block = None
+        acct_stale = False
         if acct:
             w = acct["wallet"]
-            acc_unreal = _num(w.get("unrealized_pnl"))  # the USDT coin's unrealised P&L: perps and futures only
+            # The dashboard's own exchange read (the per-symbol bot's executor) keeps its last wallet and positions when a
+            # sync fails: stale on a sync error or no good sync for ACCOUNT_STALE_S, never presented as current.
+            last = _num(acct.get("last_sync")) or None
+            age = max(0.0, now - last) if last else None
+            acct_stale = bool(acct.get("sync_error")) or age is None or age > ACCOUNT_STALE_S
+            acc_unreal = _num(w.get("unrealized_pnl")) if last else None  # the USDT coin's unrealised P&L: perps and futures only
             books_deriv = books["unrealised_derivatives"]
             account_block = {
-                "source": "exchange", "ccy": "USDT", "equity": _num(w.get("usdt_equity")), "collateral_usd": _num(w.get("equity")),
-                "available": _num(w.get("available")), "unrealised": acc_unreal, "books_unrealised": books_deriv,
+                "source": "exchange", "ccy": "USDT", "equity": _num(w.get("usdt_equity")) if last else None,
+                "collateral_usd": _num(w.get("equity")) if last else None, "available": _num(w.get("available")) if last else None,
+                "unrealised": acc_unreal, "books_unrealised": books_deriv,
                 # no account P&L today: the USDT coin's equity drops when a spot leg is bought, which is not a loss
                 "pnl_today": None, "pnl_today_since": None,
-                # like with like: the exchange's derivatives uPnL minus the books' perp and future legs' uPnL
-                "unattributed": (acc_unreal - books_deriv) if acc_unreal is not None and books_deriv is not None else None,
-                "positions_n": len(acct.get("positions") or []), "last_sync": acct.get("last_sync"),
+                # like with like: the exchange's derivatives uPnL minus the books' perp and future legs' uPnL (never against a stale read)
+                "unattributed": (acc_unreal - books_deriv) if not acct_stale and acc_unreal is not None and books_deriv is not None else None,
+                "positions_n": len(acct.get("positions") or []) if last else None, "last_sync": last,
+                "stale": acct_stale, "sync_error": str(acct["sync_error"])[:300] if acct.get("sync_error") else None, "sync_age_s": age,
             }
         elif has_registry and (extra := S.read_json(cfg.root / "account.json")):
             eq, start = _num(extra.get("equity")), _num(extra.get("day_start_equity"))
@@ -522,8 +536,13 @@ class VenueHub:
                              "available": _num(extra.get("available")), "unrealised": _num(extra.get("unrealised")), "books_unrealised": None,
                              "pnl_today": (eq - start) if eq is not None and start is not None else None,
                              "pnl_today_since": "since the runner's day start" if start is not None else None,
-                             "unattributed": None, "positions_n": None, "last_sync": _num(extra.get("updated_ms"))}
-        positions = exchange_positions(acct, doc["strategies"]) if acct else net_positions(doc["strategies"])
+                             "unattributed": None, "positions_n": None, "last_sync": _num(extra.get("updated_ms")),
+                             "stale": False, "sync_error": None, "sync_age_s": None}
+        if acct and not acct_stale:
+            positions, pos_source, pos_note = exchange_positions(acct, doc["strategies"]), "exchange", None
+        else:
+            positions, pos_source = net_positions(doc["strategies"]), "books"
+            pos_note = "the exchange read is stale, so these are the books' legs netted per coin and market" if acct else None
         counts = {k: sum(1 for r in rows if r["pill"] == k) for k in ("running", "idle", "paused")}
         counts["total"] = len(rows)
         counts["abnormal"] = counts["total"] - counts["running"] - counts["idle"] - counts["paused"]
@@ -534,7 +553,7 @@ class VenueHub:
             "counts": counts, "books": books,
             "pnl_today": sum(r["pnl_today"] for r in today) if today else None,
             "pnl_today_partial": partial, "pnl_today_since": since, "pnl_today_note": note,
-            "account": account_block, "strategies": rows, "positions": positions,
+            "account": account_block, "strategies": rows, "positions": positions, "positions_source": pos_source, "positions_note": pos_note,
             # available: KILL writes the flags (everything but absent/error); ok: and the runner would act on them now
             "kill": {"ok": pres == "live", "available": pres not in ("absent", "error"),
                      "why": None if pres == "live" else kill_refusal(cfg, pres, why)},

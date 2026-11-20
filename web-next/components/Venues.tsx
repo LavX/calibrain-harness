@@ -28,6 +28,8 @@ export type VAccount = {
   books_unrealised: number | null;
   /** only from a runner's account.json (its own day start); never computed from the exchange's USDT coin equity */
   pnl_today: number | null; pnl_today_since: string | null; unattributed: number | null; positions_n: number | null; last_sync: number | null;
+  /** the dashboard's own exchange read failed or is older than 60 s: the figures are the last known, positions come from the books */
+  stale: boolean; sync_error: string | null; sync_age_s: number | null;
 };
 export type Venue = {
   id: string; label: string; ccy: string; controlled_by: "allocator" | "owner"; root: string; unit: string | null;
@@ -36,7 +38,7 @@ export type Venue = {
   books: { equity: number | null; start: number | null; pnl: number | null; unrealised: number | null; unrealised_derivatives: number | null; incomplete: string[]; legs: number };
   /** pnl_today_since is null when the strategies' baselines differ; pnl_today_note says why (late first sample, a strategy seen later, no sample yet) */
   pnl_today: number | null; pnl_today_partial: boolean; pnl_today_since: string | null; pnl_today_note: string | null;
-  account: VAccount | null; strategies: VStrat[]; positions: VPos[];
+  account: VAccount | null; strategies: VStrat[]; positions: VPos[]; positions_source: "exchange" | "books"; positions_note: string | null;
   /** available: KILL writes the flags (every venue that has started); ok: and the runner would act on them now. */
   kill: { ok: boolean; available: boolean; why: string | null };
 };
@@ -188,9 +190,10 @@ function VenueStrip({ doc }: { doc: VenuesDoc }) {
 function AccountRow({ v }: { v: Venue }) {
   const a = v.account!;
   return (
-    <tr className="acct-row">
+    <tr className={`acct-row ${a.stale ? "stale-row" : ""}`}>
       <td colSpan={8}>
-        <span className="muted">{v.label} account{a.source === "account.json" ? " (runner's account.json)" : ""}:</span>{" "}
+        {a.stale && <><span className="vbadge bad" data-tip={a.sync_error || "no good exchange read in the last 60 s"}>STALE · {a.sync_age_s !== null ? age(a.sync_age_s) : "never read"}</span>{" "}</>}
+        <span className="muted">{v.label} account{a.source === "account.json" ? " (runner's account.json)" : ""}{a.stale ? ", last known" : ""}:</span>{" "}
         {a.ccy} equity <b className="w">{money(a.equity, a.ccy)}</b>
         {isNum(a.collateral_usd) && <span data-tip="Bybit totalEquity: every coin in the unified account, valued in USD. Not the strategies' money."> · all collateral {money(a.collateral_usd, "USD")}</span>}
         {" · "}<span data-tip={a.source === "exchange" ? "The exchange's unrealised P&L on perps and futures (spot legs are in the coin balances)" : undefined}>{a.source === "exchange" ? "derivatives unrealised" : "unrealised"}</span> <span className={ud(a.unrealised)}>{smoney(a.unrealised, a.ccy)}</span>
@@ -320,7 +323,7 @@ function PositionsPanel({ doc }: { doc: VenuesDoc }) {
       <span className="seg">{present.map((x) => (
         <button key={x.id} className={x.id === v?.id ? "on" : ""} onClick={() => setSel(x.id)}>{x.label} {x.positions.length}</button>
       ))}</span>
-      <span className="ph-r">{v?.account?.source === "exchange" ? "the exchange's netted positions; close them from F7 (FLATTEN) or KILL" : "the books' legs netted per coin and market"}</span>
+      <span className={`ph-r ${v?.positions_note ? "amb" : ""}`}>{v?.positions_source === "exchange" ? "the exchange's netted positions; close them from F7 (FLATTEN) or KILL" : v?.positions_note || "the books' legs netted per coin and market"}</span>
     </div>
   );
   if (!v) return <>{head}<div className="empty">No venue has started</div></>;

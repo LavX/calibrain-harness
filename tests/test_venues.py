@@ -413,7 +413,8 @@ def test_venue_label_says_when_and_why_baselines_differ(roots, tmp_path):
 
 
 ACCOUNT = {"wallet": {"equity": 163245.78, "usdt_equity": 49911.05, "available": 99007.9, "unrealized_pnl": 24.4},
-           "positions": [{"symbol": "BTCUSDT", "side": "short", "size": 0.05, "entry": 90000.0, "mark": 90100.0, "upnl": -5.0}]}
+           "positions": [{"symbol": "BTCUSDT", "side": "short", "size": 0.05, "entry": 90000.0, "mark": 90100.0, "upnl": -5.0}],
+           "last_sync": NOW + 50, "sync_error": None}  # a good read seconds before every NOW used with it below
 
 
 def test_bybit_account_block_compares_like_with_like(roots, tmp_path):
@@ -425,7 +426,8 @@ def test_bybit_account_block_compares_like_with_like(roots, tmp_path):
     # carry holds a linear leg (uPnL -5.0) and a spot leg (+4.5): only the linear one is in the exchange's unrealised
     assert a["books_unrealised"] == pytest.approx(-5.0) and a["unattributed"] == pytest.approx(24.4 + 5.0)
     assert b["books"]["unrealised"] == pytest.approx(-0.5)  # the books' own figure keeps both legs
-    assert b["positions"][0]["held_by"] == ["Carry"]  # the exchange's netted row, with who holds a leg
+    assert b["positions"][0]["held_by"] == ["Carry"] and b["positions_source"] == "exchange"  # the exchange's netted row, with who holds a leg
+    assert a["stale"] is False and not any(x["kind"] == "account_stale" for x in doc["alerts"])
     okx = doc["venues"][1]
     assert okx["account"] is None and okx["books"]["equity"] == 20004.0  # other venues: books only
 
@@ -436,6 +438,25 @@ def test_a_spot_purchase_does_not_move_any_pnl_today(roots, tmp_path):
     bought = {**ACCOUNT, "wallet": {**ACCOUNT["wallet"], "usdt_equity": 49911.05 - 4500.0}}  # 0.05 BTC bought with USDT
     v = run(hub(roots, sd, tmp_path, now=NOW + 60).summary(bought))["venues"][0]
     assert v["account"]["pnl_today"] is None and v["pnl_today"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("failure", [{"sync_error": "HTTP 503 from api-demo.bybit.com"}, {"last_sync": NOW - 300}])
+def test_a_failing_exchange_read_is_stale_and_positions_come_from_the_books(roots, tmp_path, failure):
+    acct = {**ACCOUNT, "positions": [], **failure}  # the executor kept an old, empty snapshot
+    doc = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(acct))
+    b = doc["venues"][0]
+    a = b["account"]
+    assert a["stale"] is True and a["unattributed"] is None  # never compare fresh books with a stale account
+    assert b["positions_source"] == "books" and "stale" in b["positions_note"]
+    assert {(p["symbol"], p["market"]) for p in b["positions"]} == {("BTCUSDT", "linear"), ("BTCUSDT", "spot")}  # carry's legs, not "flat"
+    alert = next(x for x in doc["alerts"] if x["kind"] == "account_stale")
+    assert alert["venue"] == "bybit-demo" and ("503" in alert["text"] or "min ago" in alert["text"])
+
+
+def test_an_account_never_synced_is_unknown(roots, tmp_path):
+    acct = {**ACCOUNT, "last_sync": 0.0, "sync_error": "invalid api key"}
+    a = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary(acct))["venues"][0]["account"]
+    assert a["stale"] is True and a["equity"] is None and a["unrealised"] is None and a["sync_age_s"] is None
 
 
 def test_unknown_values_stay_unknown(roots, tmp_path):

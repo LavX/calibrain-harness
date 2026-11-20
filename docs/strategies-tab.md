@@ -125,7 +125,10 @@ is marked partial with the reason (the harness's first sample of the day was lat
 later, a strategy appeared later and is counted from then, or a strategy has no fresh status yet). There is no account-level P&L today on bybit-demo: the USDT coin's
 equity drops when a spot leg is bought with USDT, which is not a loss. The account line shows the USDT equity apart from
 all collateral, and "unattributed" compares like with like: the exchange's derivatives unrealised P&L minus the books'
-perp and future legs (spot legs excluded); it is unknown when any leg's uPnL is unknown. Other venues show sums over their
+perp and future legs (spot legs excluded); it is unknown when any leg's uPnL is unknown. The account comes from the
+dashboard's own exchange read (the per-symbol bot's executor), which keeps its last snapshot when a sync fails: on a sync
+error or no good read for 60 s the line is marked STALE with its age, unattributed is not computed, the positions panel
+falls back to the books' legs (and says so), and an "account stale" alert is raised. Other venues show sums over their
 books until the runner publishes `<root>/account.json` (read when it exists). The MANUAL header set is kept in the same directory
 (`auto-set-bybit-demo.json`), not in the browser.
 
