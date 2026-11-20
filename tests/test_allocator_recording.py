@@ -349,3 +349,37 @@ def test_a_split_cut_short_is_finished_at_the_next_rotation(tmp_path):
     (d / "decisions.jsonl").write_text(json.dumps({"t_ms": t0 + day + 1000, "k": "b"}) + "\n")
     DL.append(d, {"t_ms": t0 + 2 * day + 1000, "k": "c"}, t0 + 2 * day + 1000)
     assert [r["k"] for r in DL.iter_all(d)] == ["a", "b", "c"] and not (d / "decisions.jsonl.rotating").exists()
+
+
+# ---------------------------------------------------------------- archiving never stands in the way of a decision
+@pytest.mark.parametrize("step", ["replace", "split", "gzip", "fsync", "unlink"])
+def test_a_failing_rotation_never_stops_a_weights_run(root, monkeypatch, step):
+    from ctb import decision_log as DL
+
+    DL._failures.clear()
+    d = root / "allocator"
+    d.mkdir(exist_ok=True)
+    put(d / "control.json", {"enabled": True, "interval_min": 60})
+    now = int(T0 * 1000)
+    three = now - 3 * DAY * 1000
+    (d / f"decisions-{DL.utc_day(three)}.jsonl").write_text(json.dumps({"t_ms": three, "k": "old"}) + "\n")  # something to gzip
+    (d / "decisions.jsonl").write_text(json.dumps({"t_ms": now - DAY * 1000, "k": "yesterday"}) + "\n")  # due for rotation
+    boom = OSError(5, f"{step} failed")
+
+    def fail(*a, **k):
+        raise boom
+
+    target = {"replace": "_replace", "split": "_split", "gzip": "_gzip", "fsync": "_fsync", "unlink": "_unlink"}[step]
+    monkeypatch.setattr(DL, target, fail)
+    llm = FakeDecider(answers({"carry": 0.6, "trend": 0.6, "xsmom": 0.6}))
+    a = make(root, llm)
+    asyncio.run(a._tick())  # a weights run (none was ever set)
+    asyncio.run(a._tick())  # nothing due
+    mine = [r for r in DL.iter_all(d) if r.get("t_ms") == now]
+    assert len(mine) == 1 and mine[0]["weights_mode"] == "computed" and llm.calls == 1  # written once, decided once
+    assert json.loads((d / "state.json").read_text())["last_weights_ms"] == now
+    status = json.loads((d / "status.json").read_text())
+    assert status["last_decision_ms"] == now and "decision log rotation failed" in status["last_error"] and f"{step} failed" in status["last_error"]
+    b = make(root, llm)
+    assert len(b.budget.calls) == 1  # the restart's budget seed counts the one attempt once
+    DL._failures.clear()

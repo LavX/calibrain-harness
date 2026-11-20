@@ -1872,6 +1872,9 @@ class Allocator:
         last_dec = (self.decisions(1) or [{}])[0]
         fc = self.load_forecast(now_ms) if self.mode == "decider" else None
         err = _join_errors(self.last_error, self._state().get("cap_error")) or (fc.error if fc else None)
+        rot = DL.rotation_error(self.dir)
+        if rot:  # archiving only: the lines keep going to decisions.jsonl
+            err = _join_errors(err, f"decision log rotation failed, lines keep going to decisions.jsonl and it is retried every 15 min ({rot})")
         floor = [f"{e['venue_label']} {e['strategy'] or '(venue)'}: {e['error']}" for e in self.floor_errors.values()]
         if floor:  # the drawdown floor could not cut a book: said even while paused
             err = "; ".join(([err] if err else []) + [f"drawdown floor could not write control.json ({'; '.join(floor)})"])
