@@ -203,7 +203,7 @@ def test_dry_run_writes_nothing(root):
 def test_pnl_windows_come_from_equity_samples(root):
     a = make(root, FakeLLM(good()))
     st = a._state()
-    st["history"]["carry"] = [[int(T0 * 1000) - 8 * 86_400_000, 900.0], [int(T0 * 1000) - 25 * 3600_000, 950.0]]
+    st["history"][a.vk("bybit-demo", "carry")] = [[int(T0 * 1000) - 8 * 86_400_000, 900.0], [int(T0 * 1000) - 25 * 3600_000, 950.0]]
     put(root / "carry" / "status.json", {"state": "running", "equity_usdt": 1000.0, "start_equity_usdt": 900.0, "pnl_pct": 11.1})
     ctx = a.strategy_context({"id": "carry"}, int(T0 * 1000))[0]
     assert ctx["pnl_1d_pct"] == 5.26 and ctx["pnl_7d_pct"] == 11.11 and ctx["pnl_since_start_pct"] == 11.1

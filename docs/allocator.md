@@ -25,6 +25,19 @@ Layout under the live root (`CTB_LIVE_ROOT`, default `data/live`; on aurora4
 | `allocator/state.json` | allocator | equity samples and peaks for the P&L windows and the drawdown floor, the decider's last answers (`p_hist`), `last_weights_ms` |
 | `forecast/latest.json`, `regime/latest.json` | prediction layer (`research/live/forecast.py`, `regime.py`) | read only here; contract in `live-status-contract.md` revision 3 |
 
+## Venues
+
+The allocator lives in the bybit-demo root (its control, status, decisions and state files, and the forecast and regime
+it reads) and makes one decision per strategy there. It applies that decision to every venue in `CTB_LIVE_ROOTS` that it
+controls (`CTB_ALLOCATOR_VENUES`, default all) and whose runner's strategies.json lists the strategy; a strategy a venue
+does not list is never written there, and a strategy no decision covers (not on bybit-demo) is held. Each venue is its own
+account: the vol cap is computed over that venue's strategies, the drawdown floor, the day anchor of the daily step and
+the exploration floor are per (venue, strategy), and every write checks that venue's owner lock and pending kill and the
+allocator's pause. `state.json` keys peaks, history and the day anchor as `<venue>/<strategy>` (files from before are
+migrated on load: their keys become `bybit-demo/<id>`, values unchanged; `keys_version` 2). The decider's answers
+(`p_hist`) stay per strategy. A decision line keeps bybit-demo's fields at the top level and adds `venues`: per venue the
+weights, what was written, and the owner-lock, kill-pending, paused and risk-floor skips. A risk-floor line names its venue.
+
 ## Rules enforced in code
 
 - A weight moves at most 0.5 per decision.
