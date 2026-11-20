@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { loadNews } from "@/lib/data";
 import { useStore } from "@/lib/store";
-import { dt, fx, isNum, sg, short, ud } from "@/lib/format";
+import { dt, fx, isNum, NA, sg, short, ud } from "@/lib/format";
 import { KV, openDecision } from "./Monitor";
 
 /* ---------------------------------------------------------------- charts for EVAL (hand-drawn SVG) */
@@ -57,7 +57,7 @@ const Panel = ({ code, title, span2, tight, children }: { code: string; title: s
   <section className={`pnl${span2 ? " span2" : ""}`}><div className="ph"><span className="code">{code}</span>{title}</div><div className={`pb${tight ? " tight" : ""}`}>{children}</div></section>
 );
 
-const dist = (d: any, unit = "bp") => (d ? `${sg(d.mean, 1)}${unit} mean · p90 ${sg(d.p90, 1)} · max ${sg(d.max, 1)} (n=${d.n})` : "—");
+const dist = (d: any, unit = "bp") => (d ? `${sg(d.mean, 1)}${unit} mean · p90 ${sg(d.p90, 1)} · max ${sg(d.max, 1)} (n=${d.n})` : NA);
 
 export function EvalView() {
   const st = useStore((s) => s.ov?.settings);
@@ -98,16 +98,16 @@ export function EvalView() {
   );
   if (!m) return <main className="view on">{toolbar}<div className="empty">Computing metrics…</div></main>;
   const mq = m.model_quality, ops = m.ops, edge = m.edge, cons = m.consistency, t = m.trading, ex = t.execution || {};
-  const pct = (x: any) => (isNum(x) ? (100 * Number(x)).toFixed(0) + "%" : "—");
+  const pct = (x: any) => (isNum(x) ? (100 * Number(x)).toFixed(0) + "%" : NA);
   const cells: [string, React.ReactNode, string][] = [
     ["Model requests", ops.requests, `${ops.ok} ok · err ${fx(100 * (ops.error_rate || 0), 1)}%`], ["Labelled", m.labelled, "scored against reality"],
-    ["Latency p50", isNum(ops.latency_ms_p50) ? fx(ops.latency_ms_p50, 0) + " ms" : "—", `p90 ${isNum(ops.latency_ms_p90) ? fx(ops.latency_ms_p90, 0) : "—"} ms`],
+    ["Latency p50", isNum(ops.latency_ms_p50) ? fx(ops.latency_ms_p50, 0) + " ms" : NA, `p90 ${isNum(ops.latency_ms_p90) ? fx(ops.latency_ms_p90, 0) : NA} ms`],
     ["Brier skill long", sg(mq.long_bracket?.skill_vs_climatology, 3), "> 0 beats base rates"], ["Brier skill short", sg(mq.short_bracket?.skill_vs_climatology, 3), "> 0 beats base rates"],
     ["AUC target first", `${fx(mq.long_bracket?.auc_target_first, 2)} / ${fx(mq.short_bracket?.auc_target_first, 2)}`, "long / short · 0.50 = random"],
     ["ρ(EV, realised R)", sg(edge.spearman_ev_vs_realised_r, 3), `n = ${edge.n || 0} side-decisions`],
     ["Strict signals R", sg(edge.strict_signals_mean_r, 3), `n = ${edge.strict_signals_n || 0} · win ${pct(edge.strict_signals_win_rate)}`],
     ["Explore signals R", sg(edge.exploration_signals_mean_r, 3), `n = ${edge.exploration_signals_n || 0} · win ${pct(edge.exploration_signals_win_rate)}`],
-    ["Testnet net PnL", <span key="p" className={ud(t.net_pnl_usdt)}>{sg(t.net_pnl_usdt)}</span>, `${t.closed} trades · from Bybit closed-PnL`],
+    ["Bot net P&L", <span key="p" className={ud(t.net_pnl_usdt)}>{sg(t.net_pnl_usdt)}</span>, `${t.closed} trades · from Bybit closed-PnL`],
   ];
   const qr = (b: any, k = "brier") => b && b.n ? (
     <tr key={b.name}><td className="amb">{b.name}</td><td className="r">{b.n}</td><td className="r">{fx(b[k], 4)}</td><td className="r">{fx(b[k + "_climatology"], 4)}</td><td className="r">{fx(b[k + "_uniform"], 4)}</td>
@@ -115,7 +115,7 @@ export function EvalView() {
   ) : null;
   const mr = mq.mean_reversion, pit = mq.return_distribution?.pit_histogram_quintiles;
   const bq = (b: any) => b && b.n ? (
-    <tr key={b.name}><td className="amb">{b.name}</td><td className="r">{b.n}</td><td className="r">{fx(b.brier, 4)}</td><td className="r">{fx(b.brier_climatology, 4)}</td><td className="r">—</td>
+    <tr key={b.name}><td className="amb">{b.name}</td><td className="r">{b.n}</td><td className="r">{fx(b.brier, 4)}</td><td className="r">{fx(b.brier_climatology, 4)}</td><td className="r">{NA}</td>
       <td className={`r ${ud(b.skill_vs_climatology)}`}>{sg(b.skill_vs_climatology, 3)}</td><td className="r">AUC {fx(b.auc, 3)}</td></tr>
   ) : null;
   const vb = m.vs_base_rates || {}, cw = m.calibration_weights || {};
@@ -133,7 +133,7 @@ export function EvalView() {
           <table className="t"><thead><tr><th>Question</th><th className="r">n</th><th className="r">Score</th><th className="r">Climat.</th><th className="r">Uniform</th><th className="r">Skill</th><th className="r">Acc / majority</th></tr></thead>
             <tbody>{qr(mq.long_bracket)}{qr(mq.short_bracket)}{qr(mq.return_distribution, "rps")}{qr(mq.regime)}
               {bq(mq.direction)}{bq(mq.big_move)}
-              {mr && <tr><td className="amb">mean_reversion</td><td className="r">{mr.n}</td><td className="r">{fx(mr.brier, 4)}</td><td className="r">{fx(mr.brier_climatology, 4)}</td><td className="r">—</td><td className={`r ${ud(mr.skill_vs_climatology)}`}>{sg(mr.skill_vs_climatology, 3)}</td><td className="r">AUC {fx(mr.auc, 3)}</td></tr>}</tbody></table>
+              {mr && <tr><td className="amb">mean_reversion</td><td className="r">{mr.n}</td><td className="r">{fx(mr.brier, 4)}</td><td className="r">{fx(mr.brier_climatology, 4)}</td><td className="r">{NA}</td><td className={`r ${ud(mr.skill_vs_climatology)}`}>{sg(mr.skill_vs_climatology, 3)}</td><td className="r">AUC {fx(mr.auc, 3)}</td></tr>}</tbody></table>
           <div className="muted" style={{ padding: "4px 8px" }}>Multiclass Brier, or RPS for ordered bins. Lower is better. Skill = 1 − score / climatology.</div>
         </Panel>
         <Panel code="BASE" title="Model vs the base rates it was given · calibration weights" tight>
@@ -158,24 +158,24 @@ export function EvalView() {
         ]} /></Panel>
         <Panel code="OPS" title="Operations" tight><KV rows={[
           ["Errors", Object.entries<any>(ops.errors || {}).map(([k, v]) => `${k} ${v}`).join(", ") || "none"], ["Contract issues", ops.responses_with_issues],
-          ["Latency p99", isNum(ops.latency_ms_p99) ? fx(ops.latency_ms_p99, 0) + " ms" : "—"], ["Input tokens mean / max", `${fx(ops.input_tokens_mean, 0)} / ${ops.input_tokens_max ?? "—"}`],
-          ["Retried", ops.retried_requests], ["Policy actions", Object.entries<any>(m.policy.actions).map(([k, v]) => `${k} ${v}`).join(", ") || "—"],
+          ["Latency p99", isNum(ops.latency_ms_p99) ? fx(ops.latency_ms_p99, 0) + " ms" : NA], ["Input tokens mean / max", `${fx(ops.input_tokens_mean, 0)} / ${ops.input_tokens_max ?? NA}`],
+          ["Retried", ops.retried_requests], ["Policy actions", Object.entries<any>(m.policy.actions).map(([k, v]) => `${k} ${v}`).join(", ") || NA],
         ]} /></Panel>
-        <Panel code="PNL" title="Testnet trading · Bybit closed-PnL, every fill" tight>{t.closed ? <KV rows={[
+        <Panel code="PNL" title="Per-symbol bot trading · Bybit closed-PnL, every fill" tight>{t.closed ? <KV rows={[
           ["Closed trades", t.closed], ["Net PnL (after fees)", <span key="n" className={ud(t.net_pnl_usdt)}>{sg(t.net_pnl_usdt)} USDT</span>], ["Fees", `${fx(t.fees_usdt)} USDT`],
           ["Win rate", fx(t.win_rate, 3)], ["Profit factor", fx(t.profit_factor, 2)], ["Avg realised R", sg(t.avg_r, 3), "PnL ÷ (qty × |entry − live stop|)"], ["Avg predicted EV", sg(t.avg_predicted_ev_r, 3) + "R"],
           ["Max drawdown", `${fx(t.max_drawdown_usdt)} USDT`],
-          ["By mode", Object.entries<any>(t.by_mode || {}).map(([k, v]) => `${k} ${v.n} · ${sg(v.pnl)} · win ${(100 * v.win_rate).toFixed(0)}%`).join(" | ") || "—"],
+          ["By mode", Object.entries<any>(t.by_mode || {}).map(([k, v]) => `${k} ${v.n} · ${sg(v.pnl)} · win ${(100 * v.win_rate).toFixed(0)}%`).join(" | ") || NA],
           ["Exit reasons", Object.entries<any>(t.by_reason).map(([k, v]) => `${k} ${v}`).join(", ")],
-        ]} /> : <div className="empty">No closed testnet trades yet</div>}</Panel>
-        <Panel code="EXEC" title="Execution quality · real testnet fills" tight><KV rows={[
-          ["Entry slippage", dist(ex.entry_slip_bp), "Fill vs best testnet price at order time; + = worse"],
+        ]} /> : <div className="empty">No closed bot trades yet</div>}</Panel>
+        <Panel code="EXEC" title="Execution quality · real bot fills" tight><KV rows={[
+          ["Entry slippage", dist(ex.entry_slip_bp), "Fill vs the best price on the bot's venue at order time; + = worse"],
           ["Stop exit slippage", dist(ex.stop_exit_slip_bp), "Stop fill vs trigger; + = worse"],
           ["Target exit slippage", dist(ex.target_exit_slip_bp), "Target fill vs trigger; + = worse"],
-          ["Entry latency", ex.entry_latency_ms ? `${fx(ex.entry_latency_ms.p50, 0)} ms p50 · p90 ${fx(ex.entry_latency_ms.p90, 0)}` : "—", "Order sent → fill confirmed"],
-          ["Fill ratio", isNum(ex.fill_ratio_mean) ? `${fx(100 * ex.fill_ratio_mean, 1)}%` : "—", "Filled ÷ requested (IOC takes only liquidity inside the cap)"],
-          ["Multi-fill exits", ex.multi_fill_exits ?? "—"], ["Worst trade", isNum(ex.worst_r) ? sg(ex.worst_r, 2) + "R" : "—"],
-          ["Entry attempts", Object.entries<any>(t.attempts_by_status || {}).map(([k, v]) => `${k} ${v}`).join(", ") || "—"],
+          ["Entry latency", ex.entry_latency_ms ? `${fx(ex.entry_latency_ms.p50, 0)} ms p50 · p90 ${fx(ex.entry_latency_ms.p90, 0)}` : NA, "Order sent → fill confirmed"],
+          ["Fill ratio", isNum(ex.fill_ratio_mean) ? `${fx(100 * ex.fill_ratio_mean, 1)}%` : NA, "Filled ÷ requested (IOC takes only liquidity inside the cap)"],
+          ["Multi-fill exits", ex.multi_fill_exits ?? NA], ["Worst trade", isNum(ex.worst_r) ? sg(ex.worst_r, 2) + "R" : NA],
+          ["Entry attempts", Object.entries<any>(t.attempts_by_status || {}).map(([k, v]) => `${k} ${v}`).join(", ") || NA],
         ]} /></Panel>
         <Panel code="RAW" title="Raw metrics" span2><details><summary>show JSON</summary><pre className="code">{JSON.stringify(m, null, 1)}</pre></details></Panel>
       </div>
@@ -183,18 +183,18 @@ export function EvalView() {
   );
 }
 
-const pct0 = (x: any) => (isNum(x) ? (100 * Number(x)).toFixed(0) + "%" : "—");
-const when = (r: any) => (r.started_ts ? `${dt(r.started_ts)} → ${r.ended_ts ? dt(r.ended_ts) : "now"}` : "—");
+const pct0 = (x: any) => (isNum(x) ? (100 * Number(x)).toFixed(0) + "%" : NA);
+const when = (r: any) => (r.started_ts ? `${dt(r.started_ts)} → ${r.ended_ts ? dt(r.ended_ts) : "now"}` : NA);
 
 function RunsTable({ runs, overall, sel, onSel }: { runs: any[]; overall: any; sel: number | null; onSel: (id: number | null) => void }) {
   const row = (r: any, isAll = false) => {
     const c = r.config_json || {};
     return (
       <tr key={isAll ? "all" : r.id} className={`click ${(isAll ? sel === null : sel === r.id) ? "sel" : ""}`} onClick={() => onSel(isAll ? null : r.id)}>
-        <td className="sym">{isAll ? "OVERALL" : `RUN ${r.id}`}{r.current && <> <span className="tag long">LIVE</span></>}</td>
+        <td className="sym">{isAll ? "OVERALL" : `RUN ${r.id}`}{r.current && <> <span className="tag flat">CURRENT</span></>}</td>
         <td className="wrap" style={{ maxWidth: 280 }}>{isAll ? "all runs combined" : r.name.replace(/^Run \d+ · /, "")}</td>
         <td className="muted">{when(r)}</td>
-        <td>{isAll ? "—" : <><b className="amb">{c.model_provider ? String(c.model_provider).toUpperCase() : "KAIROS"}</b> · {c.qset || "—"} · {c.exploration_mode ? <span className="tag xp">EXPLORE</span> : <span className="tag amb">STRICT</span>} · {(c.symbols || []).length} sym</>}</td>
+        <td>{isAll ? NA : <><b className="amb">{c.model_provider ? String(c.model_provider).toUpperCase() : "KAIROS"}</b> · {c.qset || NA} · {c.exploration_mode ? <span className="tag xp">EXPLORE</span> : <span className="tag amb">STRICT</span>} · {(c.symbols || []).length} sym</>}</td>
         <td className="r">{r.decisions}</td>
         <td className="r">{r.labelled}</td>
         <td className="r">{r.closed}{r.open_trades ? <span className="muted"> +{r.open_trades} open</span> : ""}</td>
@@ -203,8 +203,8 @@ function RunsTable({ runs, overall, sel, onSel }: { runs: any[]; overall: any; s
         <td className="r">{pct0(r.win_rate)}</td>
         <td className={`r ${ud(r.avg_r)}`}>{sg(r.avg_r, 2)}</td>
         <td className="r">{fx(r.profit_factor, 2)}</td>
-        <td className="r">{isNum(r.entry_slip_bp) ? sg(r.entry_slip_bp, 1) : "—"}</td>
-        <td className="r">{isNum(r.stop_slip_bp) ? sg(r.stop_slip_bp, 1) : "—"}</td>
+        <td className="r">{isNum(r.entry_slip_bp) ? sg(r.entry_slip_bp, 1) : NA}</td>
+        <td className="r">{isNum(r.stop_slip_bp) ? sg(r.stop_slip_bp, 1) : NA}</td>
         <td className="r" data-tip="Signals scored on mainnet labels (traded or not)">{r.strict_n ? `${r.strict_n} · ${sg(r.strict_r, 2)}R` : "0"} / {r.explore_n ? `${r.explore_n} · ${sg(r.explore_r, 2)}R` : "0"}</td>
         <td className={`r ${ud(r.skill_long)}`}>{sg(r.skill_long, 2)} / {sg(r.skill_short, 2)}</td>
         <td className={`r ${ud(r.vs_base_long)}`}>{sg(r.vs_base_long, 2)}</td>
@@ -229,6 +229,7 @@ export function useRuns(rev: number) {
 
 export function TradesView() {
   const rev = useStore((s) => s.rev.trades);
+  const venueLabel: string = useStore((s) => s.ov?.settings?.venue_label) || "the bot's venue";
   const [run, setRun] = useState<number | null>(null);
   const [ts, setTs] = useState<any[] | null>(null);
   const runs = useRuns(rev);
@@ -240,7 +241,7 @@ export function TradesView() {
         <div className="pb tight scroll">{runs ? <RunsTable runs={runs.runs} overall={runs.overall} sel={run} onSel={setRun} /> : <div className="empty">Loading runs…</div>}</div>
       </section>
       <section className="pnl">
-        <div className="ph"><span className="code">TRD</span>Bot trades · {run ? `Run ${run}` : "all runs"} · Bybit testnet<span className="ph-r">P&amp;L, fees and exit price summed from every Bybit closed-PnL row</span></div>
+        <div className="ph"><span className="code">TRD</span>Bot trades · {run ? `Run ${run}` : "all runs"} · {venueLabel}<span className="ph-r">P&amp;L, fees and exit price summed from every Bybit closed-PnL row</span></div>
         <div className="pb tight scroll">
           {!ts ? <div className="empty">Loading…</div> : !ts.length ? <div className="empty">No trades yet. They appear once a model key is set and AUTO-TRADE is on.</div> : (
             <table className="t">
@@ -253,13 +254,13 @@ export function TradesView() {
                   const partial = t.requested_qty && t.qty < t.requested_qty * (1 - 1e-9);
                   return (
                     <tr key={t.id}>
-                      <td className="amb">{t.run_id ?? "—"}</td><td className="muted">{dt(t.opened_ts)}</td><td className="sym">{short(t.symbol)}</td><td><span className={`tag ${t.side}`}>{t.side.toUpperCase()}</span></td>
+                      <td className="amb">{t.run_id ?? NA}</td><td className="muted">{dt(t.opened_ts)}</td><td className="sym">{short(t.symbol)}</td><td><span className={`tag ${t.side}`}>{t.side.toUpperCase()}</span></td>
                       <td>{mode === "exploration" ? <span className="tag xp">EXPLORE</span> : mode === "strict" ? <span className="tag amb">STRICT</span> : ""}</td>
                       <td className="r">{t.qty}{partial && <span className="tag part" data-tip={`IOC filled ${t.qty} of ${t.requested_qty}`}> PART</span>}</td>
-                      <td className="r muted">{t.ref_price ?? "—"}</td><td className="r">{t.entry_price ?? "—"}</td><td className={`r ${ud(-(t.entry_slip_bp ?? 0))}`}>{isNum(t.entry_slip_bp) ? sg(t.entry_slip_bp, 1) : "—"}</td>
+                      <td className="r muted">{t.ref_price ?? NA}</td><td className="r">{t.entry_price ?? NA}</td><td className={`r ${ud(-(t.entry_slip_bp ?? 0))}`}>{isNum(t.entry_slip_bp) ? sg(t.entry_slip_bp, 1) : NA}</td>
                       <td className="r">{t.tp_price}</td><td className="r">{t.sl_price}</td>
-                      <td>{t.status}</td><td>{t.close_reason || ""}</td><td className="r">{isNum(t.exit_price) ? Number(t.exit_price).toPrecision(8) : "—"}</td>
-                      <td className={`r ${ud(-(t.exit_slip_bp ?? 0))}`}>{isNum(t.exit_slip_bp) ? sg(t.exit_slip_bp, 1) : "—"}</td><td className="r">{t.exit_fills ?? "—"}</td>
+                      <td>{t.status}</td><td>{t.close_reason || ""}</td><td className="r">{isNum(t.exit_price) ? Number(t.exit_price).toPrecision(8) : NA}</td>
+                      <td className={`r ${ud(-(t.exit_slip_bp ?? 0))}`}>{isNum(t.exit_slip_bp) ? sg(t.exit_slip_bp, 1) : NA}</td><td className="r">{t.exit_fills ?? NA}</td>
                       <td className={`r ${ud(t.realized_pnl)}`}>{sg(t.realized_pnl)}</td><td className="r">{fx(t.fees, 3)}</td><td className={`r ${ud(r)}`}>{sg(r)}</td><td className="r">{sg(t.ev_r, 3)}</td>
                       <td>{t.decision_id > 0 && <a href="#" onClick={(e) => { e.preventDefault(); openDecision(t.decision_id); }}>#{t.decision_id}</a>}</td>
                     </tr>
@@ -291,7 +292,7 @@ export function NewsView() {
                   return (
                     <tr key={f.id}>
                       <td className="muted">{dt(f.ts)}</td><td className="sym">{short(f.symbol)}</td><td className="wrap">{f.title} <span className="muted">{f.source}</span></td>
-                      <td>{p ? <svg width={146} height={20}>{p.map((v: number, i: number) => <rect key={i} x={i * 21} y={20 - v * 20} width={18} height={Math.max(v * 20, 1)} fill={i < 3 ? "var(--down)" : i > 3 ? "var(--up)" : "#6a6a6a"} data-tip={`bin ${i}: ${(100 * v).toFixed(1)}%`} />)}</svg> : <span className="tag err">{f.error_kind || "—"}</span>}</td>
+                      <td>{p ? <svg width={146} height={20}>{p.map((v: number, i: number) => <rect key={i} x={i * 21} y={20 - v * 20} width={18} height={Math.max(v * 20, 1)} fill={i < 3 ? "var(--down)" : i > 3 ? "var(--up)" : "#6a6a6a"} data-tip={`bin ${i}: ${(100 * v).toFixed(1)}%`} />)}</svg> : <span className="tag err">{f.error_kind || NA}</span>}</td>
                       <td className={`r ${ud(lean)}`}>{sg(lean, 2)}</td>
                       <td className="r">{f.label_json ? `${sg(f.label_json.return_bp, 1)} bp · bin ${f.label_json.bin}` : <span className="muted">pending</span>}</td>
                     </tr>
