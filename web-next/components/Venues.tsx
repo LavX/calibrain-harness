@@ -16,6 +16,8 @@ export type VStrat = {
   id: string; name: string; label: string; pill: string; enabled: boolean; weight: number | null; weight_requested: number | null;
   set_by: string | null; owner_lock: boolean; reason: string | null; flatten_pending: boolean; positions_n: number | null; targets_n: number | null;
   equity: number | null; start_equity: number | null; pnl: number | null; pnl_today: number | null; pnl_today_since_ms: number | null;
+  /** "since 00:00 UTC" or the real time of this strategy's baseline sample ("since 09:12 UTC") */
+  pnl_today_since: string | null;
   unrealised: number | null; last_error: string | null; updated_ms: number | null; last_rebalance_ms: number | null; last_trade_ms: number | null;
   trades_today: number | null;
 };
@@ -32,7 +34,8 @@ export type Venue = {
   presence: "live" | "stale" | "stopped" | "absent" | "error"; presence_text: string | null; updated_ms: number | null;
   counts: { running: number; idle: number; paused: number; abnormal: number; total: number };
   books: { equity: number | null; start: number | null; pnl: number | null; unrealised: number | null; unrealised_derivatives: number | null; incomplete: string[]; legs: number };
-  pnl_today: number | null; pnl_today_partial: boolean; pnl_today_since: string | null;
+  /** pnl_today_since is null when the strategies' baselines differ; pnl_today_note says why (late first sample, a strategy seen later, no sample yet) */
+  pnl_today: number | null; pnl_today_partial: boolean; pnl_today_since: string | null; pnl_today_note: string | null;
   account: VAccount | null; strategies: VStrat[]; positions: VPos[];
   /** available: KILL writes the flags (every venue that has started); ok: and the runner would act on them now. */
   kill: { ok: boolean; available: boolean; why: string | null };
@@ -122,7 +125,7 @@ export function WorldView() {
           <AllocatorLine doc={doc} />
         </section>
         <section className="pnl w-matrix">
-          <Ph code="MTX" right="cell: P&L since 00:00 UTC · applied weight · positions">Strategies × venues</Ph>
+          <Ph code="MTX" right="cell: P&L today (its baseline time when not 00:00 UTC) · applied weight · positions">Strategies × venues</Ph>
           <div className="pb tight scroll"><Matrix doc={doc} /></div>
         </section>
         <section className="pnl w-alerts">
@@ -148,7 +151,7 @@ function VenueStrip({ doc }: { doc: VenuesDoc }) {
       <thead><tr>
         <th>Venue</th><th>State</th>
         <th className="r" data-tip="Sum of the strategies' virtual books on this venue">Equity (books)</th>
-        <th className="r" data-tip="Books now minus the harness's own 00:00 UTC sample (kept on disk, survives restarts)">P&amp;L today</th>
+        <th className="r" data-tip="Books now minus the harness's own first sample of the UTC day (kept on disk, survives restarts); the time of that sample is shown when it is not 00:00 UTC">P&amp;L today</th>
         <th className="r" data-tip="Sum of every book's P&L since it started (status.json pnl_usdt)">P&amp;L since start</th>
         <th>Strategies</th><th>Controlled by</th><th />
       </tr></thead>
@@ -161,8 +164,10 @@ function VenueStrip({ doc }: { doc: VenuesDoc }) {
             <td className="sym" data-tip={`${v.root}${v.unit ? `\nunit ${v.unit}` : ""}`}>{v.label}</td>
             <td><Presence v={v} at={doc.generated_at} /></td>
             <td className="r" data-tip={v.books.incomplete.length ? `Leaves out ${v.books.incomplete.join(", ")}: equity or P&L unknown` : undefined}>{off ? NA : money(v.books.equity, v.ccy)}{v.books.incomplete.length > 0 && <span className="muted"> (partial)</span>}</td>
-            <td className={`r ${off ? "" : ud(v.pnl_today)}`} data-tip={v.pnl_today_since ? `${v.pnl_today_since}${v.pnl_today_partial ? "; some strategies have no sample yet" : ""}` : "no 00:00 UTC sample yet"}>
-              {off ? NA : smoney(v.pnl_today, v.ccy)}{v.pnl_today_partial && <span className="muted"> (partial)</span>}</td>
+            <td className={`r ${off ? "" : ud(v.pnl_today)}`} data-tip={off ? undefined : [v.pnl_today_since || (v.pnl_today === null ? "no sample yet today" : "the strategies' baselines differ"), v.pnl_today_note].filter(Boolean).join("\n")}>
+              {off ? NA : smoney(v.pnl_today, v.ccy)}
+              {!off && v.pnl_today_since && v.pnl_today_since !== "since 00:00 UTC" && <span className="muted"> {v.pnl_today_since}</span>}
+              {!off && v.pnl_today_partial && <span className="muted"> (partial)</span>}</td>
             <td className={`r ${off ? "" : ud(v.books.pnl)}`}>{off ? NA : smoney(v.books.pnl, v.ccy)}</td>
             <td>{off ? <span className="muted">not started</span> : <>{c.running} running · {c.idle} idle{c.paused ? ` · ${c.paused} paused` : ""} / {c.total}{c.abnormal > 0 && <b className="amb"> · {c.abnormal} need attention</b>}</>}</td>
             <td>{v.controlled_by === "allocator" ? "LLM allocator" : "owner"}</td>
@@ -275,7 +280,7 @@ function Cell({ v, s }: { v: Venue; s: VStrat | undefined }) {
     `${s.label} on ${v.label}: ${word}`,
     `applied weight ${w}${asked}${s.set_by ? `, set by ${s.set_by === "llm" ? "the LLM allocator" : "the owner"}` : ""}${s.owner_lock ? ", owner lock" : ""}`,
     s.reason ? `reason: ${s.reason}` : "",
-    `P&L today ${smoney(s.pnl_today, v.ccy)} · since start ${smoney(s.pnl, v.ccy)}`,
+    `P&L today ${smoney(s.pnl_today, v.ccy)} ${s.pnl_today_since || "(no sample yet)"} · since start ${smoney(s.pnl, v.ccy)}`,
     `${s.positions_n ?? NA} positions · ${s.trades_today ?? NA} trades today${s.last_trade_ms ? ` · last trade ${ago(s.last_trade_ms / 1000)}` : " · no trade yet"}`,
     s.updated_ms ? `status written ${ago(s.updated_ms / 1000)}` : "",
     s.last_error ? `LAST ERROR: ${s.last_error}` : "",
@@ -283,7 +288,7 @@ function Cell({ v, s }: { v: Venue; s: VStrat | undefined }) {
   return (
     <td className={`cell-m ${grey ? "stale-row" : ""}`} data-tip={tip}>
       <div><span className={grey ? "" : ud(s.pnl_today)}>{sg(s.pnl_today, 2)}</span>{(cls || s.pill !== "running") && <span className={`sbadge ${cls}`}>{word}</span>}{s.last_error && s.pill !== "error" && s.pill !== "latched" && <span className="sbadge warn">ERR</span>}</div>
-      <div className="muted">w {w}{s.owner_lock ? " · lock" : ""} · {s.positions_n ?? NA} pos</div>
+      <div className="muted">w {w}{s.owner_lock ? " · lock" : ""} · {s.positions_n ?? NA} pos{s.pnl_today_since && s.pnl_today_since !== "since 00:00 UTC" ? ` · ${s.pnl_today_since}` : ""}</div>
     </td>
   );
 }

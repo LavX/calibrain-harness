@@ -271,12 +271,45 @@ def test_baseline_resets_on_the_next_utc_day(roots, tmp_path):
     nxt = NOW + 86400
     run(hub(roots, sd, tmp_path, now=nxt).summary())
     assert json.loads((tmp_path / "state" / "baseline-bybit-demo.json").read_text())["day"] == V.utc_day(nxt)
+    status = roots[0] / "carry" / "status.json"
+    doc = json.loads(status.read_text())
+    doc["equity_usdt"] += 5.0
+    status.write_text(json.dumps(doc))
+    carry = next(r for r in run(hub(roots, sd, tmp_path, now=nxt + 60).summary())["venues"][0]["strategies"] if r["id"] == "carry")
+    assert carry["pnl_today"] == pytest.approx(5.0) and carry["pnl_today_since"] == "since 08:00 UTC"  # from the new day's sample
+
+
+MIDNIGHT = 1_800_057_600  # a UTC midnight; NOW is 08:00:30 UTC the day before
 
 
 def test_since_label_says_when_the_baseline_was_taken():
-    midnight = 1_800_057_600  # a UTC midnight
-    assert V.since_label(midnight * 1000 + 60_000, midnight + 3600) == "since 00:00 UTC"
-    assert V.since_label(midnight * 1000 + 3 * 3600_000, midnight + 4 * 3600).startswith("since 03:00 UTC")
+    assert V.since_label(MIDNIGHT * 1000 + 60_000) == "since 00:00 UTC"  # the sampler's first minute
+    assert V.since_label(MIDNIGHT * 1000 + 4 * 60_000) == "since 00:04 UTC"  # never rounded down to midnight
+    assert V.since_label(MIDNIGHT * 1000 + 3 * 3600_000) == "since 03:00 UTC"
+
+
+def test_venue_label_at_midnight_is_plain(roots, tmp_path):
+    v = run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path, now=MIDNIGHT + 30).summary())["venues"][1]
+    assert v["pnl_today_since"] == "since 00:00 UTC" and v["pnl_today_partial"] is False and v["pnl_today_note"] is None
+
+
+def test_venue_label_says_when_and_why_baselines_differ(roots, tmp_path):
+    okx = roots[1]
+    sd = FakeSystemd(active=[OKX_UNIT])
+    first = run(hub(roots, sd, tmp_path).summary())["venues"][1]
+    assert first["pnl_today_since"] == "since 08:00 UTC" and first["pnl_today_partial"] is False
+    assert "first sample at 08:00 UTC" in first["pnl_today_note"]  # the harness was not sampling at midnight
+    (okx / "xsmom").mkdir()  # a strategy that appears an hour later
+    (okx / "xsmom" / "status.json").write_text(json.dumps({"enabled": True, "state": "running", "updated_ms": (NOW + 3590) * 1000,
+                                                          "equity_usdt": 10000.0, "start_equity_usdt": 10000.0, "pnl_usdt": 0.0,
+                                                          "positions": [], "targets": []}))
+    reg = json.loads((okx / "strategies.json").read_text()) + [{"id": "xsmom", "label": "xsmom", "unit": OKX_UNIT, "account": "okx-demo"}]
+    (okx / "strategies.json").write_text(json.dumps(reg))
+    v = run(hub(roots, sd, tmp_path, now=NOW + 3600).summary())["venues"][1]
+    rows = {r["id"]: r for r in v["strategies"]}
+    assert rows["xsmom"]["pnl_today_since"] == "since 09:00 UTC" and rows["trend"]["pnl_today_since"] == "since 08:00 UTC"
+    assert v["pnl_today_since"] is None and v["pnl_today_partial"] is True
+    assert "Momentum first seen 09:00 UTC, counted from then" in v["pnl_today_note"]
 
 
 ACCOUNT = {"wallet": {"equity": 163245.78, "usdt_equity": 49911.05, "available": 99007.9, "unrealized_pnl": 24.4},

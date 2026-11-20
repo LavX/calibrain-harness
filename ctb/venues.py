@@ -53,7 +53,9 @@ KNOWN: dict[str, tuple[str, str | None, str, str]] = {
     "bitget-demo": ("BITGET·DEMO", "calibrain-live-bitget.service", "USDT", "owner"),
 }
 IDLE_ALERT_S = 24 * 3600  # an enabled strategy that held nothing and traded nothing for this long is flagged
-MIDNIGHT_SLACK_MS = 5 * 60 * 1000  # a baseline sampled this soon after 00:00 UTC counts as "since 00:00 UTC"
+# A baseline sampled this soon after 00:00 UTC counts as "since 00:00 UTC": the sampler runs every 60 s, so a harness that
+# was up at midnight samples within this window. Anything later is labelled with its real time ("since 00:04 UTC").
+MIDNIGHT_SLACK_MS = 90 * 1000
 PRESENCE = ("live", "stale", "stopped", "absent", "error")
 
 
@@ -234,6 +236,7 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
         "targets_n": sum(1 for t in st["targets"] if t.get("target_qty")) if st else None,
         "equity": eq, "start_equity": st.get("start_equity_usdt") if st else None, "pnl": st.get("pnl_usdt") if st else None,
         "pnl_today": pnl_today, "pnl_today_since_ms": b.get("t_ms") if b and pnl_today is not None else None,
+        "pnl_today_since": since_label(b.get("t_ms")) if b and pnl_today is not None else None,
         "unrealised": _sum_known([p.get("upnl_usdt") for p in st["positions"]]) if st else None,
         "unrealised_derivatives": _sum_known([p.get("upnl_usdt") for p in st["positions"] if _derivative(p)]) if st else None,
         "last_error": st.get("last_error") if st else None,
@@ -317,13 +320,36 @@ class Baselines:
         return doc
 
 
-def since_label(t_ms: float | None, now_s: float) -> str | None:
+def since_label(t_ms: float | None, now_s: float | None = None) -> str | None:
+    """"since 00:00 UTC" only for a sample taken within MIDNIGHT_SLACK_MS of that day's UTC midnight, else the sample's
+    real time ("since 09:12 UTC"). now_s is accepted for older callers and ignored."""
     if t_ms is None:
         return None
-    midnight_ms = int(now_s // 86400) * 86400 * 1000
-    if t_ms - midnight_ms <= MIDNIGHT_SLACK_MS:
+    if t_ms - (int(t_ms) // 86_400_000) * 86_400_000 <= MIDNIGHT_SLACK_MS:
         return "since 00:00 UTC"
-    return "since " + datetime.fromtimestamp(t_ms / 1000, timezone.utc).strftime("%H:%M") + " UTC (harness started after midnight)"
+    return "since " + datetime.fromtimestamp(t_ms / 1000, timezone.utc).strftime("%H:%M") + " UTC"
+
+
+def today_basis(rows: list[dict], base: dict | None) -> tuple[str | None, bool, str | None]:
+    """The venue's P&L today label: (since label or None when the strategies' baselines differ, partial, the reason).
+    Reasons are the real ones: the harness took the day's first sample late, a strategy appeared later in the day (it is
+    counted from then), or a strategy has no sample yet (left out of the sum)."""
+    counted = [r for r in rows if r["pnl_today"] is not None]
+    missing = [r["name"] for r in rows if r["pnl_today"] is None and r["equity"] is not None]
+    stamps = [r["pnl_today_since_ms"] for r in counted if r["pnl_today_since_ms"] is not None]
+    notes: list[str] = []
+    first = (base or {}).get("t_ms")
+    if first is not None and since_label(first) != "since 00:00 UTC":
+        notes.append(f"the harness took the day's first sample at {since_label(first)[6:]} (it was not sampling at 00:00 UTC)")
+    late = [r for r in counted if first is not None and r["pnl_today_since_ms"] is not None
+            and r["pnl_today_since_ms"] - first > MIDNIGHT_SLACK_MS]
+    for r in late:
+        notes.append(f"{r['name']} first seen {since_label(r['pnl_today_since_ms'])[6:]}, counted from then")
+    if missing:
+        notes.append(f"no sample yet for {', '.join(missing)} (left out)")
+    mixed = bool(stamps) and max(stamps) - min(stamps) > MIDNIGHT_SLACK_MS
+    label = None if not stamps or mixed else since_label(min(stamps))
+    return label, mixed or bool(missing), "; ".join(notes) or None
 
 
 # ------------------------------------------------------------------------------------------------ the hub
@@ -380,7 +406,7 @@ class VenueHub:
         now = self.clock()
         base = self._sample(cfg, doc, now)
         rows = {r["id"]: r for r in (strategy_row(v, base, now * 1000) for v in doc["strategies"])}
-        doc["strategies"] = [{**v, "pnl_today": rows[v["id"]]["pnl_today"], "pnl_today_since_ms": rows[v["id"]]["pnl_today_since_ms"]}
+        doc["strategies"] = [{**v, **{k: rows[v["id"]][k] for k in ("pnl_today", "pnl_today_since_ms", "pnl_today_since")}}
                              for v in doc["strategies"]]
         doc["venue_id"], doc["venue_label"], doc["ccy"], doc["controlled_by"] = cfg.id, cfg.label, cfg.ccy, cfg.controlled_by
         doc["allocator_venue"] = cfg.id == self.primary_id
@@ -426,7 +452,6 @@ class VenueHub:
         units = [u for u in doc["runners"] if u.get("unit") in wanted]
         pres, why = presence(cfg, has_registry=has_registry, reg_error=doc.get("error"), units=units,
                              statuses=[s.get("status") for s in doc["strategies"]], now_ms=now_ms)
-        known = [r for r in rows if r["equity"] is not None]
         today = [r for r in rows if r["pnl_today"] is not None]
 
         def total(key: str) -> float | None:  # the known values summed; None when none is known (never a made-up zero)
@@ -440,7 +465,7 @@ class VenueHub:
                  # strategies whose equity or P&L is unknown: the sums above leave them out, the page says "partial"
                  "incomplete": [r["name"] for r in rows if r["equity"] is None or r["pnl"] is None],
                  "legs": sum(r["positions_n"] or 0 for r in rows)}
-        since_ms = min((r["pnl_today_since_ms"] for r in today if r["pnl_today_since_ms"] is not None), default=None)
+        since, partial, note = today_basis(rows, base)
         acct = self._account_for(cfg, doc, account)
         account_block = None
         if acct:
@@ -473,8 +498,7 @@ class VenueHub:
             "updated_ms": max((r["updated_ms"] for r in rows if r["updated_ms"] is not None), default=None),
             "counts": counts, "books": books,
             "pnl_today": sum(r["pnl_today"] for r in today) if today else None,
-            "pnl_today_partial": bool(today) and len(today) < len(known),
-            "pnl_today_since": since_label(since_ms, now),
+            "pnl_today_partial": partial, "pnl_today_since": since, "pnl_today_note": note,
             "account": account_block, "strategies": rows, "positions": positions,
             # available: KILL writes the flags (everything but absent/error); ok: and the runner would act on them now
             "kill": {"ok": pres == "live", "available": pres not in ("absent", "error"),

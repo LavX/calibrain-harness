@@ -20,7 +20,7 @@ type Status = {
 type Trade = { t_ms: number; symbol: string; market: string; side: string; qty: number; price: number; fee_usdt: number };
 type Control = { enabled: boolean; weight: number | null; set_by: "llm" | "owner" | null; owner_lock: boolean; reason: string | null; flatten_pending: boolean; reset_pending: boolean };
 type Strat = {
-  id: string; name: string; label: string; pnl_today?: number | null; pnl_today_since_ms?: number | null; unit: string | null; account: string; status: Status | null; pill: string; control: Control;
+  id: string; name: string; label: string; pnl_today?: number | null; pnl_today_since_ms?: number | null; pnl_today_since?: string | null; unit: string | null; account: string; status: Status | null; pill: string; control: Control;
   trades: Trade[]; equity_history: [number, number][]; runner_active: boolean;
 };
 type Decision = { t_ms: number; model: string; trigger?: string; risk_floor?: string[]; error?: string | null; weights: Record<string, number>; enabled: Record<string, boolean>; reasoning: string; applied: Record<string, boolean> | null; skipped_owner_lock: string[] | null };
@@ -203,7 +203,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
           <>
             <div className="strip strat-strip">
               <div className="cell"><div className="l">Equity (book, {doc.ccy})</div><div className="n">{usdt(st.equity_usdt)}</div><div className="s">start {usdt(st.start_equity_usdt)}</div></div>
-              <div className="cell"><div className="l">P&amp;L today</div><div className={`n ${ud(s.pnl_today)}`}>{sg(s.pnl_today, 2)}</div><div className="s">since the 00:00 UTC sample</div></div>
+              <div className="cell"><div className="l">P&amp;L today</div><div className={`n ${ud(s.pnl_today)}`}>{sg(s.pnl_today, 2)}</div><div className="s">{s.pnl_today_since || "no sample yet today"}</div></div>
               <div className="cell"><div className="l">P&amp;L since start</div><div className={`n ${ud(st.pnl_usdt)}`}>{sg(st.pnl_usdt, 2)}</div><div className={`s ${ud(st.pnl_pct)}`}>{sg(st.pnl_pct, 2, "% since start")}</div></div>
               <div className="cell"><div className="l">Fees (USDT)</div><div className="n">{usdt(st.fees_usdt)}</div><div className="s">paid</div></div>
               <div className="cell"><div className="l">Funding (USDT)</div><div className={`n ${ud(st.funding_usdt)}`}>{sg(st.funding_usdt, 2)}</div><div className="s">received if positive</div></div>
