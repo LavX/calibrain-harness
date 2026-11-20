@@ -668,6 +668,7 @@ class Allocator:
         # allocation. Unset: chat when the client has ask_json, else decider (create_allocator always sets it).
         self.root = Path(root)
         self._kill_skips: list[str] = []  # the last _apply: strategies not switched on because a kill is pending
+        self._paused_skips: list[str] = []  # the last _apply: not written because the allocator was paused meanwhile
         self.llm = llm
         self.market = market
         self.model = model
@@ -1013,6 +1014,17 @@ class Allocator:
                 log.info("allocator: %s not switched on: a kill or flatten is pending (control.json flatten true)", sid)
                 self._kill_skips.append(sid)
                 return False
+            # A decision can take minutes (the model call); the owner may have paused the allocator meanwhile (AUTO-TRADE OFF, or
+            # a switch to MANUAL or PER-SYMBOL BOT). Read its control again here, at the write: while paused only a write that
+            # reduces risk goes through (switching off, or a lower weight on a strategy that is on), never an enable or a raise.
+            if not self.control()["enabled"]:
+                cur_on = ctl.get("enabled") is True
+                cur_w = _num(ctl.get("weight"))
+                reducing = (not enabled) or (cur_on and cur_w is not None and weight <= cur_w + 1e-12)
+                if not reducing:
+                    log.info("allocator: %s not written: the allocator was paused while this decision ran", sid)
+                    self._paused_skips.append(sid)
+                    return False
             ctl.update({"enabled": enabled, "weight": weight, "set_by": "llm", "reason": reason[:REASONING_MAX_CHARS],
                         "updated_ms": now_ms})
             if flatten_on_zero:
@@ -1024,6 +1036,7 @@ class Allocator:
                refresh_reasons: bool = False) -> dict[str, bool]:
         applied: dict[str, bool] = {}
         self._kill_skips = []  # filled by _write_control: strategies not switched on because a kill is pending
+        self._paused_skips = []  # and those not written because the allocator was paused while the decision ran
         for sid, c in current.items():
             if sid in plan.skipped_owner_lock:
                 applied[sid] = False
@@ -1113,6 +1126,7 @@ class Allocator:
                 "mode": self.mode,
                 "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
                 "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                "skipped_paused": [x for x in self._paused_skips if x in applied],
                 "risk_floor": plan.floored if plan else [], "step_limited": plan.step_limited if plan else [],
                 "explore_floor": explored,
                 "error": error, "dry_run": dry_run,
@@ -1188,6 +1202,7 @@ class Allocator:
                 "reasoning": why, "confidence": None, "requested": None, "mode": self.mode, "weights_mode": kind,
                 "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock if plan else [],
                 "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                "skipped_paused": [x for x in self._paused_skips if x in applied],
                 "risk_floor": plan.floored if plan else [],
                 "step_limited": next((st["changed"] for st in (calc_out or {}).get("steps", []) if st["step"] == "step"), []),
                 "p_decider": p_now,
@@ -1247,7 +1262,8 @@ class Allocator:
             record = {"t_ms": now_ms, "model": "risk-floor", "trigger": "risk", "weights": plan.weights, "enabled": plan.enabled,
                       "reasoning": "; ".join(reasons.values()), "inputs": {"drawdown_pct": {s: _r(current[s].drawdown_pct, 2) for s in todo}},
                       "applied": applied, "skipped_owner_lock": plan.skipped_owner_lock,
-                      "skipped_kill_pending": [x for x in self._kill_skips if x in applied], "risk_floor": todo, "attempts": 0}
+                      "skipped_kill_pending": [x for x in self._kill_skips if x in applied],
+                "skipped_paused": [x for x in self._paused_skips if x in applied], "risk_floor": todo, "attempts": 0}
             append_jsonl(self.dir / "decisions.jsonl", record)
             self._save_state()
             return record

@@ -289,7 +289,7 @@ def is_active(st: dict[str, Any]) -> bool:
 
 # ------------------------------------------------------------------------------------------------ service
 DECISION_KEYS = ("t_ms", "model", "trigger", "weights", "enabled", "reasoning", "applied", "skipped_owner_lock", "skipped_kill_pending",
-                 "risk_floor", "error")
+                 "skipped_paused", "risk_floor", "error")
 
 
 def clean_allocator(status: dict | None, control: dict | None, decisions: list[dict]) -> dict[str, Any]:

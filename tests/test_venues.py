@@ -818,3 +818,51 @@ def test_kill_all_kills_the_per_symbol_bot_only_when_it_owns_the_account(roots, 
         assert kills == ["dashboard KILL ALL"] and body["bot"]["killed"] is True
     else:  # the strategies own it: Executor.kill would close their netted legs, so the bot is not touched on the exchange
         assert kills == [] and body["bot"]["killed"] is False
+
+
+@pytest.mark.parametrize("pause", ["auto_off", "to_manual"])
+def test_a_decision_in_flight_does_not_switch_strategies_back_on_after_a_pause(roots, tmp_path, pause):
+    """The owner presses AUTO-TRADE OFF (or switches to MANUAL) while the allocator's model call is still running."""
+    from ctb import allocator as alloc_mod
+
+    class SlowModel:
+        def __init__(self):
+            self.asked = asyncio.Event()
+            self.gate = asyncio.Event()
+
+        async def ask_json(self, messages, schema):
+            self.asked.set()
+            await self.gate.wait()
+            ids = list(schema["properties"]["weights"]["properties"])
+            return ({"weights": {i: 0.8 for i in ids}, "enabled": {i: True for i in ids}, "reasoning": "slow: everything on",
+                     "confidence": 0.5}, {"cost": 0.0})
+
+    async def market():
+        return {}
+
+    bybit = roots[0]
+    for sid in ("carry", "trend", "xsmom"):  # no owner locks: the allocator may write every strategy
+        (bybit / sid / "control.json").write_text(json.dumps({"enabled": False, "weight": 0.0, "set_by": "llm"}))
+    sd = FakeSystemd(active=BYBIT_UNITS)
+    svc = st.StrategyService(bybit, run=sd, clock=lambda: NOW, extra_units=(), dashboard_account="demo-main", allocator_available=True)
+    svc._mode = "llm"
+    model = SlowModel()
+    alloc = alloc_mod.Allocator(bybit, model, market, model="slow", clock=lambda: NOW, tick_s=0.01)
+    svc.attach_allocator(alloc)
+
+    async def go():
+        await svc.auto(True, None, llm_trading=False, venue="demo")  # allocator on
+        await svc.allocator_act("decide_now")
+        tick = asyncio.create_task(alloc._tick())
+        await asyncio.wait_for(model.asked.wait(), 5)  # the model call is in flight
+        if pause == "auto_off":
+            await svc.auto(False, None, llm_trading=False, venue="demo")
+        else:
+            await svc.set_mode("manual", venue="demo", bot_open=False)
+        model.gate.set()
+        await asyncio.wait_for(tick, 5)
+
+    run(go())
+    assert {sid: ctl(bybit, sid)["enabled"] for sid in ("carry", "trend", "xsmom")} == {"carry": False, "trend": False, "xsmom": False}
+    last = json.loads((bybit / "allocator" / "decisions.jsonl").read_text().splitlines()[-1])
+    assert sorted(last["skipped_paused"]) == ["carry", "trend", "xsmom"]  # the feed says why nothing was applied
