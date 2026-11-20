@@ -163,11 +163,12 @@ def test_forecast_weights_come_from_the_file_and_the_ledger_when_absent(root):
     assert rec["mu"]["carry"]["combined"] == pytest.approx(-0.0004 / 1.25)    # base -4e-4 and decider 0 (p 0.5): (1 * -4e-4 + 0.25 * 0) / 1.25
 
 
-def test_decider_probability_is_the_mean_of_its_last_24_answers_and_vetoes(root):
+def test_decider_probability_is_the_mean_of_its_last_24_hours_of_answers_and_vetoes(root):
     t = int(T0 * 1000) - 3600_000  # an hour ago: fresh
     put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": [[t, 0.2]] * 30, "carry": [[t, 0.9]] * 3}})
-    # the model now says 0.6 for trend: history is cut to the last 24 (0.2 x 23) plus the new answer
-    a = make(root, FakeDecider(answers({"carry": 0.9, "trend": 0.6, "xsmom": 0.5})))
+    # the model now says 0.6 for trend: all 30 answers are inside the 24 h window (a cap of 24 answers keeps the last 23)
+    a = make(root, FakeDecider(answers({"carry": 0.9, "trend": 0.6, "xsmom": 0.5})),
+             calc=replace(A.Calc.from_settings(Settings()), p_window=24, p_min_fresh=1))
     rec = decide(a, trigger="decide_now")
     p = rec["p_decider"]["trend"]
     assert p == pytest.approx((0.2 * 23 + 0.6) / 24, abs=1e-4) and p < 0.4
@@ -185,7 +186,7 @@ def _hist(*runs):
     return [[now - h * 3600_000, p] for n, p, h in runs for _ in range(n)]
 
 
-def test_decider_answers_older_than_36_h_do_not_count_in_p(root):
+def test_decider_answers_older_than_the_window_do_not_count_in_p(root):
     """20 answers of 0.2 from two days ago and 12 of 0.6 from the last hours: the old ones used to pull p under 0.40 and
     halve trend; now only the fresh ones count and the veto does not fire."""
     put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": _hist((20, 0.2, 48), (12, 0.6, 2))}})
@@ -193,6 +194,30 @@ def test_decider_answers_older_than_36_h_do_not_count_in_p(root):
     rec = decide(a, trigger="decide_now")
     assert rec["p_decider"]["trend"] == pytest.approx(0.6) and rec["p_fresh_n"]["trend"] == 13
     assert "trend" not in next(st for st in rec["steps"] if st["step"] == "veto")["changed"] and rec["w_final"]["trend"] > 0.4
+
+
+def test_p_window_is_time_based_not_count_based(root):
+    """The same 24 h of opinion, polled hourly or every minute, gives the same p: 24 answers of 0.2 spread over the day
+    against 1440 of 0.2 over the day plus one 0.6 now. A count window would let the minute poller see only 24 minutes."""
+    hourly = [[int(T0 * 1000) - (23 - i) * 3600_000, 0.2] for i in range(24)]
+    minutely = [[int(T0 * 1000) - (1439 - i) * 60_000, 0.2] for i in range(1440)] + [[int(T0 * 1000) - 25 * 3600_000, 0.9]] * 50
+    calc = replace(A.Calc.from_settings(Settings()), p_min_fresh=1)
+    for hist, n in ((hourly, 24), (minutely, 1440)):
+        put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": hist}})
+        a = make(root, calc=calc)
+        p, fresh_n = a.p_fresh(["trend"])["trend"]
+        assert p == pytest.approx(0.2, abs=1e-4) and fresh_n == n   # the 0.9 answers from 25 h ago are outside the window
+
+
+def test_p_window_cap_limits_the_count_and_pushing_prunes_old_answers(root):
+    t = int(T0 * 1000)
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {},
+                                            "p_hist": {"trend": [[t - 30 * 3600_000, 0.9]] * 5 + [[t - 600_000, 0.2]] * 10}})
+    a = make(root, calc=replace(A.Calc.from_settings(Settings()), p_window=4, p_min_fresh=1))
+    assert a.p_fresh(["trend"])["trend"][1] == 4
+    a._push_p({"trend": 0.5}, t)
+    stored = a._state()["p_hist"]["trend"]
+    assert len(stored) == 4 and all(r[0] > t - 24 * 3600_000 for r in stored)
 
 
 def test_too_few_fresh_answers_hold_the_veto_off_and_the_feed_says_so(root):

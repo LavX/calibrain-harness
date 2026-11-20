@@ -174,7 +174,7 @@ function VenueStrip({ doc }: { doc: VenuesDoc }) {
               {!off && v.pnl_today_since && v.pnl_today_since !== "since 00:00 UTC" && <span className="muted"> {v.pnl_today_since}</span>}
               {!off && v.pnl_today_partial && <span className="muted"> (partial)</span>}</td>
             <td className={`r ${off ? "" : ud(v.books.pnl)}`}>{off ? NA : smoney(v.books.pnl, v.ccy)}</td>
-            <td>{off ? <span className="muted">not started</span> : <>{c.running} running · {c.idle} idle{c.paused ? ` · ${c.paused} paused` : ""} / {c.total}{c.abnormal > 0 && <b className="amb"> · {c.abnormal} need attention</b>}</>}</td>
+            <td className="wrap">{off ? <span className="muted">not started</span> : <>{c.running} running · {c.idle} idle{c.paused ? ` · ${c.paused} paused` : ""} / {c.total}{c.abnormal > 0 && <b className="amb"> · {c.abnormal} need attention</b>}</>}</td>
             <td>{v.controlled_by === "allocator" ? "LLM allocator" : "owner"}</td>
             <td className="r">{!off && (
               <span data-tip={v.kill.ok ? "Pause and flatten every strategy on this venue" : v.kill.available ? `Writes the kill flags, but cannot confirm now: ${v.kill.why}` : v.kill.why || undefined}>

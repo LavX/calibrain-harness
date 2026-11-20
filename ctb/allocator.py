@@ -388,8 +388,8 @@ class Calc:
     carry_cost_bp: float = 16.0
     sharpe_cap: float = 1.5
     decider_k: float = 0.8
-    p_window: int = 24
-    p_max_age_h: float = 36.0   # an answer older than this does not count in p
+    p_window: int = 5000        # upper cap on the answers kept and averaged; the window itself is p_window_h
+    p_window_h: float = 24.0    # p is the mean of the answers from the last this many hours, at any polling interval
     p_min_fresh: int = 12       # with fewer fresh answers p is None: the veto does not fire, the decider is no forecaster
     stale_h: float = 36.0
     weights_utc: tuple[int, int] = (23, 50)
@@ -412,7 +412,7 @@ class Calc:
             floor = 0.0
         return Calc(gamma=s.allocator_gamma, horizon_days=s.allocator_horizon_days, cost_bp=s.allocator_cost_bp,
                     carry_cost_bp=s.allocator_carry_cost_bp, sharpe_cap=s.allocator_sharpe_cap, decider_k=s.allocator_decider_k,
-                    p_window=max(1, s.allocator_p_window), p_max_age_h=s.allocator_p_max_age_h,
+                    p_window=max(1, s.allocator_p_window), p_window_h=max(0.01, s.allocator_p_window_h),
                     p_min_fresh=max(1, s.allocator_p_min_fresh), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
                     rules=M.RuleParams(vol_cap=s.allocator_vol_cap, buffer=s.allocator_buffer, step_up=s.allocator_step_up,
                                        veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, veto_live=s.allocator_veto_live,
@@ -831,12 +831,13 @@ class Allocator:
     def _push_p(self, p: dict[str, float], now_ms: int) -> None:
         hist = self._state()["p_hist"]
         for sid, v in p.items():
-            hist[sid] = (hist.get(sid) or []) + [[now_ms, v]]
-            hist[sid] = hist[sid][-self.calc.p_window:]
+            oldest = now_ms - self.calc.p_window_h * 3_600_000
+            rows = [r for r in (hist.get(sid) or []) if (_num(r[0]) or 0) >= oldest] + [[now_ms, v]]
+            hist[sid] = rows[-self.calc.p_window:]
         self._dirty = True
 
     def p_means(self, ids: list[str], extra: dict[str, float] | None = None, now_ms: int | None = None) -> dict[str, float | None]:
-        """p per strategy: the mean of the decider's last p_window answers that are at most p_max_age_h old (`extra`: one
+        """p per strategy: the mean of the decider's answers from the last p_window_h hours (at most p_window of them) (`extra`: one
         more at now, not stored, for dry runs). None when fewer than p_min_fresh such answers exist: then the veto does not
         fire and the decider is not a forecaster for that strategy (see p_fresh for the counts)."""
         return {sid: v for sid, (v, _) in self.p_fresh(ids, extra, now_ms).items()}
@@ -844,7 +845,7 @@ class Allocator:
     def p_fresh(self, ids: list[str], extra: dict[str, float] | None = None, now_ms: int | None = None) -> dict[str, tuple[float | None, int]]:
         """Per strategy (p, number of fresh answers it is the mean of)."""
         now_ms = self.now_ms() if now_ms is None else now_ms
-        oldest = now_ms - self.calc.p_max_age_h * 3_600_000
+        oldest = now_ms - self.calc.p_window_h * 3_600_000
         hist = self._state()["p_hist"]
         out: dict[str, tuple[float | None, int]] = {}
         for sid in ids:
@@ -860,7 +861,7 @@ class Allocator:
         few = [sid for sid, (p, n) in fresh.items() if p is None]
         for sid in few:
             if sid in reasons:
-                reasons[sid] += (f" [decider: {fresh[sid][1]} answers in the last {self.calc.p_max_age_h:g} h, fewer than "
+                reasons[sid] += (f" [decider: {fresh[sid][1]} answers in the last {self.calc.p_window_h:g} h, fewer than "
                                  f"{self.calc.p_min_fresh}: no p, the veto holds off]")
         return few
 

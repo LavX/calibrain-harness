@@ -373,6 +373,11 @@ dialog.strat .seg button { padding: 1px 7px; }
 
 /* ---------- F1 venues, matrix, alerts (colour only when something needs the owner) */
 .vstrip td, .vstrip th { padding: 3px 8px; }
+/* the per-venue KILL stays reachable when the strip is still wider than the panel (the panel scrolls sideways) */
+.vstrip td:last-child, .vstrip th:last-child { position: sticky; right: 0; background: var(--bg); }
+.vstrip th:last-child { background: var(--bar-2); }
+.vstrip tr.stale-row td:last-child { background: var(--bg); }
+.vstrip .acct-row td:last-child { position: static; }
 .vstrip .acct-row td { white-space: normal; color: var(--text-2); border-top: 1px solid var(--line); font-size: 11px; }
 .vbadge { display: inline-block; font: 600 11px var(--cond); letter-spacing: .05em; padding: 0 6px; line-height: 15px; border: 1px solid var(--line); color: var(--text-2); white-space: nowrap; }
 .vbadge.ok { color: var(--text-2); }
