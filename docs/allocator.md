@@ -187,7 +187,12 @@ The chat fallback (`CTB_ALLOCATOR_MODEL=llm`) never uses the forecast.
 ## What is recorded for the evaluation
 
 The allocator records what an honest comparison needs; none of it changes a live weight (a test runs three weights
-runs on two venues with and without the recording and compares every `control.json`).
+runs on two venues with and without the recording and compares every `control.json`). The policies are computed only
+after every venue's live writes, each venue's recording in its own try: a failure (a damaged `policy_state`, a full
+disk, a bug) is logged, named on the venue as `policies_error` and in the decision's `error` and `status.json`
+`last_error` ("evaluation recording failed, live weights unaffected"), and the decision line, `last_weights_ms`, the
+budget and the status are written as always. An unusable `policy_state` restarts the shadows from the live weights
+(`policy_state_reset` on the venue).
 
 - **Paired executable policies.** Every weights run (the 23:50 UTC slot, DECIDE NOW, the CLI, and held runs), per managed
   venue, the venue's part of the decision line carries

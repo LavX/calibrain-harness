@@ -768,6 +768,9 @@ class Allocator:
         # the same for the last decision's writes (and a venue the decision could not handle at all); rebuilt by every
         # decision that is not a dry run, so an entry stays until a later decision writes that book
         self.decision_errors: dict[str, dict[str, Any]] = {}
+        # the paired-policy recordings of the decision in progress: queued by each venue after its live writes, run once
+        # every venue has been written (_record_policies), each inside its own try
+        self._policy_jobs: list[tuple] = []
         self.state_cache: dict[str, Any] | None = None
         self._dirty = False
         self._seed_budget()
@@ -1323,6 +1326,7 @@ class Allocator:
             current: dict[str, Current] = {}
             error: str | None = None
             extra: dict[str, Any] = {}
+            self._policy_jobs = []
             try:
                 ctx, current, rows = await self.build_context(now_ms)
                 record["inputs"] = ctx
@@ -1383,7 +1387,7 @@ class Allocator:
                                                           {**({"write_failed": failed} if failed else {}),
                                                            **({"final_cap": final_cap} if final_cap else {})})}
             if plan and self.primary.managed and kind != "refresh":
-                venues[self.primary.id].update(self._policy_record(self.primary, kind, fc, current, ids, p_now, plan.weights, now_ms, dry_run))
+                self._policy_jobs.append((self.primary, kind, fc, current, ids, p_now, dict(plan.weights)))
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1414,17 +1418,19 @@ class Allocator:
             for v in self.venues[1:]:  # the same forecasts and decider p, each venue's own books, anchor and rules
                 venues[v.id] = self._other_venue(v, lambda v=v: self._computed_venue(v, fc, kind, why, p_new, now_ms, dry_run, decided_ids=ids))
             record["venues"] = venues
+            # every venue's live writes are done: only now the evaluation recording runs, and nothing it does can propagate
+            not_recorded = self._record_policies(venues, kind, now_ms, dry_run)
             # only a weights run rewrites every book: an hourly refresh or a held run leaves earlier failures standing
             not_applied = self._write_failures(venues, now_ms, dry_run, replace=kind == "computed")
             # Refreshes do not check the cap, so only a weights run can clear its last error.
             infeasible = self._cap_infeasible(venues) if kind != "refresh" else self._state().get("cap_error")
-            record["error"] = _join_errors(record["error"], infeasible, not_applied)
+            record["error"] = _join_errors(record["error"], infeasible, not_applied, not_recorded)
             if not dry_run:
                 self._slim_routine_poll(record, kind == "refresh" and not error and not not_applied)
                 DL.append(self.dir, record, now_ms)
                 if kind != "refresh":
                     self._state()["cap_error"] = infeasible
-                self.last_error = _join_errors(error, not_applied)  # forecast and persistent cap errors are added by write_status
+                self.last_error = _join_errors(error, not_applied, not_recorded)  # forecast and persistent cap errors are added by write_status
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
@@ -1566,9 +1572,13 @@ class Allocator:
         Nothing here touches live: no control.json, no live state."""
         st = self._state()
         ps = json.loads(json.dumps(st["policy_state"])) if isinstance(st.get("policy_state"), dict) else {}  # a copy: a dry run keeps nothing
-        if ps.get("version") != POLICY_STATE_VERSION:
+        reset = None
+        if ps.get("version") != POLICY_STATE_VERSION or not isinstance(ps.get("books"), dict):
+            if ps:
+                reset = "policy_state was unusable (another version or shape): the shadow policies restart from the live weights"
+                log.warning("allocator: %s", reset)
             ps = {"version": POLICY_STATE_VERSION, "books": {}}
-        books = ps.setdefault("books", {})
+        books = ps["books"]
         day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
         policies: dict[str, dict[str, float]] = {}
         for name in SHADOW_POLICIES:
@@ -1594,11 +1604,34 @@ class Allocator:
         policies = {"core": policies["core"], "live": {sid: round(float(live_w[sid]), 4) for sid in current},
                     "tilt": policies["tilt"], "core_veto": policies["core_veto"]}
         rec = {"policies": policies, "t_ms": now_ms, "venue": v.id, "policy_state_version": POLICY_STATE_VERSION}
+        if reset:
+            rec["policy_state_reset"] = reset
         if not dry_run:
             st["policy_state"] = ps
             self._dirty = True
-            append_jsonl(self.dir / "policies.jsonl", {**rec, "weights_mode": kind})
         return rec
+
+    def _record_policies(self, venues: dict[str, dict[str, Any]], kind: str, now_ms: int, dry_run: bool) -> str | None:
+        """Runs the queued paired-policy recordings after every venue's live writes. Each venue's recording and each
+        policies.jsonl line has its own try: a failure (a damaged state, a full disk, a bug) is logged and returned as the
+        decision's error, named on that venue as policies_error, and never stops or changes anything live."""
+        jobs, self._policy_jobs = self._policy_jobs, []
+        errors: list[str] = []
+        for job in jobs:
+            v = job[0]
+            vr = venues.get(v.id) if isinstance(venues.get(v.id), dict) else {}
+            try:
+                rec = self._policy_record(*job, now_ms=now_ms, dry_run=dry_run)
+                vr.update(rec)
+                if not dry_run:
+                    append_jsonl(self.dir / "policies.jsonl", {**{k: rec[k] for k in ("policies", "t_ms", "venue", "policy_state_version")},
+                                                               "weights_mode": kind})
+            except Exception as exc:  # noqa: BLE001 - recording only: it must never reach the live path
+                msg = f"{type(exc).__name__}: {exc}"[:300]
+                log.exception("allocator: evaluation recording on %s failed (live weights unaffected)", v.id)
+                vr["policies_error"] = msg
+                errors.append(f"{v.label}: {msg}")
+        return f"evaluation recording failed, live weights unaffected ({'; '.join(errors)})" if errors else None
 
     def _other_venue(self, v: AllocVenue, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         """One other venue's part of a decision. Anything that goes wrong there (beyond a single write, which _apply keeps
@@ -1721,7 +1754,7 @@ class Allocator:
         if final_cap:
             extra["final_cap"] = final_cap
         if v.managed and kind != "refresh":
-            extra.update(self._policy_record(v, kind, fc, current, covered, p_now, plan.weights, now_ms, dry_run))
+            self._policy_jobs.append((v, kind, fc, current, covered, p_now, dict(plan.weights)))
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:

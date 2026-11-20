@@ -166,8 +166,9 @@ def test_the_recording_never_changes_the_live_weights(tmp_path):
     runs over three days: every control.json written with the recording equals the one written without it."""
 
     class Unrecorded(A.Allocator):
-        def _policy_record(self, *a, **k):
-            return {}
+        def _record_policies(self, *a, **k):
+            self._policy_jobs = []
+            return None
 
     def world(name):
         base = tmp_path / name
@@ -196,3 +197,67 @@ def test_the_recording_never_changes_the_live_weights(tmp_path):
         runs.append(seen)
         assert (bybit / "allocator" / "policies.jsonl").exists() is (cls is A.Allocator)
     assert runs[0] == runs[1] and runs[0][0] != runs[0][2]  # identical, and the weights did move over the three runs
+
+
+# ---------------------------------------------------------------- a recording failure never reaches live
+FIVE = (("bybit-demo", ("carry", "trend", "xsmom")), ("okx-demo", ("trend", "xsmom")), ("deribit-test", ("trend", "xsmom")),
+        ("bitget-demo", ("trend", "xsmom")), ("extra-demo", ("trend", "xsmom")))
+
+
+class Unrecorded(A.Allocator):
+    def _record_policies(self, *a, **k):
+        self._policy_jobs = []
+        return None
+
+
+def five_venues(base, cls=A.Allocator):
+    roots = {}
+    for vid, ids in FIVE:
+        r = base / vid
+        put(r / "strategies.json", [{"id": i, "label": i} for i in ids])
+        for i, w in zip(ids, (0.5, 0.2, 0.3)):
+            put(r / i / "status.json", {"state": "running", "equity_usdt": 1000.0, "start_equity_usdt": 1000.0, "pnl_pct": 0.0, "positions": []})
+            put(r / i / "control.json", {"enabled": True, "weight": w, "owner_lock": False})
+        roots[vid] = r
+    bybit = roots["bybit-demo"]
+    put(bybit / "forecast" / "latest.json", forecast(T0 - 7200))
+    put(bybit / "allocator" / "control.json", {"enabled": True, "interval_min": 60})
+    llm = FakeDecider(answers({"carry": 0.5, "trend": 0.6, "xsmom": 0.5}))
+    a = cls(bybit, llm, _market, model="ordecide / test", clock=Clock(T0), budget=A.RateBudget(50), calc=A.Calc.from_settings(Settings()),
+            venues=[A.AllocVenue(vid, roots[vid], vid.upper()) for vid, _ in FIVE])
+    return a, llm, roots
+
+
+def controls(roots):
+    return {f"{vid}/{p.parent.name}": json.loads(p.read_text()) for vid, r in roots.items() for p in sorted(r.glob("*/control.json"))
+            if p.parent.name != "allocator"}
+
+
+@pytest.mark.parametrize("fault", ["corrupt_state", "policies_jsonl_unwritable", "recording_raises"])
+def test_a_recording_failure_never_stops_or_changes_a_weights_run(tmp_path, monkeypatch, fault):
+    ref, _, ref_roots = five_venues(tmp_path / "reference", Unrecorded)
+    asyncio.run(ref._tick())
+    a, llm, roots = five_venues(tmp_path / "faulty")
+    bybit = roots["bybit-demo"]
+    if fault == "corrupt_state":
+        put(bybit / "allocator" / "state.json", {"peaks": {}, "history": {}, "policy_state": {"version": 1, "books": ["damaged"]}})
+    elif fault == "policies_jsonl_unwritable":
+        real = A.append_jsonl
+        monkeypatch.setattr(A, "append_jsonl", lambda path, obj: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+                            if path.name == "policies.jsonl" else real(path, obj))
+    else:
+        monkeypatch.setattr(A.Allocator, "_policy_variant", lambda self, *x: (_ for _ in ()).throw(RuntimeError("shadow bug")))
+    asyncio.run(a._tick())  # the 23:50-style weights run of a fresh install: due at once
+    asyncio.run(a._tick())  # the next tick: nothing due
+    assert controls(roots) == controls(ref_roots) and controls(roots) != {}  # all five venues written exactly as without recording
+    lines = jl(bybit / "allocator" / "decisions.jsonl")
+    assert len(lines) == 1 and lines[0]["weights_mode"] == "computed" and llm.calls == 1  # one weights run, no repeat
+    st = json.loads((bybit / "allocator" / "state.json").read_text())
+    assert st["last_weights_ms"] == int(T0 * 1000)
+    assert len(a.budget.calls) == 1 and len(A.Allocator(bybit, llm, _market, model="m", clock=Clock(T0), budget=A.RateBudget(50)).budget.calls) == 1
+    status = json.loads((bybit / "allocator" / "status.json").read_text())
+    if fault == "corrupt_state":
+        assert "unusable" in lines[0]["venues"]["bybit-demo"]["policy_state_reset"] and lines[0]["venues"]["okx-demo"]["policies"]["core"]
+    else:
+        assert "evaluation recording failed, live weights unaffected" in lines[0]["error"] and "evaluation recording failed" in status["last_error"]
+        assert all("policies_error" in lines[0]["venues"][vid] for vid, _ in FIVE)
