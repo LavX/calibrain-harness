@@ -31,6 +31,8 @@ Files under the live root (CTB_LIVE_ROOT, default <repo>/data/live):
   allocator/decisions.jsonl  one line per decision (also risk-floor actions and failed attempts); the full model input
                              only on weights runs, errors and every CTB_ALLOCATOR_FULL_INPUT_EVERY-th routine poll.
                              Rotated daily (ctb/decision_log.py): decisions-<day>.jsonl, older days gzipped, 90 days kept
+  allocator/policies.jsonl   one slim line per weights run and managed venue: the paired policies of decisions.jsonl
+                             (t_ms, venue, policy_state_version, weights_mode, policies), for the dashboard's history
   allocator/answers.jsonl    one slim line per decider answer (issued_ms, horizon_start_ms, maturity_ms, question_version,
                              model, p): what the decider scoring reads; never the model input
   allocator/state.json       equity samples and peaks, so P&L windows and drawdown survive restarts, the
@@ -140,6 +142,12 @@ def _join_errors(*parts: str | None) -> str | None:
 
 
 ANSWER_HORIZON_MS = 24 * 3_600_000  # the question set asks about the next 24 hours
+# Paired executable policies (recorded on every weights run, per managed venue, for the evaluation; never written to a
+# control.json): core = the inverse-vol core, no tilt, no veto; tilt = core plus the forecast tilt at kappa 1, no veto;
+# core_veto = core plus the decider veto, no tilt; live = what was written. Each shadow policy keeps its own weights and
+# day anchor in state.json policy_state and goes through the same rules as live.
+SHADOW_POLICIES = ("core", "tilt", "core_veto")
+POLICY_STATE_VERSION = 1
 
 
 def write_json_atomic(path: Path, obj: Any) -> None:
@@ -1374,6 +1382,8 @@ class Allocator:
             venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, None,
                                                           {**({"write_failed": failed} if failed else {}),
                                                            **({"final_cap": final_cap} if final_cap else {})})}
+            if plan and self.primary.managed and kind != "refresh":
+                venues[self.primary.id].update(self._policy_record(self.primary, kind, fc, current, ids, p_now, plan.weights, now_ms, dry_run))
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1537,6 +1547,59 @@ class Allocator:
         notes = [vr["final_cap"]["note"] for vr in venues.values() if isinstance(vr.get("final_cap"), dict) and vr["final_cap"].get("infeasible")]
         return "; ".join(notes) or None
 
+    # ---- paired executable policies (recorded only)
+    def _policy_variant(self, name: str, data: dict[str, Any], p_now: dict[str, float | None]) -> tuple[dict[str, Any], dict[str, float | None], Calc]:
+        """The forecast, decider p and rules a shadow policy computes with: its own kappa and veto, every other rule live's."""
+        no_veto = replace(self.calc.rules, veto_p=-1.0)  # no p is below -1: the veto never fires
+        if name == "core":
+            return {**data, "kappa": 0.0}, {}, replace(self.calc, rules=no_veto)
+        if name == "tilt":
+            return {**data, "kappa": 1.0}, dict(p_now), replace(self.calc, rules=no_veto)
+        return {**data, "kappa": 0.0}, dict(p_now), replace(self.calc, rules=replace(self.calc.rules, veto_live=True))
+
+    def _policy_record(self, v: AllocVenue, kind: str, fc: Forecast, current: dict[str, Current], covered: list[str],
+                       p_now: dict[str, float | None], live_w: dict[str, float], now_ms: int, dry_run: bool) -> dict[str, Any]:
+        """The paired policies of one managed venue on a weights run, for its decision record (and policies.jsonl). Each
+        shadow policy starts from its own weights (state.json policy_state; the live weights the first time) and its own
+        day anchor, and goes through the same executable rules as live: buffer, step, exploration floor, drawdown floor,
+        owner locks (a locked book sits at its live weight in every policy) and the final vol cap. A held run holds them.
+        Nothing here touches live: no control.json, no live state."""
+        st = self._state()
+        ps = json.loads(json.dumps(st["policy_state"])) if isinstance(st.get("policy_state"), dict) else {}  # a copy: a dry run keeps nothing
+        if ps.get("version") != POLICY_STATE_VERSION:
+            ps = {"version": POLICY_STATE_VERSION, "books": {}}
+        books = ps.setdefault("books", {})
+        day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
+        policies: dict[str, dict[str, float]] = {}
+        for name in SHADOW_POLICIES:
+            key = self.vk(v.id, name)
+            book = books.get(key) if isinstance(books.get(key), dict) else {}
+            prev = book.get("w") if isinstance(book.get("w"), dict) else {}
+            w = {sid: (_num(prev.get(sid)) if _num(prev.get(sid)) is not None else c.weight) for sid, c in current.items()}
+            cur = {sid: (c if c.owner_lock else replace(c, weight=w[sid], enabled=w[sid] > 0)) for sid, c in current.items()}
+            anchor = book.get("anchor") if isinstance(book.get("anchor"), dict) and book["anchor"].get("day") == day else {}
+            aw = {sid: (_num((anchor.get("w") or {}).get(sid)) if _num((anchor.get("w") or {}).get(sid)) is not None else cur[sid].weight)
+                  for sid in current}
+            decision = None
+            if kind == "computed" and covered:
+                data, p, calc = self._policy_variant(name, fc.data or {}, p_now)
+                anchored = {s: replace(cur[s], weight=aw[s]) for s in covered}
+                out = compute_weights(covered, data, anchored, p, calc, None, self.dd_floor_pct)
+                decision = Decision({**{s: cur[s].weight for s in current}, **out["w_final"]}, {s: cur[s].enabled for s in current},
+                                    "", None, derive_enabled=tuple(out["opt"]))
+            plan = resolve(cur, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct)
+            self._final_cap(v, plan, cur, {}, fc)
+            policies[name] = {sid: round(plan.weights[sid], 4) for sid in current}
+            books[key] = {"w": policies[name], "anchor": {"day": day, "w": aw}}
+        policies = {"core": policies["core"], "live": {sid: round(float(live_w[sid]), 4) for sid in current},
+                    "tilt": policies["tilt"], "core_veto": policies["core_veto"]}
+        rec = {"policies": policies, "t_ms": now_ms, "venue": v.id, "policy_state_version": POLICY_STATE_VERSION}
+        if not dry_run:
+            st["policy_state"] = ps
+            self._dirty = True
+            append_jsonl(self.dir / "policies.jsonl", {**rec, "weights_mode": kind})
+        return rec
+
     def _other_venue(self, v: AllocVenue, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         """One other venue's part of a decision. Anything that goes wrong there (beyond a single write, which _apply keeps
         per strategy) is that venue's error: the decision, its record and the other venues go on."""
@@ -1629,6 +1692,7 @@ class Allocator:
         covered = [s for s in ids if decided_ids is None or s in decided_ids]
         calc_out: dict[str, Any] | None = None
         decision: Decision | None = None
+        p_now: dict[str, float | None] = {}
         if kind == "computed" and covered:
             anchored = self._day_anchor({s: current[s] for s in covered}, now_ms, persist=not dry_run, venue=v)
             fresh = self.p_fresh(covered, p_new if dry_run else None, now_ms)
@@ -1656,6 +1720,8 @@ class Allocator:
             extra["write_failed"] = failed
         if final_cap:
             extra["final_cap"] = final_cap
+        if v.managed and kind != "refresh":
+            extra.update(self._policy_record(v, kind, fc, current, covered, p_now, plan.weights, now_ms, dry_run))
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:

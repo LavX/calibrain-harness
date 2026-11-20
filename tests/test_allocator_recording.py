@@ -102,3 +102,97 @@ def test_the_predictions_panel_finds_yesterdays_weights_line_after_the_rotation(
     (d / "decisions-2027-01-14.jsonl").write_text(json.dumps({"t_ms": 1, "core": {"trend": 0.4}}) + "\n")
     (d / "decisions.jsonl").write_text(json.dumps({"t_ms": 2, "weights_mode": "refresh"}) + "\n")
     assert P.newest_with(d, "core")["core"] == {"trend": 0.4}
+
+
+# ---------------------------------------------------------------- paired executable policies
+from ctb.config import Settings  # noqa: E402
+from test_allocator_computed import forecast, put  # noqa: E402
+
+
+def _low_trend(root, hours_ago=3):
+    t = int(T0 * 1000) - hours_ago * 3600_000
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": [[t, 0.2]] * 23}})
+
+
+def _alloc(root, clock=None, cls=A.Allocator, venues=None):
+    return cls(root, FakeDecider(answers({"carry": 0.5, "trend": 0.2, "xsmom": 0.5})), _market,
+               model="ordecide / test", clock=clock or Clock(T0), budget=A.RateBudget(50), calc=A.Calc.from_settings(Settings()),
+               venues=venues)
+
+
+async def _market():
+    return {"major": {"BTC": {"ret_1d_pct": 1.0}}}
+
+
+def test_each_weights_run_records_the_four_paired_policies(root):
+    put(root / "forecast" / "latest.json", forecast(T0 - 7200, kappa=0.0))  # no tilt room: live is the core plus the veto
+    _low_trend(root)
+    rec = decide(_alloc(root), trigger="decide_now")
+    vr = rec["venues"]["bybit-demo"]
+    pol = vr["policies"]
+    assert list(pol) == ["core", "live", "tilt", "core_veto"]
+    assert (vr["t_ms"], vr["venue"], vr["policy_state_version"]) == (int(T0 * 1000), "bybit-demo", 1)
+    assert pol["live"] == {i: ctl(root, i)["weight"] for i in ("carry", "trend", "xsmom")}
+    assert pol["core_veto"] == pol["live"]  # kappa 0 and the veto live: live is exactly core plus the veto
+    assert pol["live"]["trend"] == pytest.approx(0.1) and pol["core"]["trend"] > 0.3  # the veto halved live trend, not the core
+    assert pol["core"]["carry"] == pol["live"]["carry"] and pol["tilt"]["trend"] > pol["core"]["trend"]  # tilt at kappa 1
+    assert jl(root / "allocator" / "policies.jsonl") == [{**{k: vr[k] for k in ("policies", "t_ms", "venue", "policy_state_version")},
+                                                          "weights_mode": "computed"}]
+
+
+def test_a_shadow_policy_steps_from_its_own_weights_not_from_live(root):
+    put(root / "forecast" / "latest.json", forecast(T0 - 7200, kappa=0.0))
+    _low_trend(root)
+    clock = Clock(T0)
+    a = _alloc(root, clock)
+    first = decide(a, trigger="decide_now")["venues"]["bybit-demo"]["policies"]
+    clock.t = T0 + DAY
+    put(root / "forecast" / "latest.json", forecast(clock.t - 7200, kappa=0.0))
+    second = decide(a, trigger="decide_now")["venues"]["bybit-demo"]["policies"]
+    assert second["live"]["trend"] == pytest.approx(0.1)  # vetoed again (the exploration floor keeps 0.1)
+    # the core held its own 0.37 overnight; stepping from live's 0.1 it could reach 0.35 at most
+    assert second["core"]["trend"] == first["core"]["trend"] > 0.35
+
+
+def test_a_dry_run_records_policies_but_keeps_no_policy_state(root):
+    _low_trend(root)
+    rec = decide(_alloc(root), trigger="decide_now", dry_run=True)
+    assert rec["venues"]["bybit-demo"]["policies"]["core"] and not (root / "allocator" / "policies.jsonl").exists()
+    assert "policy_state" not in json.loads((root / "allocator" / "state.json").read_text())
+
+
+def test_the_recording_never_changes_the_live_weights(tmp_path):
+    """Two identical worlds (Bybit with a vetoed and a tilted book, OKX with a strategy Bybit does not list), three weights
+    runs over three days: every control.json written with the recording equals the one written without it."""
+
+    class Unrecorded(A.Allocator):
+        def _policy_record(self, *a, **k):
+            return {}
+
+    def world(name):
+        base = tmp_path / name
+        bybit, okx = base / "live", base / "live-okx"
+        put(bybit / "strategies.json", [{"id": i, "label": i} for i in ("carry", "trend", "xsmom")])
+        put(okx / "strategies.json", [{"id": i, "label": i} for i in ("trend", "xsmom", "longvol")])
+        for r, ids in ((bybit, ("carry", "trend", "xsmom")), (okx, ("trend", "xsmom", "longvol"))):
+            for i, w in zip(ids, (0.5, 0.2, 0.3)):
+                put(r / i / "status.json", {"state": "running", "equity_usdt": 1000.0, "start_equity_usdt": 1000.0, "pnl_pct": 0.0, "positions": []})
+                put(r / i / "control.json", {"enabled": True, "weight": w, "owner_lock": False})
+        _low_trend(bybit)
+        return bybit, okx
+
+    runs = []
+    for name, cls in (("with", A.Allocator), ("without", Unrecorded)):
+        bybit, okx = world(name)
+        clock = Clock(T0)
+        a = _alloc(bybit, clock, cls, [A.AllocVenue("bybit-demo", bybit, "BYBIT·DEMO"), A.AllocVenue("okx-demo", okx, "OKX·DEMO")])
+        seen = []
+        for day in range(3):
+            clock.t = T0 + day * DAY
+            put(bybit / "forecast" / "latest.json", forecast(clock.t - 7200))  # kappa 1: the live tilt is on
+            decide(a, trigger="decide_now")
+            seen.append({str(p.relative_to(tmp_path / name)): json.loads(p.read_text())
+                         for r in (bybit, okx) for p in sorted(r.glob("*/control.json")) if p.parent.name != "allocator"})
+        runs.append(seen)
+        assert (bybit / "allocator" / "policies.jsonl").exists() is (cls is A.Allocator)
+    assert runs[0] == runs[1] and runs[0][0] != runs[0][2]  # identical, and the weights did move over the three runs

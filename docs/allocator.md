@@ -184,6 +184,29 @@ prints the full table (mu per forecaster in %/yr, p, sigma, previous weight, cor
 after each rule, final, the reasons) and writes nothing. Without a usable forecast file it prints the held table.
 The chat fallback (`CTB_ALLOCATOR_MODEL=llm`) never uses the forecast.
 
+## What is recorded for the evaluation
+
+The allocator records what an honest comparison needs; none of it changes a live weight (a test runs three weights
+runs on two venues with and without the recording and compares every `control.json`).
+
+- **Paired executable policies.** Every weights run (the 23:50 UTC slot, DECIDE NOW, the CLI, and held runs), per managed
+  venue, the venue's part of the decision line carries
+  `"policies": {"core": {sid: w}, "live": {sid: w}, "tilt": {sid: w}, "core_veto": {sid: w}}` with `t_ms`, `venue` and
+  `policy_state_version`. `live` is what was written. `core` is the inverse-vol core without tilt or veto, `tilt` the core
+  with the forecast tilt at kappa 1 and no veto, `core_veto` the core with the decider veto and no tilt. Each shadow
+  policy keeps its own weights and day anchor (`state.json` `policy_state`; the live weights the first time) and goes
+  through the same rules as live: buffer, step from its own anchor, exploration floor, drawdown floor, owner locks (a
+  locked book sits at its live weight in every policy) and the final vol cap. A held run holds them. The same lines,
+  slim, go to `allocator/policies.jsonl` (plus `weights_mode`) for the dashboard.
+- **Decider answers.** Every poll appends one slim line to `allocator/answers.jsonl`: `issued_ms`, `horizon_start_ms`
+  (= `issued_ms`), `maturity_ms` (+24 h), `question_version`, `model`, `p` per strategy. No model input.
+- **The full model input** stays in `decisions.jsonl` on weights runs, on polls with an error and on every
+  `CTB_ALLOCATOR_FULL_INPUT_EVERY`-th routine poll (default 60); other polls mark `inputs_omitted` and keep `state_bytes`.
+- **Rotation.** When the first line of a new UTC day is appended, `decisions.jsonl` becomes `decisions-<day>.jsonl`
+  (`<day>` = the UTC day of its first line), older archives are gzipped (`decisions-<day>.jsonl.gz`, possibly several gzip
+  members) and archives older than 90 days are deleted (`ctb/decision_log.py`). Read everything with
+  `decision_log.iter_all(<root>/allocator)`, oldest first.
+
 ## Model and question set
 
 The decision model decides (default). `CTB_ALLOCATOR_MODEL` is `kairos`, `jev`, `ordecide` or
