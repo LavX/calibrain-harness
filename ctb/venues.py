@@ -90,7 +90,10 @@ def parse_live_roots(text: str | None, default_root: Path) -> list[VenueConfig]:
             raise ValueError(f"CTB_LIVE_ROOTS entry {part!r}: use <venue id>=<runner root>, ids in lowercase letters, digits and -")
         if any(v.id == vid for v in out):
             raise ValueError(f"CTB_LIVE_ROOTS lists {vid} twice")
-        out.append(venue_config(vid, Path(root).expanduser()))
+        path = Path(root).expanduser()
+        if same := next((v for v in out if v.root.resolve() == path.resolve()), None):
+            raise ValueError(f"CTB_LIVE_ROOTS gives {same.id} and {vid} the same root {path}: one root is one exchange account")
+        out.append(venue_config(vid, path))
     if not any(v.id == PRIMARY for v in out):
         raise ValueError(f"CTB_LIVE_ROOTS must list {PRIMARY}: the LLM allocator and the per-symbol bot's guard are bound to it")
     return out
@@ -118,6 +121,8 @@ def presence(cfg: VenueConfig, *, has_registry: bool, reg_error: str | None, uni
         return "absent", f"not started: no strategies.json under {cfg.root}"
     if reg_error:
         return "error", reg_error
+    if not units and not any(statuses):
+        return "absent", "not started: no runner unit is known and no strategy has written a status.json yet"
     if units and not any(S.is_active(u) for u in units):
         names = ", ".join(u.get("unit", "?") for u in units)
         state = units[0].get("active") or "unknown"
@@ -225,7 +230,7 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
     trades = v.get("trades") or []
     last_trade = max((t.get("t_ms") for t in trades if _num(t.get("t_ms")) is not None), default=None)
     return {
-        "id": v["id"], "name": v.get("name") or S.short_name(v["id"], v.get("label", "")), "label": v.get("label", v["id"]),
+        "id": v["id"], "name": v.get("name") or S.short_name(v["id"], v.get("label", "")), "label": v.get("label", v["id"]), "unit": v.get("unit"),
         "pill": v.get("pill"), "enabled": bool(st and st["enabled"]),
         "weight": st.get("weight") if st else None, "weight_requested": ctl.get("weight"),
         "set_by": st.get("set_by") if st and st.get("set_by") else ctl.get("set_by"),
@@ -273,6 +278,8 @@ def alerts(v: dict, now_ms: float) -> list[dict]:
             add("crit" if kind == "error" else "warn", kind, err or "the runner reports an error", sid, name)
         elif p == "stale" and pres == "live":
             add("crit", "stale", "status.json older than 3 min", sid, name)
+        elif p == "runner_stopped" and pres == "live":  # one unit per strategy: the venue is up but this one's unit is not
+            add("crit", "unit_down", f"runner unit {s.get('unit') or '(unknown)'} is not active: nothing trades or flattens this strategy", sid, name)
         elif p == "no_data" and pres == "live":
             add("warn", "no_data", "no status.json yet", sid, name)
         elif p == "idle":

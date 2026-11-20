@@ -52,11 +52,12 @@ export function MarketView({ hidden }: { hidden: boolean }) {
 export function BotView() {
   const bot = useBotMode();
   const mode = useStore((s) => (s.strat as StratDoc | null)?.mode);
+  const modeTxt = mode ? MODE_LABEL[mode] : "not loaded yet";
   const last = useStore((s) => s.decisions[0]?.ts as number | undefined);
   return (
     <main className="view on">
       {!bot && (
-        <div className="alert"><b>PER-SYMBOL BOT INACTIVE.</b> The header mode is {MODE_LABEL[mode || "llm"]}: the strategies own the Bybit demo
+        <div className="alert"><b>PER-SYMBOL BOT INACTIVE.</b> The header mode is {modeTxt}: the strategies own the Bybit demo
           account and the bot makes no decisions. Its controls (EXPLORE, TRADE TF, MODEL, CAP, RISK, BOT BRACKETS, ASK) appear here when the
           header mode is PER-SYMBOL BOT. Last bot decision {last ? `${dt(last)} (${ago(last)})` : "none"}.</div>
       )}
@@ -200,7 +201,7 @@ function ChartHeader() {
   );
 }
 
-/** The bot venue's short name ("DEMO" or "TESTNET"): settings.venue_label without the exchange name. */
+/** The bot venue's short name: settings.venue_label without the exchange name. */
 function useVenueShort(): string {
   return useStore((s) => s.ov?.settings?.venue_label)?.replace("BYBIT ", "") || NA;
 }

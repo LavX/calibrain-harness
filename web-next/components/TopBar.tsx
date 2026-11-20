@@ -43,9 +43,11 @@ function BrandMark() {
   );
 }
 
-/** The auto-trade mode, as the header shows it: "bot" until the strategies are known (an older install without them behaves as before). */
+/** The auto-trade mode, as the header shows it: "unknown" until /api/strategies has answered (never assume the bot), "bot" for
+ * an older install without strategies or an allocator (it behaves as before), else the mode. */
 function modeOf(strat: StratDoc | null): string {
-  return strat && (strat.strategies.length > 0 || strat.allocator?.available) ? strat.mode : "bot";
+  if (!strat) return "unknown";
+  return strat.strategies.length > 0 || strat.allocator?.available ? strat.mode : "bot";
 }
 /** True only in mode "bot". In LLM DECIDES and MANUAL the per-symbol bot is observe-only, so its controls are locked. */
 export const useBotMode = () => useStore((s) => modeOf(s.strat as StratDoc | null) === "bot");
@@ -127,7 +129,7 @@ export function CommandBar() {
     loadOverview();
   };
   const hasModes = !!strat && (strat.strategies.length > 0 || strat.allocator?.available);
-  const mode = hasModes ? strat!.mode : "bot";
+  const mode = modeOf(strat);
   const allocVenue = venues?.venues.find((v) => v.id === venues.primary)?.label || "BYBIT·DEMO";
   const onKill = async () => {
     if (mode === "bot") {
@@ -139,7 +141,7 @@ export function CommandBar() {
     }
     await killAll(venues);
   };
-  const autoTip = mode === "bot"
+  const autoTip = mode === "unknown" ? "Loading the strategies' state: the switch works once it is known" : mode === "bot"
     ? `Allow the per-symbol bot to place orders on ${botVenue}`
     : mode === "llm"
       ? `${allocVenue} only (the allocator venue). On: the LLM allocator decides which strategies trade there and how much. Off: the allocator pauses and every ${allocVenue} strategy is paused; positions stay open (use KILL to close them). Other venues are switched per strategy on F7.`
@@ -167,12 +169,14 @@ export function CommandBar() {
           </span>
         )}
         <label className="arm" data-tip={autoTip}>
-          <input type="checkbox" checked={mode === "bot" ? !!ov?.settings.trading_enabled : !!strat?.auto_on}
-            onChange={(e) => (mode === "bot" || !strat ? onTrading(e.target.checked) : headerAuto(strat, e.target.checked, allocVenue))} />
-          <span className="arm-box" /><span>AUTO-TRADE{mode !== "bot" ? ` · ${allocVenue}` : ""}</span>
+          <input type="checkbox" disabled={mode === "unknown"} checked={mode === "bot" ? !!ov?.settings.trading_enabled : !!strat?.auto_on}
+            onChange={(e) => (mode === "bot" ? onTrading(e.target.checked) : strat && headerAuto(strat, e.target.checked, allocVenue))} />
+          <span className="arm-box" /><span>AUTO-TRADE{mode !== "bot" && mode !== "unknown" ? ` · ${allocVenue}` : ""}</span>
         </label>
         <button className="kbtn" onClick={() => setState({ modal: { kind: "keys" } })}>KEYS</button>
-        <button className="kbtn red" onClick={onKill} data-tip={mode === "bot" ? `Close the per-symbol bot's positions on ${botVenue}, cancel its orders, stop its trading` : "KILL ALL: pause and flatten every venue that is up (per-venue KILL is on F1). Refused, and said so, for a venue whose runner is down or stale."}>{mode === "bot" ? "KILL" : "KILL ALL"}</button>
+        <span data-tip={mode === "bot" ? `Close the per-symbol bot's positions on ${botVenue}, cancel its orders, stop its trading` : !venues ? "Loading the venues: KILL ALL works once they are known (F1 has per-venue KILL)" : "KILL ALL: pause and flag to flatten every venue that has started (per-venue KILL is on F1). The answer says, per venue, whether the runner confirms."}>
+          <button className="kbtn red" disabled={mode === "bot" ? false : !venues} onClick={onKill}>{mode === "bot" ? "KILL" : "KILL ALL"}</button>
+        </span>
       </div>
     </header>
   );
@@ -181,9 +185,10 @@ export function CommandBar() {
 export async function ask(probe: boolean) {
   const sym = getState().symbol;
   if (!sym || !botMode()) return;
-  setState({ cmdHint: `ASKING KAIROS · ${sym}${probe ? " + probes" : ""}…` });
+  setState({ cmdHint: `ASKING THE MODEL · ${sym}${probe ? " + probes" : ""}…` });
   try {
-    await post("/api/decide", { symbol: sym, probe });
+    const r = await post("/api/decide", { symbol: sym, probe });
+    if (r?.skipped) alert(`Not asked: ${r.why || "skipped"}`);
   } catch (e: any) {
     alert(e.message);
   }

@@ -97,19 +97,40 @@ def test_known_venues_get_label_unit_currency_and_controller(tmp_path):
                    "bitget-demo": ("BITGET·DEMO", "calibrain-live-bitget.service", "USDT", "owner")}
 
 
-@pytest.mark.parametrize("bad", ["okx-demo=/x", "bybit-demo=/a,bybit-demo=/b", "bybit-demo", "Bybit Demo=/x", "bybit-demo=/a,../x=/b"])
+@pytest.mark.parametrize("bad", ["okx-demo=/x", "bybit-demo=/a,bybit-demo=/b", "bybit-demo", "Bybit Demo=/x", "bybit-demo=/a,../x=/b",
+                                 "bybit-demo=/a,okx-demo=/a/", "bybit-demo=/a,okx-demo=/a/../a"])
 def test_malformed_roots_are_refused(tmp_path, bad):
     with pytest.raises(ValueError):
         V.parse_live_roots(bad, tmp_path)
 
 
-def test_venues_come_from_config_never_a_glob(tmp_path, monkeypatch, roots):
+def files_under(*dirs):
+    return {f: f.read_bytes() for d in dirs for f in sorted(Path(d).rglob("*")) if f.is_file()}
+
+
+@pytest.mark.parametrize("configured", ["unset", "listed"])
+def test_a_quarantined_sibling_root_is_never_read_or_written(tmp_path, monkeypatch, roots, configured):
+    """data/live-okx-rejected-<date> sits next to data/live and data/live-okx: a glob over data/live* would pick it up."""
     bybit, okx, _ = roots
-    shutil.copytree(okx, tmp_path / "live-okx-rejected-20261120")  # a quarantined root next to the real one
-    monkeypatch.setenv("CTB_LIVE_ROOTS", f"bybit-demo={bybit},okx-demo={okx}")
+    rejected = tmp_path / "live-okx-rejected-20261120"
+    shutil.copytree(okx, rejected)
+    if configured == "unset":
+        monkeypatch.setenv("CTB_LIVE_ROOT", str(bybit))
+        want = ["bybit-demo"]
+    else:
+        monkeypatch.setenv("CTB_LIVE_ROOTS", f"bybit-demo={bybit},okx-demo={okx}")
+        want = ["bybit-demo", "okx-demo"]
     h = V.VenueHub.from_env()
-    assert [v.id for v in h.venues] == ["bybit-demo", "okx-demo"] and h.primary.root == bybit
-    assert not h.services["okx-demo"].shares_bot_account and h.services["bybit-demo"].shares_bot_account
+    for svc in h.services.values():
+        svc.run = FakeSystemd(active=BYBIT_UNITS + [OKX_UNIT])  # never the real systemctl
+        svc.clock = lambda: NOW
+    h.clock = lambda: NOW
+    before = files_under(rejected)
+    doc = run(h.summary())
+    run(h.kill_all())
+    assert [v["id"] for v in doc["venues"]] == want and not any(str(rejected) in v["root"] for v in doc["venues"])
+    assert files_under(rejected) == before  # neither read into the page nor written by KILL ALL
+    assert not any("rejected" in f.name for f in (tmp_path / "state").rglob("*"))
 
 
 # ---------------------------------------------------------------- presence
@@ -130,6 +151,51 @@ def test_presence_stale_when_every_status_is_old(roots, tmp_path):
     doc = run(hub(roots, sd, tmp_path, now=NOW + 600).summary())
     okx = next(v for v in doc["venues"] if v["id"] == "okx-demo")
     assert okx["presence"] == "stale" and "older than 3 min" in okx["presence_text"]
+
+
+def test_unknown_venue_with_no_unit_and_no_status_is_not_started(tmp_path):
+    root = tmp_path / "mynew"
+    (root / "trend").mkdir(parents=True)
+    (root / "strategies.json").write_text(json.dumps([{"id": "trend", "label": "Trend"}]))  # no unit named
+    cfg = V.venue_config("mynew-demo", root)
+    assert cfg.unit is None and cfg.label == "MYNEW·DEMO"
+    svc = st.StrategyService(root, run=FakeSystemd(), clock=lambda: NOW, extra_units=(), dashboard_account="", shares_bot_account=False)
+    h = V.VenueHub([V.venue_config("bybit-demo", tmp_path / "none", unit=""), cfg],
+                   {"bybit-demo": st.StrategyService(tmp_path / "none", run=FakeSystemd(), clock=lambda: NOW, extra_units=()), "mynew-demo": svc},
+                   state=tmp_path / "state", clock=lambda: NOW)
+    v = run(h.summary())["venues"][1]
+    assert v["presence"] == "absent" and "not started" in v["presence_text"]
+
+
+def test_a_stopped_unit_of_one_strategy_raises_an_alert(roots, tmp_path):
+    later = NOW + 600  # every fixture status is old now; carry's runner wrote a fresh one
+    p = roots[0] / "carry" / "status.json"
+    doc = json.loads(p.read_text())
+    doc["updated_ms"] = int((later - 5) * 1000)
+    p.write_text(json.dumps(doc))
+    out = run(hub(roots, FakeSystemd(active=["calibrain-live@carry.service"]), tmp_path, now=later).summary())
+    assert out["venues"][0]["presence"] == "live"
+    downs = {a["strategy"]: a for a in out["alerts"] if a["kind"] == "unit_down" and a["venue"] == "bybit-demo"}
+    assert sorted(downs) == ["trend", "xsmom"] and "calibrain-live@trend.service" in downs["trend"]["text"]
+
+
+def test_unit_times_come_as_unix_seconds_with_a_fallback():
+    calls = []
+
+    async def new_systemd(argv, **_):
+        calls.append(argv)
+        return 0, "LoadState=loaded\nActiveState=active\nActiveEnterTimestamp=@1795170550\n", ""
+
+    async def old_systemd(argv, **_):
+        calls.append(argv)
+        if "--timestamp=unix" in argv:
+            return 1, "", "unknown option"
+        return 0, "LoadState=loaded\nActiveState=active\nActiveEnterTimestamp=Fri 2026-11-20 01:33:05 CET\n", ""
+
+    u = run(st.unit_state(new_systemd, "calibrain-live.service"))
+    assert u["since_s"] == 1795170550 and "--timestamp=unix" in calls[0]
+    u = run(st.unit_state(old_systemd, "calibrain-live.service"))
+    assert u["active"] == "active" and u["since_s"] is None and u["since"].startswith("Fri")
 
 
 def test_presence_error_fails_closed(roots, tmp_path):
@@ -448,6 +514,15 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             assert {x["venue"]: x["ok"] for x in body["venues"]} == {"bybit-demo": False, "okx-demo": True, "deribit-test": False}
             assert ctl(roots[1], "trend")["flatten"] is True
             assert (await c.post("/api/venues/okx-demo/strategies/trend/unlock", json={})).status == 409
+            # crafted ids never reach the file system: an unknown venue, a sid or unit with a path in it
+            before = files_under(*roots[:2])
+            for path, body in (("/api/venues/..%2F..%2Fetc/strategies/carry/pause", {}), ("/api/venues/bybit-demo/strategies/..%2Fcarry/pause", {}),
+                               ("/api/venues/bybit-demo/strategies/%2E%2E/pause", {}), ("/api/venues/okx-demo/strategies/..%2F..%2Flive%2Fcarry/disable", {}),
+                               ("/api/venues/bybit-demo/runner/start", {"unit": "../../evil.service"}),
+                               ("/api/venues/..%2Flive/kill", {}), ("/api/venues/okx-demo/runner/stop", {"unit": "calibrain-live@carry.service"})):
+                r = await c.post(path, json=body)
+                assert r.status == 404, (path, r.status)
+            assert files_under(*roots[:2]) == before
             r = await c.post("/api/strategies/auto-set", json={"ids": ["carry"]})
             assert r.status == 200 and (await r.json())["ids"] == ["carry"]
 

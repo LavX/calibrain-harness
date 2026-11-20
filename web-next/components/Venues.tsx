@@ -256,21 +256,20 @@ function Matrix({ doc }: { doc: VenuesDoc }) {
     <table className="t matrix">
       <thead><tr>
         <th>Strategy</th>
-        <th className="r" data-tip="The LLM's P(price up in 24 h) for this strategy's book: mean of the last 24 hourly answers (allocator venue)">LLM P(up 24h)</th>
         {doc.venues.map((v) => <th key={v.id} className={v.presence !== "live" ? "muted" : ""} data-tip={v.presence_text || undefined}>{v.label}{v.presence !== "live" && ` · ${(PRESENCE[v.presence]?.[0] || v.presence).toLowerCase()}`}</th>)}
       </tr></thead>
       <tbody>{ids.map((id) => (
         <tr key={id}>
           <td className="sym lbl" data-tip={`${labels.get(id)} (${id})`}>{names.get(id)}</td>
-          <td className="r">{isNum(pDec.get(id)) ? `${(Number(pDec.get(id)) * 100).toFixed(0)}%` : <span className="muted">{NA}</span>}</td>
-          {doc.venues.map((v) => <Cell key={v.id} v={v} s={v.strategies.find((x) => x.id === id)} />)}
+          {doc.venues.map((v) => <Cell key={v.id} v={v} s={v.strategies.find((x) => x.id === id)} pUp={v.controlled_by === "allocator" ? pDec.get(id) : undefined} />)}
         </tr>
       ))}</tbody>
     </table>
   );
 }
 
-function Cell({ v, s }: { v: Venue; s: VStrat | undefined }) {
+/** pUp: the allocator's LLM P(up 24h) for this strategy, given only on the allocator venue's cells (no LLM feeds the others). */
+function Cell({ v, s, pUp }: { v: Venue; s: VStrat | undefined; pUp?: number | null }) {
   if (!s) return <td className="cell-x muted">{NA}</td>;
   const [word, cls] = STATE[s.pill] || [s.pill.toUpperCase(), "bad"];
   const grey = v.presence !== "live";
@@ -283,12 +282,13 @@ function Cell({ v, s }: { v: Venue; s: VStrat | undefined }) {
     `P&L today ${smoney(s.pnl_today, v.ccy)} ${s.pnl_today_since || "(no sample yet)"} · since start ${smoney(s.pnl, v.ccy)}`,
     `${s.positions_n ?? NA} positions · ${s.trades_today ?? NA} trades today${s.last_trade_ms ? ` · last trade ${ago(s.last_trade_ms / 1000)}` : " · no trade yet"}`,
     s.updated_ms ? `status written ${ago(s.updated_ms / 1000)}` : "",
+    isNum(pUp) ? `LLM P(up 24h) ${(Number(pUp) * 100).toFixed(0)}%: mean of the allocator's last 24 hourly answers` : "",
     s.last_error ? `LAST ERROR: ${s.last_error}` : "",
   ].filter(Boolean).join("\n");
   return (
     <td className={`cell-m ${grey ? "stale-row" : ""}`} data-tip={tip}>
       <div><span className={grey ? "" : ud(s.pnl_today)}>{sg(s.pnl_today, 2)}</span>{(cls || s.pill !== "running") && <span className={`sbadge ${cls}`}>{word}</span>}{s.last_error && s.pill !== "error" && s.pill !== "latched" && <span className="sbadge warn">ERR</span>}</div>
-      <div className="muted">w {w}{s.owner_lock ? " · lock" : ""} · {s.positions_n ?? NA} pos{s.pnl_today_since && s.pnl_today_since !== "since 00:00 UTC" ? ` · ${s.pnl_today_since}` : ""}</div>
+      <div className="muted">w {w}{s.owner_lock ? " · lock" : ""} · {s.positions_n ?? NA} pos{isNum(pUp) ? ` · P(up) ${(Number(pUp) * 100).toFixed(0)}%` : ""}{s.pnl_today_since && s.pnl_today_since !== "since 00:00 UTC" ? ` · ${s.pnl_today_since}` : ""}</div>
     </td>
   );
 }

@@ -263,12 +263,19 @@ async def run_cmd(argv: list[str], *, timeout: float = CMD_TIMEOUT_S) -> tuple[i
 
 
 async def unit_state(run: Runner, unit: str) -> dict[str, Any]:
-    rc, out, err = await run(["systemctl", "--user", "show", f"--property={SHOW_PROPS}", "--", unit], timeout=5)
+    """`systemctl --user show` of one unit. Timestamps are asked for as unix seconds ("@1795170550", systemd 248+), so the
+    page can show them in UTC; an older systemd that rejects the flag is asked again without it (host-local text)."""
+    argv = ["systemctl", "--user", "show", "--timestamp=unix", f"--property={SHOW_PROPS}", "--", unit]
+    rc, out, err = await run(argv, timeout=5)
+    if rc != 0 and "=" not in out:
+        rc, out, err = await run([a for a in argv if a != "--timestamp=unix"], timeout=5)
     props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
     if rc != 0 and not props:
         return {"unit": unit, "load": "unknown", "active": "unknown", "error": (err or "systemctl failed").strip()[:200]}
+    since = props.get("ActiveEnterTimestamp", "")
     return {"unit": unit, "load": props.get("LoadState", ""), "active": props.get("ActiveState", ""), "sub": props.get("SubState", ""),
-            "enabled": props.get("UnitFileState", ""), "result": props.get("Result", ""), "since": props.get("ActiveEnterTimestamp", "")}
+            "enabled": props.get("UnitFileState", ""), "result": props.get("Result", ""), "since": since,
+            "since_s": int(since[1:]) if since.startswith("@") and since[1:].isdigit() else None}
 
 
 def is_active(st: dict[str, Any]) -> bool:

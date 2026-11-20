@@ -30,7 +30,7 @@ type Allocator = {
   control: { enabled: boolean; interval_min: number | null; decide_now_pending: boolean };
   decisions: Decision[];
 };
-type Runner = { unit: string; load: string; active: string; since?: string };
+type Runner = { unit: string; load: string; active: string; since?: string; since_s?: number | null };
 export type StratDoc = {
   mode: "llm" | "manual" | "bot"; auto_on: boolean; error: string | null; root: string; venue: string; llm_trading_enabled: boolean;
   allocator: Allocator; runners: Runner[]; strategies: Strat[]; auto_set: string[] | null;
@@ -254,6 +254,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
 
 function AllocatorPanel({ doc }: { doc: StratDoc }) {
   const a = doc.allocator, st = a.status;
+  const names = new Map(doc.strategies.map((s) => [s.id, s.name || s.id]));
   const [open, setOpen] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -303,7 +304,7 @@ function AllocatorPanel({ doc }: { doc: StratDoc }) {
             <tbody>{a.decisions.map((d) => (
               <tr key={d.t_ms}><td>{dt(d.t_ms / 1000)}</td>
                 <td className="wrap">{Object.entries(d.weights || {}).map(([id, w]) => (
-                  <div key={id}><span className="amb">{id}</span> {fx(w, 2)}{d.enabled?.[id] === false ? " (off)" : ""}{d.skipped_owner_lock?.includes(id) ? " (owner lock, not applied)" : ""}</div>
+                  <div key={id}><span className="amb" data-tip={id}>{names.get(id) || id}</span> {fx(w, 2)}{d.enabled?.[id] === false ? " (off)" : ""}{d.skipped_owner_lock?.includes(id) ? " (owner lock, not applied)" : ""}</div>
                 ))}</td>
                 <td className="wrap">{d.error && <div className="dn">failed: {d.error}</div>}{d.risk_floor?.length ? <div className="amb">risk floor: {d.risk_floor.join(", ")}</div> : null}{d.reasoning}<span className="muted"> {d.trigger ? `(${d.trigger})` : ""}</span></td></tr>
             ))}</tbody>
@@ -339,7 +340,7 @@ function RunnerBar({ doc }: { doc: StratDoc }) {
           <div key={r.unit} className="strat-runner-row">
             <span className="code">RUNNER</span><b>{r.unit}</b>
             <span className={`spill ${active ? "plain" : "warn"}`}>{r.load === "not-found" ? "NOT INSTALLED" : active ? "UP" : String(r.active || "unknown").toUpperCase()}</span>
-            {r.since && active && <span className="muted">since {r.since}</span>}
+            {r.since && active && <span className="muted">since {r.since_s ? dt(r.since_s) : `${r.since} (host time)`}</span>}
             <Confirmed id={`start:${r.unit}`} label="START" disabled={active || r.load === "not-found"} open={open} setOpen={setOpen} busy={busy} onRun={() => run(r.unit, "start")} />
             <Confirmed id={`stop:${r.unit}`} label="STOP" cn="red" disabled={!active} open={open} setOpen={setOpen} busy={busy} onRun={() => run(r.unit, "stop")} />
           </div>

@@ -171,8 +171,8 @@ export function ValidationView() {
           <div className="muted" style={{ padding: "4px 8px" }}>On alarm the model's weight drops to 0 for that question (DRIFT ACTION base), or trading pauses (pause).</div>
         </Panel>
         <Panel code="EXEC" title="Execution quality" tight><KV rows={[
-          ["Implementation shortfall", dist(ex.implementation_shortfall_bp), "Fill vs the mainnet price the decision was made on; includes testnet divergence"],
-          ["Entry slip vs testnet", dist(ex.entry_slip_vs_testnet_bp)], ["Stop exit slip", dist(ex.stop_exit_slip_bp)],
+          ["Implementation shortfall", dist(ex.implementation_shortfall_bp), "Fill vs the mainnet price the decision was made on; includes the bot venue's divergence from mainnet"],
+          ["Entry slip vs venue book", dist(ex.entry_slip_vs_testnet_bp)], ["Stop exit slip", dist(ex.stop_exit_slip_bp)],
           ["Fees", dist(ex.fees_bp)], ["Impact proxy", dist(ex.impact_proxy_bp), "Our notional ÷ mainnet depth within 10bp × 10bp"],
           ["Markout +1m", dist(ex.markout_bp_after_entry?.["1"]), "Price move in our favour after entry"], ["Markout +5m", dist(ex.markout_bp_after_entry?.["5"])],
           ["Markout +15m", dist(ex.markout_bp_after_entry?.["15"])],

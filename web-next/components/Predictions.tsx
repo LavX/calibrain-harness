@@ -196,7 +196,7 @@ export function ScoreboardPanel() {
               <tbody>{sb.per_strategy.map((s) => (
                 <tr key={s.id}>
                   <td className="sym">{s.id}</td>
-                  {KS.map((k) => <td key={k} className="r">{k in s.loss || k in s.weight ? <>{isNum(s.loss[k]) ? fx(s.loss[k], 3) : NA} <span className="muted">/ {isNum(s.weight[k]) ? fx(s.weight[k], 2) : NA}</span></> : <span className="muted">n/a</span>}</td>)}
+                  {KS.map((k) => <td key={k} className="r">{k in s.loss || k in s.weight ? <>{isNum(s.loss[k]) ? fx(s.loss[k], 3) : NA} <span className="muted">/ {isNum(s.weight[k]) ? fx(s.weight[k], 2) : NA}</span></> : <span className="muted">{NA}</span>}</td>)}
                   <td className={`r ${isNum(s.brier) && isNum(s.brier_base) ? (s.brier < s.brier_base ? "up" : "dn") : ""}`}>{isNum(s.brier) ? fx(s.brier, 3) : NA}</td>
                   <td className="r">{isNum(s.brier_base) ? fx(s.brier_base, 3) : NA}</td>
                   <td className="r">{s.n_brier ?? NA}{s.decider_no_skill ? <span className="tag err" data-tip="No better than the base rate after 30 scored days: the decider's weight is held at the floor"> NO SKILL</span> : null}</td>

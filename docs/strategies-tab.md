@@ -94,7 +94,9 @@ bybit-demo must be listed: the allocator, the predictions panel and the per-symb
 `/api/strategies` (and its actions) are aliases of `/api/venues/bybit-demo/...`. Unset, the dashboard has one venue,
 bybit-demo at `CTB_LIVE_ROOT`, as before. Each venue has a presence: **live** (unit active, a status.json fresher than
 3 min), **stale** (unit active, every status.json older), **stopped** (unit not active), **absent** (no root or no
-strategies.json: "not started") and **error** (strategies.json unusable).
+strategies.json, or no known unit and no status.json yet: "not started") and **error** (strategies.json unusable).
+Two venues may not share a root (refused at startup, like a malformed entry). A strategy whose own unit is down while the
+venue is up raises a "unit down" alert. Unit start times are read as unix seconds and shown in UTC.
 
 Routes: `GET /api/venues` (every venue: presence, books, account, P&L today, strategies, netted positions, alerts),
 `GET /api/venues/{vid}/strategies`, `POST /api/venues/{vid}/strategies/{sid}/{enable|disable|pause|unlock|flatten|reset}`,

@@ -133,7 +133,7 @@ function KeysModal() {
   const [k, setK] = useState<any>(null);
   const [kMsg, setKMsg] = useState<Msg>(null);
   const [bMsg, setBMsg] = useState<Msg>(null);
-  const venueLabel: string = useStore((s) => s.ov?.settings?.venue_label) || "BYBIT TESTNET";
+  const venueLabel: string = useStore((s) => s.ov?.settings?.venue_label) || "the bot's venue";
   const venueKeys: string = useStore((s) => s.ov?.settings?.venue_keys_url) || "https://testnet.bybit.com/app/user/api-management";
   const isDemo = venueLabel.includes("DEMO");
   const switchVenue = (venue: string, label: string) => run("bv", async () => {
@@ -284,7 +284,7 @@ function UniverseModal() {
   return (
     <Dialog>
       <div className="ph"><span className="code">UNIV</span>Symbol universe · signals Bybit mainnet · per-symbol bot orders {venue}</div>
-      <p>Pick the perps the bot watches and trades. Each needs ~{u ? fx(u.rph_per_symbol, 1) : NA} model requests/hour at the current {u?.decision_tf}m trading timeframe (one per bar close, plus consistency probes). Only perps listed on both mainnet and testnet can be chosen. Entries take only testnet liquidity within {u?.max_entry_slip_bp}bp of the best price, so a thin testnet book means small or unfilled orders.</p>
+      <p>Pick the perps the bot watches and trades. Each needs ~{u ? fx(u.rph_per_symbol, 1) : NA} model requests/hour at the current {u?.decision_tf}m trading timeframe (one per bar close, plus consistency probes). Only perps listed on both mainnet and the bot&apos;s venue can be chosen. Entries take only that venue&apos;s liquidity within {u?.max_entry_slip_bp}bp of the best price, so a thin venue book means small or unfilled orders.</p>
       <div className="unibar">
         <input type="text" placeholder="filter or type a symbol" value={q} onChange={(e) => setQ(e.target.value)} />
         <span>SELECTED <b className="amb">{sel.length}</b>/{u?.max_symbols ?? 30}</span>
@@ -299,10 +299,10 @@ function UniverseModal() {
           <button className="kbtn" onClick={() => !sel.includes(typedSym) && setSel([...sel, typedSym])}>ADD {typedSym} (validated on apply)</button>
         </div>
       )}
-      {!u ? <div className="empty">{err || "Loading the universe and testnet books…"}</div> : (
+      {!u ? <div className="empty">{err || "Loading the universe and the venue's books…"}</div> : (
         <div className="unigrid">
           <table className="t">
-            <thead><tr><th /><th>Symbol</th><th className="r">24h turnover $</th><th className="r">24h</th><th>Testnet</th><th className="r">Testnet bid / ask ≤20bp $</th><th className="r">Spread bp</th><th>Note</th></tr></thead>
+            <thead><tr><th /><th>Symbol</th><th className="r">24h turnover $</th><th className="r">24h</th><th>Bot venue</th><th className="r">Venue bid / ask ≤20bp $</th><th className="r">Spread bp</th><th>Note</th></tr></thead>
             <tbody>
               {rows.map((c: any) => {
                 const on = sel.includes(c.symbol), b = c.testnet_book;
