@@ -1399,7 +1399,24 @@ class Allocator:
         cov = data.get("cov_d") if isinstance(data.get("cov_d"), dict) else {}
         ids, matrix = cov.get("ids"), cov.get("matrix")
         if isinstance(ids, list) and isinstance(matrix, list) and len(matrix) == len(ids) and all(isinstance(r, list) and len(r) == len(ids) for r in matrix):
-            rm["cov"] = {"ids": ids, "matrix": matrix, "made_ms": fc.made_ms}
+            previous = rm.get("cov") if isinstance(rm.get("cov"), dict) else {}
+            old_ids = previous.get("ids") if isinstance(previous.get("ids"), list) else []
+            old_matrix = previous.get("matrix") if isinstance(previous.get("matrix"), list) else []
+            all_ids = list(dict.fromkeys(sid for sid in [*ids, *old_ids] if isinstance(sid, str)))
+
+            def last_cov(a: str, b: str) -> float | None:
+                for cids, mat in ((ids, matrix), (old_ids, old_matrix)):
+                    if a in cids and b in cids:
+                        try:
+                            v = _num(mat[cids.index(a)][cids.index(b)])
+                        except (IndexError, TypeError):
+                            v = None
+                        if v is not None:
+                            return v
+                return None
+
+            rm["cov"] = {"ids": all_ids, "matrix": [[last_cov(a, b) for b in all_ids] for a in all_ids],
+                         "made_ms": fc.made_ms}
         self._dirty = True
 
     def _risk_cov(self, ids: list[str], fc: Forecast | None) -> tuple[list[list[float]] | None, dict[str, str]]:
@@ -1446,7 +1463,14 @@ class Allocator:
                         return v
             return 0.0
 
-        return [[cov_ij(a, b) for b in ids] for a in ids], notes
+        cov = [[cov_ij(a, b) for b in ids] for a in ids]
+        if not M.is_positive_semidefinite(cov):
+            # Mixing forecasts can create an impossible covariance matrix. Use the upper risk bound for long weights.
+            note = "inconsistent covariance estimates, perfect positive correlation assumed"
+            for sid in ids:
+                notes[sid] = f"{notes[sid]}, {note}" if sid in notes else note
+            cov = [[sigma[a] * sigma[b] for b in ids] for a in ids]
+        return cov, notes
 
     def _final_cap(self, v: AllocVenue, plan: Plan, current: dict[str, Current], reasons: dict[str, str],
                    fc: Forecast | None) -> dict[str, Any]:

@@ -165,6 +165,28 @@ def portfolio_vol_ann(w: Sequence[float], cov: Sequence[Sequence[float]], n: int
     return math.sqrt(max(0.0, DAYS * q)) / n if n else 0.0
 
 
+def is_positive_semidefinite(matrix: Sequence[Sequence[float]]) -> bool:
+    """Test a symmetric matrix by eliminating one pivot at a time, allowing zero pivots."""
+    size = len(matrix)
+    work = [list(row) for row in matrix]
+    tolerance = max((abs(work[i][i]) for i in range(size)), default=0.0) * 1e-12
+    for i in range(size):
+        if any(abs(work[j][i] - work[i][j]) > tolerance for j in range(i + 1, size)):
+            return False
+    for i in range(size):
+        pivot = work[i][i]
+        if pivot < -tolerance:
+            return False
+        if pivot <= tolerance:
+            if any(abs(work[j][i]) > tolerance for j in range(i + 1, size)):
+                return False
+            continue
+        for j in range(i + 1, size):
+            for k in range(j, size):
+                work[k][j] -= work[k][i] * work[j][i] / pivot
+    return True
+
+
 def solve_weights(mu: Sequence[float], cov: Sequence[Sequence[float]], w_prev: Sequence[float], cost: Sequence[float], *,
                   gamma: float = 2.0, iters: int = 50_000, tol: float = 1e-13) -> list[float]:
     """argmax over 0 <= w <= 1 of  mu'w - gamma/2 w'Sigma w - sum_s cost_s |w_s - w_prev_s|.

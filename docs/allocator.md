@@ -141,7 +141,9 @@ Per strategy, a weights run does:
    minimum weight of 0.0001 on venues without a floor. A book already below that limit keeps its weight. Disabled
    books are held fixed and contribute zero when the runner reports an empty position list. Locked books keep their
    controls. A sleeve with no sigma in today's forecast counts at its last known one (`state.json`
-   `risk_model`, kept from every fresh forecast); one never seen counts at the largest known sigma. If the cap cannot be
+   `risk_model`, kept from every fresh forecast). A sleeve without any volatility history uses the largest known sigma.
+   Cached covariance pairs remain available when a forecast omits a sleeve. If the combined estimates form an invalid
+   covariance matrix, the cap assumes perfect positive correlation. If the cap cannot be
    met, the cap uses the lowest-risk permitted weights, keeps trading books enabled, and reports "cap infeasible" in
    the decision line and `status.json` `last_error`. The check runs on every weights run, also a held one (forecast
    missing or stale: it uses the last known volatilities), and its result is `final_cap` in the decision line (per venue
