@@ -577,7 +577,13 @@ class VenueHub:
                     svc._cache = None
                     out[cfg.id] = "paused"
                 elif mode == "llm":
-                    await svc._ensure_running([e.unit for e in reg.entries if e.unit])
+                    units = [e.unit for e in reg.entries if e.unit]
+                    if any(not e.unit for e in reg.entries):  # an entry naming no unit runs under the venue's own runner
+                        units += [cfg.unit] if cfg.unit else list(reg.units)
+                    if not units:
+                        out[cfg.id] = "refused: no runner unit known (strategies.json names none and the venue has none configured)"
+                        continue
+                    await svc._ensure_running(units)
                     out[cfg.id] = "runner running; the allocator decides"
                 else:
                     out[cfg.id] = "unchanged (MANUAL: switch its strategies per card)"

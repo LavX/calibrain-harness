@@ -367,6 +367,20 @@ def test_the_header_switch_reaches_every_allocator_venue(roots, tmp_path):
     assert out["okx-demo"] == "paused" and all(ctl(okx, i)["enabled"] is False for i in OKX_IDS)
 
 
+def test_the_header_switch_starts_the_venues_own_runner_when_strategies_json_names_no_unit(roots, tmp_path):
+    bybit, okx = roots
+    put(okx / "strategies.json", [{"id": i, "label": i.title()} for i in OKX_IDS])  # unit is optional per strategy
+    sd = FakeSystemd()
+    out = asyncio.run(hub_of(bybit, okx, tmp_path, sd).auto_others(True, "llm"))
+    assert sd.active == {"calibrain-live-okx.service"} and "allocator decides" in out["okx-demo"]
+    # a venue with no unit anywhere (none per strategy, none configured): said, not claimed running
+    vs = [V.venue_config("bybit-demo", bybit, unit=""), V.venue_config("okx-demo", okx, unit="")]
+    services = {"bybit-demo": st.StrategyService(bybit, run=sd, clock=lambda: T0, extra_units=(), dashboard_account=""),
+                "okx-demo": st.StrategyService(okx, run=sd, clock=lambda: T0, extra_units=(), dashboard_account="", shares_bot_account=False)}
+    out = asyncio.run(V.VenueHub(vs, services, state=tmp_path / "state2", clock=lambda: T0).auto_others(True, "llm"))
+    assert out["okx-demo"].startswith("refused: no runner unit known")
+
+
 def test_the_drawdown_floor_keeps_running_on_every_venue_while_the_allocator_is_paused(roots, tmp_path):
     """A KILL on bybit-demo pauses the allocator; OKX's books are still open and must still be cut by the floor."""
     bybit, okx = roots
