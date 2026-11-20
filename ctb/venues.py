@@ -190,6 +190,32 @@ def _derivative_unrealised(positions: list[dict]) -> float | None:
     return _sum_known([p.get("upnl_usdt") for p, k in zip(positions, kinds) if k == "derivative"])
 
 
+def venue_presence(cfg: VenueConfig, doc: dict, now_ms: float) -> tuple[str, str | None, list[dict], list[str]]:
+    """presence() of one snapshot, with the runner units it looked at: (state, why, units, wanted unit names)."""
+    has_registry = (cfg.root / "strategies.json").is_file()
+    entry_units = list(dict.fromkeys(s["unit"] for s in doc["strategies"] if s.get("unit")))
+    wanted = entry_units or ([cfg.unit] if cfg.unit else []) or [r["unit"] for r in doc["runners"] if r.get("unit")]
+    units = [u for u in doc["runners"] if u.get("unit") in wanted]
+    pres, why = presence(cfg, has_registry=has_registry, reg_error=doc.get("error"), units=units,
+                         statuses=[s.get("status") for s in doc["strategies"]], now_ms=now_ms, n_strategies=len(doc["strategies"]))
+    return pres, why, units, wanted
+
+
+def proven_flat(raw: dict | None, now_ms: float) -> bool:
+    """Fail closed: the status proves the book flat only if it is fresh, was written after the runner saw the pause
+    (enabled false), lists positions as a real, empty list and sets no non-zero target. (It carries no working orders, so
+    this never stands alone: the strategy's runner must also be confirmed live, and the flatten flag is written anyway.)"""
+    if not isinstance(raw, dict):
+        return False
+    upd = _num(raw.get("updated_ms"))
+    if upd is None or now_ms - upd > S.STALE_S * 1000 or raw.get("enabled") is not False or raw.get("state") == "latched":
+        return False
+    pos, tgt = raw.get("positions"), raw.get("targets", [])
+    if not isinstance(pos, list) or pos or not isinstance(tgt, list):
+        return False
+    return not any(not isinstance(t, dict) or _num(t.get("target_qty")) != 0.0 for t in tgt)
+
+
 def _signed(side: str, qty: float) -> float:
     return -abs(qty) if side.lower() in ("short", "sell") else abs(qty)
 
@@ -532,11 +558,7 @@ class VenueHub:
         doc = await svc.snapshot(force=force)
         base = self._sample(cfg, doc, now) if has_registry else None
         rows = [strategy_row(v, base, now_ms) for v in doc["strategies"]]
-        entry_units = list(dict.fromkeys(s["unit"] for s in doc["strategies"] if s.get("unit")))
-        wanted = entry_units or ([cfg.unit] if cfg.unit else []) or [r["unit"] for r in doc["runners"] if r.get("unit")]
-        units = [u for u in doc["runners"] if u.get("unit") in wanted]
-        pres, why = presence(cfg, has_registry=has_registry, reg_error=doc.get("error"), units=units,
-                             statuses=[s.get("status") for s in doc["strategies"]], now_ms=now_ms, n_strategies=len(doc["strategies"]))
+        pres, why, units, wanted = venue_presence(cfg, doc, now_ms)
         today = [r for r in rows if r["pnl_today"] is not None]
 
         def total(key: str) -> float | None:  # the known values summed; None when none is known (never a made-up zero)
@@ -637,23 +659,28 @@ class VenueHub:
         # write first: nothing (a slow systemctl, a broken status file) may delay or stop the flags
         res = svc.kill_all(pause_allocator=vid == self.primary_id)
         written, failed = res["written"], res["failed"]
+        flat_ids: list[str] = []
         try:
             doc = await svc.snapshot(force=True)
             now_ms = self.clock() * 1000
             live = {v["id"]: strategy_liveness(cfg, v, doc["runners"], now_ms) for v in doc["strategies"]}
+            pres, pres_why, _, _ = venue_presence(cfg, doc, now_ms)
             read_error = None
+            # informational: confirmed AND proven flat by its own fresh status (the flag is still written; the runner clears it)
+            flat_ids = [i for i in written if live.get(i, (False, ""))[0] and proven_flat(S.read_json(cfg.root / i / "status.json"), now_ms)]
         except Exception as exc:  # noqa: BLE001 - the flags are written; only the confirmation is lost
-            live, read_error = {}, f"could not read the runner's state ({type(exc).__name__}: {exc})"
+            live, read_error, pres, pres_why = {}, f"could not read the runner's state ({type(exc).__name__}: {exc})", "error", None
         confirmed = [i for i in written if live.get(i, (False, ""))[0]]
         unconfirmed = {i: live.get(i, (False, read_error or "unknown"))[1] for i in written if i not in confirmed}
         for i in res["missing"]:  # listed in strategies.json but no directory: not flagged, so nothing confirms it is flat
             unconfirmed[i] = "no directory under the root, so it was not flagged (the runner has not created it, or it was removed)"
-        out = {"ok": not failed and not unconfirmed, "venue": vid, "label": cfg.label, "written": written, "flattening": written,
-               "already_flat": res["already_flat"], "confirmed": confirmed, "unconfirmed": unconfirmed, "failed": failed,
-               "allocator_paused": res["allocator_paused"] if vid == self.primary_id else None}
+        venue_down = None if pres == "live" else (pres_why or read_error or f"venue {pres}")  # a venue that is not live never answers 200
+        out = {"ok": not failed and not unconfirmed and venue_down is None, "venue": vid, "label": cfg.label, "written": written,
+               "flattening": written, "already_flat": flat_ids, "confirmed": confirmed, "unconfirmed": unconfirmed, "failed": failed,
+               "venue_not_live": venue_down, "allocator_paused": res["allocator_paused"] if vid == self.primary_id else None}
         if failed:
             raise S.StrategyError(500, kill_message(cfg, out), detail=out)
-        if unconfirmed:
+        if unconfirmed or venue_down:
             raise S.StrategyError(409, kill_message(cfg, out), detail=out)
         return out
 
@@ -681,12 +708,7 @@ def kill_preview(cfg: VenueConfig, pres: str, why: str | None, doc: dict, now_ms
         return {"ok": False, "available": False, "why": kill_refusal(cfg, pres, why)}
     if pres != "live":
         return {"ok": False, "available": True, "why": kill_refusal(cfg, pres, why)}
-    def paused_and_flat(v: dict) -> bool:  # the kill only locks these (nothing to close), so no runner has to confirm them
-        st = v.get("status")
-        return not (v.get("control") or {}).get("enabled") and bool(st) and not st["positions"]
-
-    bad = {v["id"]: w for v in doc["strategies"] if not paused_and_flat(v)
-           for ok, w in [strategy_liveness(cfg, v, doc["runners"], now_ms)] if not ok}
+    bad = {v["id"]: w for v in doc["strategies"] for ok, w in [strategy_liveness(cfg, v, doc["runners"], now_ms)] if not ok}
     bad.update({v["id"]: "no directory, it would not be flagged" for v in doc["strategies"] if not (cfg.root / v["id"]).is_dir()})
     if not bad:
         return {"ok": True, "available": True, "why": None}
@@ -701,7 +723,9 @@ def kill_message(cfg: VenueConfig, out: dict) -> str:
         return (f"{cfg.label} KILL partially written: could not write {fails}. Written (paused, owner-locked, flatten "
                 f"requested{alloc}): {written}. Fix the file permissions and kill again.")
     why = "; ".join(f"{k} ({v})" for k, v in out["unconfirmed"].items())  # includes strategies not flagged (no directory)
-    flat = f" Already flat and paused (only locked): {', '.join(out['already_flat'])}." if out.get("already_flat") else ""
+    if out.get("venue_not_live"):
+        why = f"the venue is not live ({out['venue_not_live']})" + (f"; {why}" if why else "")
+    flat = f" Already flat (its runner clears the flag on its next loop): {', '.join(out['already_flat'])}." if out.get("already_flat") else ""
     return (f"{cfg.label} KILL written, NOT confirmed: {why}. The flags are on disk for {written} (paused, owner-locked, "
             f"flatten requested{alloc}); nothing closes until the runner reads them. Confirmed: {', '.join(out['confirmed']) or 'none'}.{flat}")
 

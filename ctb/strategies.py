@@ -388,10 +388,8 @@ class StrategyService:
         path = self.root / e.id / "control.json"
         with locked(path):
             cur = read_json(path) or {}
-            if refuse_if_kill and cur.get("flatten") is True:
-                if not self._is_flat(e):
-                    raise StrategyError(409, KILL_PENDING_MSG.format(names=e.label), detail={"kill_pending": [e.id]})
-                changes = {**changes, "flatten": False}  # a stale flag on a flat book: nothing to keep open, nothing to cancel
+            if refuse_if_kill and cur.get("flatten") is True:  # never cleared here: only the runner (flat) or the owner's cancel ends it
+                raise StrategyError(409, KILL_PENDING_MSG.format(names=e.label), detail={"kill_pending": [e.id]})
             if require_kill and cur.get("flatten") is not True:  # checked here, at the write: the runner may have just cleared it
                 raise StrategyError(409, f"no kill is pending for {e.label}")
             ctl = {**cur, "enabled": self._enabled(e), "flatten": bool(cur.get("flatten")), "reset_latch": bool(cur.get("reset_latch")),
@@ -415,14 +413,10 @@ class StrategyService:
     def _kill_pending(self, e: Entry) -> bool:
         return self._control(e).get("flatten") is True
 
-    def _is_flat(self, e: Entry) -> bool:
-        """The runner's book for this strategy holds nothing (its status.json lists no position). Unknown is not flat."""
-        st = clean_status(read_json(self.root / e.id / "status.json"))
-        return st is not None and not st["positions"]
-
     def _refuse_if_kill_pending(self, entries: list[Entry], cancel_kill: bool) -> None:
-        """A kill is pending only while there is something to close: a flat strategy's leftover flag is cleared on enable."""
-        pending = [e for e in entries if self._kill_pending(e) and not self._is_flat(e)]
+        """A status.json that shows no position does not prove the book flat (it can predate a fill or a working order), so a
+        pending kill is never waved through here: the runner clears it when flat, or the owner cancels it."""
+        pending = [e for e in entries if self._kill_pending(e)]
         if pending and not cancel_kill:
             raise StrategyError(409, KILL_PENDING_MSG.format(names=", ".join(e.label for e in pending)),
                                 detail={"kill_pending": [e.id for e in pending]})
@@ -667,10 +661,10 @@ class StrategyService:
         """Dashboard kill switch: pause the allocator, then pause every strategy (owner-locked) and ask the runner to
         flatten it. The runner closes positions through its own books. Always records the owner's intent, whether or not
         the runner is up (ctb.venues.VenueHub.kill says whether it is confirmed). A failed write does not stop the others.
-        A strategy that is already paused and flat gets the pause and the owner lock but no flatten flag: there is nothing to
-        close, and a flag no runner clears (its runner may be stopped, as PER-SYMBOL BOT mode does) would only block it later.
-        Returns {"written": [flagged ids], "already_flat": [ids], "failed": {id or "allocator": why}, "missing": [ids without
-        a directory], "allocator_paused": bool}."""
+        Every strategy gets the flatten flag, also one whose status shows it flat: a status can predate a fill or a working
+        order, and a live runner clears the flag itself on its first loop when the book really is flat.
+        Returns {"written": [flagged ids], "failed": {id or "allocator": why}, "missing": [ids without a directory],
+        "allocator_paused": bool}."""
         reg = self.registry()
         failed: dict[str, str] = {}
         if pause_allocator:
@@ -679,26 +673,19 @@ class StrategyService:
             except StrategyError as exc:
                 failed[ALLOCATOR] = exc.message
         done: list[str] = []
-        flat: list[str] = []
         missing: list[str] = []
         for e in reg.entries:
             if not (self.root / e.id).is_dir():
                 missing.append(e.id)  # no directory: nothing to write into; named so the answer can say so
                 continue
             try:
-                paused_and_flat = not self._enabled(e) and self._is_flat(e)  # read before the kill's own pause
                 self._write_owner(e, False)
-                if paused_and_flat:
-                    self._write(e, reason="kill switch from the dashboard: already flat and paused, nothing to close")
-                    flat.append(e.id)
-                else:
-                    self._write(e, flatten=True, reason="kill switch from the dashboard")
-                    done.append(e.id)
+                self._write(e, flatten=True, reason="kill switch from the dashboard")
+                done.append(e.id)
             except StrategyError as exc:
                 failed[e.id] = exc.message
         self._cache = None
-        return {"written": done, "already_flat": flat, "failed": failed, "missing": missing,
-                "allocator_paused": pause_allocator and ALLOCATOR not in failed}
+        return {"written": done, "failed": failed, "missing": missing, "allocator_paused": pause_allocator and ALLOCATOR not in failed}
 
     async def act(self, sid: str, action: str, *, llm_trading: bool, venue: str, cancel_kill: bool = False) -> dict[str, Any]:
         """Per-card actions: enable / pause (the Auto trade switch, owner-locked), unlock (back to the LLM), flatten, reset, and

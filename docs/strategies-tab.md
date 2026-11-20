@@ -103,9 +103,12 @@ Routes: `GET /api/venues` (every venue: presence, books, account, P&L today, str
 `POST /api/venues/{vid}/runner/{start|stop}`, `POST /api/venues/{vid}/kill`, `POST /api/kill-all`.
 
 KILL always records the owner's intent: it pauses the allocator (bybit-demo), and pauses every strategy of the venue
-(owner-locked) with its flatten flag set. A strategy that is already paused and flat gets only the pause and the lock
-("already flat, paused"): there is nothing to close, and a flag no runner clears (PER-SYMBOL BOT mode stops it) would
-only block it later. Enabling a flat strategy that still carries a flatten flag clears it without the cancel step. It then answers 200 only when every written strategy's runner unit is active and
+(owner-locked) with its flatten flag set, every strategy, also one whose status shows it flat: a status can predate
+a fill or a working order (it lists no orders at all). The answer names a strategy "already flat" only when its runner is
+confirmed live and its own fresh status, written after the runner saw the pause (`enabled: false`), lists positions as an
+empty list and no non-zero target; the flag is still written and that runner clears it on its next loop. A venue that is
+not live never answers 200. Enabling a strategy with a pending flag always needs the owner's cancel, whatever its status
+shows. It then answers 200 only when every written strategy's runner unit is active and
 its status.json is fresh (checked per strategy, since units can be per strategy). Otherwise it answers 409 "written, NOT
 confirmed" naming the strategies nobody may be acting for yet: a hung or restarting runner reads the flags when it comes
 back. A failed write answers 500 with what was and was not written. The flags are written before any systemd call (only

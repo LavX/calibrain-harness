@@ -221,8 +221,7 @@ def test_a_stopped_unit_of_one_strategy_raises_an_alert(roots, tmp_path):
     downs = {a["strategy"]: a for a in out["alerts"] if a["kind"] == "unit_down" and a["venue"] == "bybit-demo"}
     assert sorted(downs) == ["trend", "xsmom"] and "calibrain-live@trend.service" in downs["trend"]["text"]
     k = out["venues"][0]["kill"]  # the preview agrees with what KILL would answer: not confirmable for trend and xsmom
-    assert k["available"] is True and k["ok"] is False and "xsmom" in k["why"]
-    assert "trend" not in k["why"]  # paused and flat: the kill only locks it, no runner has to confirm anything
+    assert k["available"] is True and k["ok"] is False and "trend" in k["why"] and "xsmom" in k["why"]
 
 
 def test_unit_times_come_as_unix_seconds_with_a_fallback():
@@ -313,8 +312,8 @@ def test_kill_liveness_is_per_strategy_when_units_are(roots, tmp_path):
     with pytest.raises(st.StrategyError) as e:
         run(h.kill("bybit-demo"))
     d = e.value.detail
-    assert d["confirmed"] == ["carry"] and sorted(d["unconfirmed"]) == ["xsmom"] and d["already_flat"] == ["trend"]
-    assert "calibrain-live@xsmom.service is inactive" in d["unconfirmed"]["xsmom"] and "Confirmed: carry" in e.value.message
+    assert d["confirmed"] == ["carry"] and sorted(d["unconfirmed"]) == ["trend", "xsmom"] and d["already_flat"] == []
+    assert "calibrain-live@trend.service is inactive" in d["unconfirmed"]["trend"] and "Confirmed: carry" in e.value.message
 
 
 def test_a_latched_strategy_is_never_confirmed(roots, tmp_path):
@@ -325,7 +324,8 @@ def test_a_latched_strategy_is_never_confirmed(roots, tmp_path):
     with pytest.raises(st.StrategyError) as e:
         run(h.kill("bybit-demo"))
     d = e.value.detail
-    assert e.value.status == 409 and d["confirmed"] == ["carry"] and d["already_flat"] == ["trend"] and "latched" in d["unconfirmed"]["xsmom"]
+    assert e.value.status == 409 and d["confirmed"] == ["carry", "trend"] and "latched" in d["unconfirmed"]["xsmom"]
+    assert d["already_flat"] == ["trend"] and ctl(roots[0], "trend")["flatten"] is True  # proven flat, still flagged (its runner clears it)
     assert "flatten runs after the reset" in e.value.message and ctl(roots[0], "xsmom")["flatten"] is True  # written all the same
     set_status(roots[0], "xsmom", positions=[{"symbol": "SOLUSDT", "side": "long", "qty": 1, "entry_price": 1, "mark_price": 1,
                                               "upnl_usdt": 0.0, "market": "linear"}])
@@ -763,8 +763,8 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             # kill: bybit's runner is down, so its flags are written but not confirmed (409 with the detail); OKX confirms
             r = await c.post("/api/venues/bybit-demo/kill", json={})
             body = await r.json()
-            assert r.status == 409 and "NOT confirmed" in body["error"] and sorted(body["written"]) == ["carry", "xsmom"]
-            assert body["already_flat"] == ["trend"] and ctl(roots[0], "trend")["flatten"] is False  # paused and flat: only locked
+            assert r.status == 409 and "NOT confirmed" in body["error"] and sorted(body["written"]) == ["carry", "trend", "xsmom"]
+            assert body["already_flat"] == [] and ctl(roots[0], "trend")["flatten"] is True  # runner down: nothing is proven flat
             assert ctl(roots[0], "carry")["flatten"] is True and alloc_ctl(roots[0])["enabled"] is False
             r = await c.post("/api/kill", json={})  # the old alias answers the same way and says the bot's auto-trade is off
             body = await r.json()
@@ -909,9 +909,10 @@ def test_a_decision_in_flight_does_not_switch_strategies_back_on_after_a_pause(r
     assert sorted(last["skipped_paused"]) == ["carry", "trend", "xsmom"]  # the feed says why nothing was applied
 
 
-def test_bot_mode_kill_all_then_back_to_manual_and_auto_trade_works(roots, tmp_path):
-    """PER-SYMBOL BOT pauses the bybit strategies and stops their runner (they share the bot's account). KILL ALL there must not
-    leave flags nobody clears: back in MANUAL, AUTO-TRADE on works."""
+def test_bot_mode_kill_all_then_back_to_manual_needs_the_owners_cancel(roots, tmp_path):
+    """PER-SYMBOL BOT pauses the bybit strategies and stops their runner (they share the bot's account). KILL ALL there still
+    writes the flags (a stopped runner proves nothing is flat) and says it is not confirmed; back in MANUAL the owner's
+    explicit cancel switches them on again."""
     bybit = roots[0]
     set_status(bybit, "carry", positions=[])  # set_mode("bot") requires the strategies flat
     sd = FakeSystemd(active=BYBIT_UNITS)
@@ -919,54 +920,72 @@ def test_bot_mode_kill_all_then_back_to_manual_and_auto_trade_works(roots, tmp_p
     svc = h.primary
     run(svc.set_mode("bot", venue="demo", bot_open=False))
     assert not sd.active & set(BYBIT_UNITS)  # the runner is stopped
-    out = run(h.kill_all())
-    by = {r["venue"]: r for r in out["venues"]}
-    assert by["bybit-demo"]["ok"] is True and sorted(by["bybit-demo"]["already_flat"]) == ["carry", "trend", "xsmom"]
-    assert all(ctl(bybit, i).get("flatten") is not True and ctl(bybit, i)["owner_lock"] is True for i in ("carry", "trend", "xsmom"))
+    by = {r["venue"]: r for r in run(h.kill_all())["venues"]}
+    assert by["bybit-demo"]["ok"] is False and by["bybit-demo"]["already_flat"] == [] and by["bybit-demo"]["venue_not_live"]
+    assert all(ctl(bybit, i)["flatten"] is True for i in ("carry", "trend", "xsmom"))
     run(svc.set_mode("manual", venue="demo", bot_open=False))
-    run(svc.auto(True, None, llm_trading=False, venue="demo"))
-    assert all(ctl(bybit, i)["enabled"] is True for i in ("carry", "trend", "xsmom"))
+    with pytest.raises(st.StrategyError) as e:
+        run(svc.auto(True, None, llm_trading=False, venue="demo"))
+    assert e.value.status == 409 and sorted(e.value.detail["kill_pending"]) == ["carry", "trend", "xsmom"]
+    run(svc.auto(True, None, llm_trading=False, venue="demo", cancel_kill=["carry", "trend", "xsmom"]))
+    assert all(ctl(bybit, i)["enabled"] is True and ctl(bybit, i)["flatten"] is False for i in ("carry", "trend", "xsmom"))
 
 
-def test_enable_clears_a_stale_flag_on_a_flat_book_without_cancel(roots, tmp_path):
+def test_enable_never_clears_a_pending_flag_without_the_cancel(roots, tmp_path):
     okx = roots[1]
-    c = ctl(okx, "longvol")  # longvol is flat
+    c = ctl(okx, "longvol")  # longvol's status shows no position: that does not prove the book flat
     (okx / "longvol" / "control.json").write_text(json.dumps({**c, "enabled": False, "flatten": True}))
-    h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
-    run(h.service("okx-demo").act("longvol", "enable", llm_trading=False, venue="demo"))  # no cancel_kill needed: nothing to keep open
-    c = ctl(okx, "longvol")
-    assert c["enabled"] is True and c["flatten"] is False
+    svc = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).service("okx-demo")
+    with pytest.raises(st.StrategyError) as e:
+        run(svc.act("longvol", "enable", llm_trading=False, venue="demo"))
+    assert e.value.status == 409 and ctl(okx, "longvol")["flatten"] is True
+    run(svc.act("longvol", "enable", llm_trading=False, venue="demo", cancel_kill=True))
+    assert ctl(okx, "longvol")["enabled"] is True and ctl(okx, "longvol")["flatten"] is False
 
 
-def test_api_kill_turns_the_bots_trading_off_even_when_the_venue_has_not_started(tmp_path, monkeypatch):
-    from aiohttp.test_utils import TestClient, TestServer
+def paused_flat_okx(okx, **status):
+    """OKX longvol paused by the owner, its status written after the runner saw the pause, flat, no target; then `status` overrides."""
+    (okx / "longvol" / "control.json").write_text(json.dumps({"enabled": False, "weight": 1.0, "owner_lock": True, "set_by": "owner"}))
+    set_status(okx, "longvol", **{"enabled": False, "state": "paused", "positions": [], "targets": [],
+                                  "updated_ms": int(NOW * 1000) - 10_000, **status})
 
-    from ctb.server import make_app
 
-    class Engine:
-        s = SimpleNamespace(trading_enabled=True, public_view=lambda: {})
-        db = SimpleNamespace(event=lambda *a: a, one=lambda *a: None)
-        executor = None
+def kill_okx(roots, tmp_path, active=(OKX_UNIT,)):
+    try:
+        return 200, run(hub(roots, FakeSystemd(active=list(active)), tmp_path).kill("okx-demo"))
+    except st.StrategyError as exc:
+        return exc.status, exc.detail
 
-        async def start(self): ...
-        async def stop(self): ...
-        def emit(self, *a): ...
 
-    monkeypatch.setenv("CTB_VENUE", "demo")
-    svc = st.StrategyService(tmp_path / "nothing", run=FakeSystemd(), clock=lambda: NOW, extra_units=(), dashboard_account="demo-main")
-    svc._mode = "manual"  # the strategies own the account, but bybit-demo has not started
-    eng = Engine()
-    app = make_app(eng, hub=V.VenueHub.single(svc, state=tmp_path / "state"))
-    app.on_startup.clear()
-    app.on_cleanup.clear()
+def test_a_proven_flat_strategy_is_reported_flat_and_still_flagged(roots, tmp_path):
+    paused_flat_okx(roots[1])
+    status, d = kill_okx(roots, tmp_path)
+    assert status == 200 and d["already_flat"] == ["longvol"] and "longvol" in d["confirmed"]
+    assert ctl(roots[1], "longvol")["flatten"] is True  # the live runner clears it on its first loop when the book is flat
 
-    async def go():
-        async with TestClient(TestServer(app)) as c:
-            r = await c.post("/api/kill", json={})
-            return r.status, await r.json()
 
-    status, body = run(go())
-    assert status == 409 and "has not started" in body["error"] and body["bot_auto_trade"] == "off" and eng.s.trading_enabled is False
+@pytest.mark.parametrize("case,status_over", [
+    ("stale flat status, then a fill", {"updated_ms": int(NOW * 1000) - 600_000}),
+    ("positions not a list", {"positions": 1}),
+    ("a non-zero target while flat", {"targets": [{"symbol": "BTCUSDT", "market": "linear", "target_qty": 0.01}]}),
+    ("status written before the pause", {"enabled": True, "state": "running"}),
+])
+def test_unproven_flat_is_flagged_and_never_reported_flat(roots, tmp_path, case, status_over):
+    paused_flat_okx(roots[1], **status_over)
+    status, d = kill_okx(roots, tmp_path)
+    assert "longvol" not in d["already_flat"], case
+    assert ctl(roots[1], "longvol")["flatten"] is True, case  # a normal kill: the flag is written
+    if case.startswith("stale"):
+        assert status == 409 and "longvol" in d["unconfirmed"]  # nobody is proven to be reading it
+
+
+def test_all_paused_and_flat_with_the_unit_stopped_is_not_confirmed(roots, tmp_path):
+    okx = roots[1]
+    paused_flat_okx(okx)
+    set_status(okx, "trend", enabled=False, state="paused", positions=[], targets=[], updated_ms=int(NOW * 1000) - 10_000)
+    status, d = kill_okx(roots, tmp_path, active=())  # the runner is stopped
+    assert status == 409 and d["already_flat"] == [] and d["confirmed"] == [] and d["venue_not_live"]
+    assert all(ctl(okx, i)["flatten"] is True for i in ("trend", "longvol"))
 
 
 def test_liveness_falls_back_to_the_venues_units_when_strategies_json_names_none(tmp_path):
