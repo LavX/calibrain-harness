@@ -486,3 +486,20 @@ def test_the_predictions_panel_finds_a_weights_line_in_a_compressed_archive(tmp_
     (d / "decisions-2027-01-13.jsonl").write_text(json.dumps({"t_ms": 3, "weights_mode": "held"}) + "\n")
     (d / "decisions.jsonl").write_text(json.dumps({"t_ms": 4, "weights_mode": "refresh"}) + "\n")
     assert P.newest_with(d, "core")["core"] == {"trend": 0.4}  # two days of held runs in between
+
+
+def test_a_switched_off_book_stays_off_in_the_shadows_until_the_rules_switch_it(root):
+    """xsmom is switched off (not locked), flat, weight 0.3, and has no forecast. The shadows start from the live book:
+    off, so exposure 0 in every policy, on a computed run and on a held one."""
+    put(root / "forecast" / "latest.json", forecast(T0 - 7200, kappa=0.0))
+    put(root / "xsmom" / "control.json", {"enabled": False, "weight": 0.3, "owner_lock": False})
+    put(root / "xsmom" / "status.json", {"state": "running", "equity_usdt": 1000.0, "start_equity_usdt": 1000.0, "positions": []})
+    clock = Clock(T0)
+    a = _alloc(root, clock)
+    for run in ("computed", "held"):
+        if run == "held":
+            (root / "forecast" / "latest.json").unlink()
+            clock.t = T0 + 3600
+        vr = decide(a, trigger="decide_now")["venues"]["bybit-demo"]
+        assert {k: v["xsmom"] for k, v in vr["policies"].items()} == {"core": 0.0, "live": 0.0, "tilt": 0.0, "core_veto": 0.0}, run
+        assert not any(v["xsmom"] for v in vr["policy_enabled"].values()), run

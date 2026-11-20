@@ -1604,8 +1604,11 @@ class Allocator:
             key = self.vk(v.id, name)
             book = books.get(key) if isinstance(books.get(key), dict) else {}
             prev = book.get("w") if isinstance(book.get("w"), dict) else {}
+            prev_on = book.get("on") if isinstance(book.get("on"), dict) else {}
             w = {sid: (_num(prev.get(sid)) if _num(prev.get(sid)) is not None else c.weight) for sid, c in current.items()}
-            cur = {sid: (c if c.owner_lock else replace(c, weight=w[sid], enabled=w[sid] > 0)) for sid, c in current.items()}
+            # on/off as the book was, the live book's the first time: only the rules switch a shadow book on or off
+            on = {sid: (prev_on[sid] if isinstance(prev_on.get(sid), bool) else c.enabled) for sid, c in current.items()}
+            cur = {sid: (c if c.owner_lock else replace(c, weight=w[sid], enabled=on[sid])) for sid, c in current.items()}
             anchor = book.get("anchor") if isinstance(book.get("anchor"), dict) and book["anchor"].get("day") == day else {}
             aw = {sid: (_num((anchor.get("w") or {}).get(sid)) if _num((anchor.get("w") or {}).get(sid)) is not None else cur[sid].weight)
                   for sid in current}
@@ -1618,7 +1621,8 @@ class Allocator:
                                     "", None, derive_enabled=tuple(out["opt"]))
             plan = resolve(cur, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct)
             self._final_cap(v, plan, cur, {}, fc)
-            books[key] = {"w": {sid: round(plan.weights[sid], 4) for sid in current}, "anchor": {"day": day, "w": aw}}
+            books[key] = {"w": {sid: round(plan.weights[sid], 4) for sid in current}, "on": {sid: bool(plan.enabled[sid]) for sid in current},
+                          "anchor": {"day": day, "w": aw}}
             enabled[name] = {sid: bool(plan.enabled[sid]) for sid in current}
             policies[name] = {sid: self._exposure(plan.weights[sid], enabled[name][sid], cur[sid]) for sid in current}
         live_on = live_on if live_on is not None else {sid: c.enabled for sid, c in current.items()}
