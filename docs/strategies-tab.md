@@ -111,8 +111,14 @@ strategies.json is unusable, is refused with nothing written. KILL ALL does ever
 that has not started is skipped) and then switches the per-symbol bot's AUTO-TRADE off. `/api/kill` (the old header
 button) is the bybit-demo kill in LLM DECIDES and MANUAL.
 
-An owner "enable" (the card switch, or the MANUAL header switch) writes `flatten: false`, so a strategy switched back on
-after a KILL is not flattened again by the kill's flag. UNLOCK TO LLM is refused on an owner-controlled venue (no allocator).
+A pending kill (`flatten: true`) ends in one of two ways only: the runner, once flat, clears the flag itself
+(`research/live/runner.py` `_flatten_clear`: it writes `enabled: false, flatten: false`), or the owner cancels it. The
+card switch, the MANUAL header switch and UNLOCK TO LLM answer 409 "a kill is pending" for such a strategy unless the
+request carries `cancel_kill: true`, which the page sends only after a confirm that says the positions will NOT be
+closed. The card also has CANCEL KILL (`/strategies/{sid}/cancel_kill`: flatten cleared, still paused and owner-locked).
+The allocator never switches on a strategy whose control.json has `flatten: true` (it logs why and skips it). The "kill
+pending" alert shows only while the book still holds positions (or is switched on); flat and paused is done.
+UNLOCK TO LLM is refused on an owner-controlled venue (no allocator).
 
 P&L today uses the harness's own 00:00 UTC baseline, one small JSON file per venue under the harness data directory
 (next to the database: `data/venues/baseline-<vid>.json`). A background task samples every minute, so the file is

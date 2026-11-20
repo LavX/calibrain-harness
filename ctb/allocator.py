@@ -1006,6 +1006,9 @@ class Allocator:
         ctl = ctl if isinstance(ctl, dict) else {}
         if ctl.get("owner_lock") is True:
             return False
+        if enabled and ctl.get("flatten") is True:  # a pending kill or flatten ends when the runner, flat, clears it, or the owner cancels it
+            log.info("allocator: %s not switched on: a kill or flatten is pending (control.json flatten true)", sid)
+            return False
         ctl.update({"enabled": enabled, "weight": weight, "set_by": "llm", "reason": reason[:REASONING_MAX_CHARS],
                     "updated_ms": now_ms})
         if flatten_on_zero:

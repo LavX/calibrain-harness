@@ -239,6 +239,9 @@ def strategy_row(v: dict, base: dict | None, now_ms: float) -> dict:
         "owner_lock": bool(st.get("owner_lock")) if st else bool(ctl.get("owner_lock")),
         "reason": (st.get("reason") if st else None) or ctl.get("reason"),
         "flatten_pending": bool(ctl.get("flatten_pending")),
+        # a kill still doing something: the flag is set and the book holds positions (or is switched on). Flat and paused with the
+        # flag still set only means the runner has not cleared it yet (it does so on its next loop), not a kill in progress.
+        "kill_open": bool(ctl.get("flatten_pending")) and (not st or bool(st["positions"]) or bool(ctl.get("enabled"))),
         "positions_n": len(st["positions"]) if st else None,
         "targets_n": sum(1 for t in st["targets"] if t.get("target_qty")) if st else None,
         "equity": eq, "start_equity": st.get("start_equity_usdt") if st else None, "pnl": st.get("pnl_usdt") if st else None,
@@ -276,8 +279,8 @@ def alerts(v: dict, now_ms: float) -> list[dict]:
     for s in v["strategies"]:
         sid, name, p = s["id"], s["name"], s["pill"]
         err = s.get("last_error") or ""
-        if s["flatten_pending"]:
-            add("warn", "kill_pending", "flatten requested, waiting for the runner", sid, name)
+        if s["kill_open"]:
+            add("warn", "kill_pending", "flatten requested, waiting for the runner to close the positions", sid, name)
         if p == "latched":
             add("crit", "latched", err or "latched: check the account, then reset the latch (F7)", sid, name)
         elif p == "error":

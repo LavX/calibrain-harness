@@ -293,12 +293,70 @@ def test_kill_all_reports_per_venue_and_skips_not_started(roots, tmp_path):
     assert out["ok"] is False
 
 
-def test_enable_after_a_kill_clears_the_flatten_flag(roots, tmp_path):
+def test_a_pending_kill_is_not_cancelled_by_enable_unless_the_owner_says_so(roots, tmp_path):
     h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
     run(h.kill("okx-demo"))
-    run(h.service("okx-demo").act("trend", "enable", llm_trading=False, venue="demo"))
+    svc = h.service("okx-demo")
+    with pytest.raises(st.StrategyError) as e:
+        run(svc.act("trend", "enable", llm_trading=False, venue="demo"))
+    assert e.value.status == 409 and "kill is pending" in e.value.message and e.value.detail == {"kill_pending": ["trend"]}
+    assert ctl(roots[1], "trend")["flatten"] is True and ctl(roots[1], "trend")["enabled"] is False  # untouched
+    run(svc.act("trend", "enable", llm_trading=False, venue="demo", cancel_kill=True))  # the explicit owner choice
     c = ctl(roots[1], "trend")
     assert c["enabled"] is True and c["flatten"] is False and c["owner_lock"] is True
+
+
+def test_manual_header_switch_does_not_cancel_a_pending_kill(roots, tmp_path):
+    sd = FakeSystemd(active=BYBIT_UNITS)
+    h = hub(roots, sd, tmp_path)
+    run(h.kill("bybit-demo"))
+    svc = h.primary  # MANUAL in the test hub
+    with pytest.raises(st.StrategyError) as e:
+        run(svc.auto(True, ["carry", "trend"], llm_trading=False, venue="demo"))
+    assert e.value.status == 409 and sorted(e.value.detail["kill_pending"]) == ["carry", "trend"]
+    assert all(ctl(roots[0], i)["flatten"] is True and ctl(roots[0], i)["enabled"] is False for i in ("carry", "trend"))
+    run(svc.auto(True, ["carry"], llm_trading=False, venue="demo", cancel_kill=True))
+    assert ctl(roots[0], "carry")["enabled"] is True and ctl(roots[0], "carry")["flatten"] is False
+    assert ctl(roots[0], "trend")["flatten"] is True  # not selected: its kill goes on
+
+
+def test_unlock_and_cancel_kill(roots, tmp_path):
+    h = hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path)
+    run(h.kill("bybit-demo"))
+    svc = h.primary
+    with pytest.raises(st.StrategyError) as e:
+        run(svc.act("carry", "unlock", llm_trading=False, venue="demo"))
+    assert e.value.status == 409 and ctl(roots[0], "carry")["owner_lock"] is True
+    run(svc.act("trend", "unlock", llm_trading=False, venue="demo", cancel_kill=True))
+    c = ctl(roots[0], "trend")
+    assert c["owner_lock"] is False and c["flatten"] is False
+    run(svc.act("carry", "cancel_kill", llm_trading=False, venue="demo"))
+    c = ctl(roots[0], "carry")
+    assert c["flatten"] is False and c["enabled"] is False and c["owner_lock"] is True  # positions stay open, still paused
+    with pytest.raises(st.StrategyError):
+        run(svc.act("carry", "cancel_kill", llm_trading=False, venue="demo"))  # nothing pending any more
+
+
+def test_the_allocator_never_switches_on_a_strategy_with_a_pending_kill(roots):
+    from ctb import allocator as alloc_mod
+
+    async def market():
+        return {}
+
+    a = alloc_mod.Allocator(roots[0], object(), market, model="fake", clock=lambda: NOW, tick_s=0.01)
+    p = roots[0] / "carry" / "control.json"
+    p.write_text(json.dumps({"enabled": False, "flatten": True, "owner_lock": False, "weight": 0.6}))
+    before = p.read_bytes()
+    assert a._write_control("carry", True, 0.8, "the LLM wants it on", False, int(NOW * 1000)) is False
+    assert p.read_bytes() == before
+    assert a._write_control("carry", False, 0.0, "off", False, int(NOW * 1000)) is True  # switching off is fine
+
+
+def test_no_lasting_kill_alert_once_flat_and_paused(roots, tmp_path):
+    h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
+    run(h.kill("okx-demo"))  # trend holds a position, longvol none
+    kinds = {(a["strategy"], a["kind"]) for a in run(h.summary())["alerts"]}
+    assert ("trend", "kill_pending") in kinds and ("longvol", "kill_pending") not in kinds
 
 
 def test_unlock_is_refused_on_an_owner_venue(roots, tmp_path):
@@ -569,6 +627,10 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             assert {x["venue"]: x["ok"] for x in body["venues"]} == {"bybit-demo": False, "okx-demo": True, "deribit-test": False}
             assert ctl(roots[1], "trend")["flatten"] is True
             assert (await c.post("/api/venues/okx-demo/strategies/trend/unlock", json={})).status == 409
+            r = await c.post("/api/venues/okx-demo/strategies/trend/enable", json={})  # its kill is pending
+            assert r.status == 409 and (await r.json())["kill_pending"] == ["trend"]
+            assert (await c.post("/api/venues/okx-demo/strategies/trend/enable", json={"cancel_kill": True})).status == 200
+            assert ctl(roots[1], "trend")["flatten"] is False
             # crafted ids never reach the file system: an unknown venue, a sid or unit with a path in it
             before = files_under(*roots[:2])
             for path, body in (("/api/venues/..%2F..%2Fetc/strategies/carry/pause", {}), ("/api/venues/bybit-demo/strategies/..%2Fcarry/pause", {}),

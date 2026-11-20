@@ -97,9 +97,12 @@ export async function headerAuto(doc: StratDoc, on: boolean, venue = "BYBIT·DEM
       ? `Turn AUTO-TRADE on for ${venue}? The LLM allocator will decide which strategies trade there and how much. The strategy runner is started if needed. Other venues are not affected.`
       : `Turn AUTO-TRADE on for ${set.join(", ") || "no strategy"} on ${venue}? The strategy runner is started if needed. Other venues are not affected.`
     : `Turn AUTO-TRADE off for ${venue}? ${doc.mode === "llm" ? "The allocator pauses and every" : "Every"} ${venue} strategy is paused: it places no new orders. Positions stay open (use KILL to close them).`;
-  if (!confirm(msg)) return;
+  const pending = on && doc.mode === "manual" ? doc.strategies.filter((s) => set.includes(s.id) && s.control.flatten_pending) : [];
+  if (pending.length) {
+    if (!confirm(`A kill is pending for ${pending.map((s) => s.name || s.label).join(", ")} on ${venue}. Turning AUTO-TRADE on cancels it for them: their positions will NOT be closed and they trade from them. Cancel the kill and turn AUTO-TRADE on?`)) return;
+  } else if (!confirm(msg)) return;
   try {
-    await post("/api/strategies/auto", { enabled: on });
+    await post("/api/strategies/auto", { enabled: on, ...(pending.length ? { cancel_kill: true } : {}) });
   } catch (e: any) {
     alert(e.message);
   }
@@ -140,11 +143,11 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
   const [err, setErr] = useState<string | null>(null);
   const [label, cls] = PILL[s.pill] || [s.pill.toUpperCase(), "notlive"];
   const st = s.status, c = s.control;
-  const act = async (action: string) => {
+  const act = async (action: string, body?: object) => {
     setBusy(true);
     setErr(null);
     try {
-      await post(`${base}/strategies/${s.id}/${action}`);
+      await post(`${base}/strategies/${s.id}/${action}`, body);
     } catch (e: any) {
       setErr(e.message);
     }
@@ -153,10 +156,27 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
     await reloadAll(doc.venue_id);
   };
   const lockTxt = doc.allocator_venue ? " Your choice is locked: the LLM allocator will not change it until you unlock it." : "";
+  const open_n = st?.positions.length ?? 0;
+  // A pending kill ends when the runner, flat, clears it, or when the owner cancels it here, never as a side effect.
+  const cancelTxt = `A kill is pending for ${s.label} on ${venue}${open_n ? ` and ${open_n} positions are still open` : ""}. Cancel the kill? Its positions will NOT be closed.`;
   const flip = (on: boolean) => {
+    if (on && c.flatten_pending) {
+      if (confirm(`${cancelTxt} It is then switched on and trades from them.${lockTxt}`)) act("enable", { cancel_kill: true });
+      return;
+    }
     if (on && !confirm(`Switch ${s.label} on? Orders go to ${venue} (the runner is started if needed).${lockTxt}`)) return;
     if (!on && !confirm(`Switch ${s.label} off on ${venue}? It stops placing new orders and keeps its positions open.${lockTxt}`)) return;
     act(on ? "enable" : "pause");
+  };
+  const unlock = () => {
+    if (c.flatten_pending) {
+      if (confirm(`${cancelTxt} It is then handed back to the LLM allocator, which may switch it on.`)) act("unlock", { cancel_kill: true });
+      return;
+    }
+    act("unlock");
+  };
+  const cancelKill = () => {
+    if (confirm(`${cancelTxt} It stays paused and owner-locked.`)) act("cancel_kill");
   };
   const btn = (action: string, text: string, cn?: string, disabled?: boolean) => (
     <Confirmed id={action} label={text} cn={cn} disabled={disabled} open={open} setOpen={setOpen} busy={busy} onRun={() => act(action)} />
@@ -179,8 +199,11 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
               <input type="checkbox" checked={inSet} onChange={toggleSet} /> in header set
             </label>
           )}
-          {(c.flatten_pending || c.reset_pending) && (
-            <span className="muted">waiting for the runner: {[c.flatten_pending && "flatten", c.reset_pending && "reset latch"].filter(Boolean).join(", ")}</span>
+          {c.flatten_pending && (
+            <button className="kbtn" disabled={busy} onClick={cancelKill} data-tip="Clear the pending kill's flatten flag: the positions stay open and the strategy stays paused">CANCEL KILL</button>
+          )}
+          {((c.flatten_pending && (open_n > 0 || c.enabled)) || c.reset_pending) && (
+            <span className="amb">waiting for the runner: {[c.flatten_pending && (open_n > 0 || c.enabled) && `flatten (${open_n} open)`, c.reset_pending && "reset latch"].filter(Boolean).join(", ")}</span>
           )}
         </div>
         <div className="strat-weight">
@@ -190,7 +213,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
           {doc.allocator_venue && c.owner_lock && (
             <>
               <span className="tag amb">OWNER LOCK</span>
-              <button className="kbtn" disabled={busy} onClick={() => act("unlock")} data-tip="Hand this strategy back to the LLM allocator at its next decision">UNLOCK TO LLM</button>
+              <button className="kbtn" disabled={busy} onClick={unlock} data-tip="Hand this strategy back to the LLM allocator at its next decision">UNLOCK TO LLM</button>
             </>
           )}
           {(st?.reason || c.reason) && <span className="strat-reason"><span className="muted">reason</span> {st?.reason || c.reason}</span>}

@@ -124,6 +124,15 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         except Exception:  # noqa: BLE001 - the venues page must not fail on the bot's account
             return None
 
+    async def cancel_kill(req: web.Request) -> bool:
+        """The explicit owner choice to cancel a pending kill, sent by the page only after a confirm that says the
+        positions will NOT be closed."""
+        try:
+            body = await req.json()
+        except ValueError:
+            return False
+        return isinstance(body, dict) and body.get("cancel_kill") is True
+
     def refused(exc: strat_mod.StrategyError) -> web.Response:
         return j({"error": exc.message, **exc.detail}, exc.status)
 
@@ -355,7 +364,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         try:
             svc = hub.service(req.match_info["vid"])
             return j(await svc.act(req.match_info["sid"], req.match_info["action"], llm_trading=bool(s.trading_enabled),
-                                   venue=venue_mod.name()))
+                                   venue=venue_mod.name(), cancel_kill=await cancel_kill(req)))
         except strat_mod.StrategyError as exc:
             return refused(exc)
 
@@ -411,9 +420,9 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     async def strategies_act(req: web.Request) -> web.Response:
         try:
             return j(await strat.act(req.match_info["sid"], req.match_info["action"],
-                                     llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+                                     llm_trading=bool(s.trading_enabled), venue=venue_mod.name(), cancel_kill=await cancel_kill(req)))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.post("/api/mode")
     async def trading_mode(req: web.Request) -> web.Response:
@@ -423,7 +432,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         try:
             out = await strat.set_mode(str(body.get("mode", "")) if isinstance(body, dict) else "", venue=venue_mod.name(), bot_open=bot_open)
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
         if out["llm_off"] and s.trading_enabled:
             s.trading_enabled = False
             engine.emit("event", engine.db.event("warn", "trading_toggled", "per-symbol bot auto-trade switched OFF: the mode is no longer PER-SYMBOL BOT"))
@@ -437,9 +446,9 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         ids = body.get("ids")
         try:
             return j(await strat.auto(bool(body.get("enabled")), [str(i) for i in ids] if isinstance(ids, list) else None,
-                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
+                                      llm_trading=bool(s.trading_enabled), venue=venue_mod.name(), cancel_kill=body.get("cancel_kill") is True))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.get("/api/allocator")
     async def allocator_status(req: web.Request) -> web.Response:
@@ -465,7 +474,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
         try:
             return j(await strat.allocator_act(req.match_info["action"], body.get("interval_min") if isinstance(body, dict) else None))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.post("/api/runner/{action}")
     async def runner_act(req: web.Request) -> web.Response:
@@ -474,7 +483,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             return j(await strat.runner_act(str(body.get("unit", "")) if isinstance(body, dict) else "", req.match_info["action"],
                                             llm_trading=bool(s.trading_enabled), venue=venue_mod.name()))
         except strat_mod.StrategyError as exc:
-            return j({"error": exc.message}, exc.status)
+            return refused(exc)
 
     @routes.post("/api/close")
     async def close(req: web.Request) -> web.Response:
