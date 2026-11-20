@@ -100,9 +100,17 @@ Routes: `GET /api/venues` (every venue: presence, books, account, P&L today, str
 `GET /api/venues/{vid}/strategies`, `POST /api/venues/{vid}/strategies/{sid}/{enable|disable|pause|unlock|flatten|reset}`,
 `POST /api/venues/{vid}/runner/{start|stop}`, `POST /api/venues/{vid}/kill`, `POST /api/kill-all`.
 
-KILL pauses every strategy of the venue (owner-locked) and sets its flatten flag, and on bybit-demo pauses the allocator.
-It is refused with a 409 and the reason, writing nothing, unless the venue is live: a flatten flag that no running runner
-reads closes nothing. KILL ALL does every venue and reports each one (a venue that has not started is skipped).
+KILL always records the owner's intent: it pauses the allocator (bybit-demo), and pauses every strategy of the venue
+(owner-locked) with its flatten flag set. It then answers 200 only when every written strategy's runner unit is active and
+its status.json is fresh (checked per strategy, since units can be per strategy). Otherwise it answers 409 "written, NOT
+confirmed" naming the strategies nobody may be acting for yet: a hung or restarting runner reads the flags when it comes
+back. A failed write answers 500 with what was and was not written. Only a venue that has not started, or whose
+strategies.json is unusable, is refused with nothing written. KILL ALL does every venue and reports each one (a venue
+that has not started is skipped) and then switches the per-symbol bot's AUTO-TRADE off. `/api/kill` (the old header
+button) is the bybit-demo kill in LLM DECIDES and MANUAL.
+
+An owner "enable" (the card switch, or the MANUAL header switch) writes `flatten: false`, so a strategy switched back on
+after a KILL is not flattened again by the kill's flag. UNLOCK TO LLM is refused on an owner-controlled venue (no allocator).
 
 P&L today uses the harness's own 00:00 UTC baseline, one small JSON file per venue under the harness data directory
 (next to the database: `data/venues/baseline-<vid>.json`). A background task samples every minute, so the file is

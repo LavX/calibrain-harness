@@ -30,7 +30,9 @@ export type Venue = {
   counts: { running: number; idle: number; paused: number; abnormal: number; total: number };
   books: { equity: number | null; start: number | null; pnl: number | null; unrealised: number | null; legs: number };
   pnl_today: number | null; pnl_today_partial: boolean; pnl_today_since: string | null;
-  account: VAccount | null; strategies: VStrat[]; positions: VPos[]; kill: { ok: boolean; why: string | null };
+  account: VAccount | null; strategies: VStrat[]; positions: VPos[];
+  /** available: KILL writes the flags (every venue that has started); ok: and the runner would act on them now. */
+  kill: { ok: boolean; available: boolean; why: string | null };
 };
 export type VAlert = { venue: string; venue_label: string; strategy: string | null; name: string | null; kind: string; level: "crit" | "warn"; text: string };
 export type VenuesDoc = {
@@ -57,36 +59,42 @@ async function reload() {
   await Promise.all([loadVenues().catch(() => {}), loadStrat().catch(() => {}), loadOverview().catch(() => {})]);
 }
 
-/** What KILL does on one venue, said before it happens. */
+/** What KILL does on one venue, said before it happens (and, when the runner is down or stale, that it cannot be confirmed). */
 function killText(v: Venue): string {
   const n = v.counts.total;
   const unit = v.unit || "its runner unit";
-  return v.controlled_by === "allocator"
-    ? `KILL ${v.label}?\n\nPauses the LLM allocator, pauses all ${n} strategies (owner-locked, so the allocator cannot switch them back on) and asks the runner (${unit}) to close every position through its books. The runner acts within a minute. Other venues are untouched.`
-    : `KILL ${v.label}?\n\nPauses all ${n} strategies (owner-locked) and asks the runner (${unit}) to close every position through its books. The runner acts within a minute. Other venues are untouched.`;
+  const what = v.controlled_by === "allocator"
+    ? `Pauses the LLM allocator, pauses all ${n} strategies (owner-locked, so the allocator cannot switch them back on) and asks the runner (${unit}) to close every position through its books.`
+    : `Pauses all ${n} strategies (owner-locked) and asks the runner (${unit}) to close every position through its books.`;
+  const when = v.kill.ok ? "The runner acts within a minute." : `NOT CONFIRMABLE NOW: ${v.kill.why} The flags are written anyway and read when the runner runs again.`;
+  return `KILL ${v.label}?\n\n${what} ${when} Other venues are untouched.`;
 }
 
 export async function killVenue(v: Venue) {
   if (!confirm(killText(v))) return;
   try {
     const r = await post(`/api/venues/${encodeURIComponent(v.id)}/kill`);
-    alert(`${v.label}: flattening ${r.flattening.length} strategies (${r.flattening.join(", ")}). Watch the alerts until they are flat.`);
+    alert(`${v.label}: confirmed, flattening ${r.flattening.length} strategies (${r.flattening.join(", ")}). Watch the alerts until they are flat.`);
   } catch (e: any) {
-    alert(e.message);
+    alert(e.message); // "written, NOT confirmed: ...", "partially written: ..." or "has not started"
   }
   await reload();
 }
 
 /** KILL ALL: every venue that is up is killed; the answer says, per venue, what happened or why not. */
 export async function killAll(doc: VenuesDoc | null) {
-  const lines = (doc?.venues || []).map((v) =>
-    v.presence === "absent" ? `${v.label}: not started, skipped`
-      : v.kill.ok ? `${v.label}: ${v.controlled_by === "allocator" ? "allocator paused, " : ""}${v.counts.total} strategies paused and flattened`
-        : `${v.label}: will be refused now (${PRESENCE[v.presence]?.[0] || v.presence}): ${v.kill.why}`);
+  if (!doc) return; // the button is disabled until the venues have loaded
+  const lines = doc.venues.map((v) => {
+    const what = `${v.controlled_by === "allocator" ? "allocator paused, " : ""}${v.counts.total} strategies paused and flagged to flatten`;
+    return v.presence === "absent" ? `${v.label}: not started, skipped` : !v.kill.available ? `${v.kill.why}`
+      : v.kill.ok ? `${v.label}: ${what}`
+        : `${v.label}: ${what}, NOT confirmable now (${PRESENCE[v.presence]?.[0] || v.presence}): ${v.kill.why}`;
+  });
   if (!confirm(`KILL ALL venues?\n\n${lines.join("\n")}\n\nThe per-symbol bot's AUTO-TRADE is switched off too. Positions close through each runner's books.`)) return;
   try {
     const r = await post("/api/kill-all");
-    alert(r.venues.map((x: any) => `${x.label}: ${x.ok ? `flattening ${x.flattening.join(", ")}` : x.skipped ? "not started, skipped" : x.error}`).join("\n"));
+    alert(r.venues.map((x: any) => `${x.label}: ${x.ok ? `confirmed, flattening ${x.flattening.join(", ")}` : x.skipped ? "not started, skipped" : x.error}`).join("\n")
+      + "\n\nThe per-symbol bot's AUTO-TRADE is off.");
   } catch (e: any) {
     alert(e.message);
   }
@@ -106,7 +114,7 @@ export function WorldView() {
     <main className="view on">
       <div className="grid-world">
         <section className="pnl w-strip">
-          <Ph code="VEN" right={<button className="kbtn red" onClick={() => killAll(doc)} data-tip="Pause and flatten every venue that is up; the answer says what happened on each">KILL ALL</button>}>Venues</Ph>
+          <Ph code="VEN" right={<button className="kbtn red" onClick={() => killAll(doc)} data-tip="Pause and flag to flatten every venue that has started; the answer says, per venue, whether the runner confirms">KILL ALL</button>}>Venues</Ph>
           <div className="pb tight scroll"><VenueStrip doc={doc} /></div>
           <AllocatorLine doc={doc} />
         </section>
@@ -156,8 +164,8 @@ function VenueStrip({ doc }: { doc: VenuesDoc }) {
             <td>{off ? <span className="muted">not started</span> : <>{c.running} running · {c.idle} idle{c.paused ? ` · ${c.paused} paused` : ""} / {c.total}{c.abnormal > 0 && <b className="amb"> · {c.abnormal} need attention</b>}</>}</td>
             <td>{v.controlled_by === "allocator" ? "LLM allocator" : "owner"}</td>
             <td className="r">{!off && (
-              <span data-tip={v.kill.ok ? "Pause and flatten every strategy on this venue" : v.kill.why || undefined}>
-                <button className="kbtn red" disabled={!v.kill.ok} onClick={() => killVenue(v)}>KILL</button>
+              <span data-tip={v.kill.ok ? "Pause and flatten every strategy on this venue" : v.kill.available ? `Writes the kill flags, but cannot confirm now: ${v.kill.why}` : v.kill.why || undefined}>
+                <button className="kbtn red" disabled={!v.kill.available} onClick={() => killVenue(v)}>KILL{v.kill.available && !v.kill.ok ? " (unconfirmed)" : ""}</button>
               </span>
             )}</td>
           </tr>

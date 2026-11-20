@@ -64,11 +64,12 @@ EQUITY_POINTS = 720
 
 
 class StrategyError(Exception):
-    """A refusal with an HTTP status and a message fit to show the owner."""
+    """A refusal with an HTTP status and a message fit to show the owner. `detail` carries what was done anyway (a kill
+    that wrote its flags but could not confirm the runner reads them), returned next to the message."""
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, detail: dict | None = None) -> None:
         super().__init__(message)
-        self.status, self.message = status, message
+        self.status, self.message, self.detail = status, message, detail or {}
 
 
 def live_root() -> Path:
@@ -305,11 +306,13 @@ class StrategyService:
     def __init__(self, root: Path | None = None, run: Runner = run_cmd, clock: Callable[[], float] = time.time,
                  extra_units: tuple[str, ...] | None = None, dashboard_account: str | None = None,
                  allocator_available: bool = False, allocator: Any = None, shares_bot_account: bool = True,
-                 auto_set_path: Path | None = None) -> None:
+                 auto_set_path: Path | None = None, has_allocator: bool = True) -> None:
         self.root = root if root is not None else live_root()
         # False for a venue on another exchange (OKX, Deribit, Bitget): the per-symbol bot never trades there, so the
         # one-mode-at-a-time guard does not apply to its strategies.
         self.shares_bot_account = shares_bot_account
+        # False for an owner-controlled venue: no LLM allocator writes its controls, so "unlock to the LLM" is refused there.
+        self.has_allocator = has_allocator
         self.auto_set_path = auto_set_path  # the MANUAL header set, kept by the harness (None: every strategy)
         self.run, self.clock = run, clock
         self.extra_units = extra_units if extra_units is not None else extra_units_from_env()
@@ -373,11 +376,12 @@ class StrategyService:
             raise StrategyError(500, f"cannot write control.json: {exc.strerror or exc}") from exc
 
     def _write_owner(self, e: Entry, enabled: bool) -> None:
-        """The owner flips a switch: the allocator may not change this strategy until it is unlocked."""
+        """The owner flips a switch: the allocator may not change this strategy until it is unlocked. Switching it on also
+        writes flatten: false, so a strategy re-enabled after a KILL is not flattened again by a flag left from the kill."""
         cur = self._control(e)
         w = _num(cur.get("weight"))
         self._write(e, enabled=enabled, owner_lock=True, set_by="owner", reason="owner",
-                    weight=1.0 if enabled and not w else (w if w is not None else 1.0))
+                    weight=1.0 if enabled and not w else (w if w is not None else 1.0), **({"flatten": False} if enabled else {}))
 
     def _write_allocator(self, **changes: Any) -> None:
         d = self.root / ALLOCATOR
@@ -607,22 +611,30 @@ class StrategyService:
         """True when the live strategies (not the per-symbol bot) own the demo account: any mode but "bot"."""
         return self.mode(self.registry()) != "bot"
 
-    def kill_all(self, pause_allocator: bool = True) -> list[str]:
-        """Dashboard kill switch while the strategies own the account: pause the allocator, then pause every strategy
-        (owner-locked) and ask the runner to flatten it. The runner closes positions through its own books.
-        The caller checks that the runner is alive first (ctb.venues.VenueHub.kill): a flag nobody reads closes nothing."""
+    def kill_all(self, pause_allocator: bool = True) -> dict[str, Any]:
+        """Dashboard kill switch: pause the allocator, then pause every strategy (owner-locked) and ask the runner to
+        flatten it. The runner closes positions through its own books. Always records the owner's intent, whether or not
+        the runner is up (ctb.venues.VenueHub.kill says whether it is confirmed). A failed write does not stop the others.
+        Returns {"written": [ids], "failed": {id or "allocator": why}, "allocator_paused": bool}."""
         reg = self.registry()
+        failed: dict[str, str] = {}
         if pause_allocator:
-            self._write_allocator(enabled=False)
+            try:
+                self._write_allocator(enabled=False)
+            except StrategyError as exc:
+                failed[ALLOCATOR] = exc.message
         done = []
         for e in reg.entries:
             if not (self.root / e.id).is_dir():
-                continue
-            self._write_owner(e, False)
-            self._write(e, flatten=True, reason="kill switch from the dashboard")
-            done.append(e.id)
+                continue  # the runner has not created it yet: it holds nothing
+            try:
+                self._write_owner(e, False)
+                self._write(e, flatten=True, reason="kill switch from the dashboard")
+                done.append(e.id)
+            except StrategyError as exc:
+                failed[e.id] = exc.message
         self._cache = None
-        return done
+        return {"written": done, "failed": failed, "allocator_paused": pause_allocator and ALLOCATOR not in failed}
 
     async def act(self, sid: str, action: str, *, llm_trading: bool, venue: str) -> dict[str, Any]:
         """Per-card actions: enable / pause (the Auto trade switch, owner-locked), unlock (back to the LLM), flatten, reset."""
@@ -642,6 +654,8 @@ class StrategyService:
         elif action == "pause":
             self._write_owner(e, False)
         elif action == "unlock":
+            if not self.has_allocator:
+                raise StrategyError(409, "this venue is controlled by the owner: there is no LLM allocator to hand the strategy to")
             self._write(e, owner_lock=False, set_by="llm", reason="unlocked: the LLM decides at its next decision")
         else:
             if not (e.unit and is_active(await unit_state(self.run, e.unit))):

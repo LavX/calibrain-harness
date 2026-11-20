@@ -69,9 +69,9 @@ def hub(roots, systemd, tmp_path, *, now=NOW):
         "bybit-demo": st.StrategyService(bybit, run=systemd, clock=lambda: now, extra_units=(), dashboard_account="demo-main",
                                          allocator_available=True, auto_set_path=tmp_path / "state" / "auto-set-bybit-demo.json"),
         "okx-demo": st.StrategyService(okx, run=systemd, clock=lambda: now, extra_units=(OKX_UNIT,), dashboard_account="",
-                                       shares_bot_account=False),
+                                       shares_bot_account=False, has_allocator=False),
         "deribit-test": st.StrategyService(deribit, run=systemd, clock=lambda: now, extra_units=("calibrain-live-deribit.service",),
-                                           dashboard_account="", shares_bot_account=False),
+                                           dashboard_account="", shares_bot_account=False, has_allocator=False),
     }
     services["bybit-demo"]._mode = "manual"
     return V.VenueHub(venues, services, state=tmp_path / "state", clock=lambda: now)
@@ -140,46 +140,106 @@ def test_presence_error_fails_closed(roots, tmp_path):
 
 
 # ---------------------------------------------------------------- kill
-def test_kill_refused_when_the_runner_is_down_and_nothing_is_written(roots, tmp_path):
+def alloc_ctl(root):
+    return json.loads((root / "allocator" / "control.json").read_text())
+
+
+def test_kill_with_the_runner_down_still_writes_and_says_not_confirmed(roots, tmp_path):
     h = hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path)
-    before = ctl(roots[1], "trend")
     with pytest.raises(st.StrategyError) as e:
         run(h.kill("okx-demo"))
-    assert e.value.status == 409 and "refused" in e.value.message and OKX_UNIT in e.value.message
-    assert ctl(roots[1], "trend") == before
+    assert e.value.status == 409 and "NOT confirmed" in e.value.message and OKX_UNIT in e.value.message
+    assert sorted(e.value.detail["written"]) == ["longvol", "trend"] and e.value.detail["confirmed"] == []
+    for sid in ("trend", "longvol"):  # the owner's intent is on disk for when the runner comes back
+        c = ctl(roots[1], sid)
+        assert c["flatten"] is True and c["enabled"] is False and c["owner_lock"] is True
+    assert not (roots[1] / "allocator").exists()
 
 
-def test_kill_refused_when_status_is_stale(roots, tmp_path):
+def test_kill_with_stale_status_writes_and_says_how_old(roots, tmp_path):
     h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path, now=NOW + 600)
     with pytest.raises(st.StrategyError) as e:
         run(h.kill("okx-demo"))
-    assert e.value.status == 409 and "hung" in e.value.message
+    assert e.value.status == 409 and "min old" in e.value.message and ctl(roots[1], "trend")["flatten"] is True
+
+
+def test_refused_bybit_kill_still_pauses_the_allocator(roots, tmp_path):
+    assert alloc_ctl(roots[0])["enabled"] is True
+    with pytest.raises(st.StrategyError) as e:
+        run(hub(roots, FakeSystemd(), tmp_path).kill("bybit-demo"))  # every runner unit down
+    assert e.value.status == 409 and e.value.detail["allocator_paused"] is True
+    assert alloc_ctl(roots[0])["enabled"] is False and ctl(roots[0], "carry")["flatten"] is True
+
+
+def test_kill_liveness_is_per_strategy_when_units_are(roots, tmp_path):
+    h = hub(roots, FakeSystemd(active=["calibrain-live@carry.service"]), tmp_path)  # one unit per strategy in the fixture
+    with pytest.raises(st.StrategyError) as e:
+        run(h.kill("bybit-demo"))
+    d = e.value.detail
+    assert d["confirmed"] == ["carry"] and sorted(d["unconfirmed"]) == ["trend", "xsmom"]
+    assert "calibrain-live@trend.service is inactive" in d["unconfirmed"]["trend"] and "Confirmed: carry" in e.value.message
+
+
+def test_kill_on_absent_or_broken_roots_writes_nothing(roots, tmp_path):
+    bybit, okx, deribit = roots
+    h = hub(roots, FakeSystemd(active=BYBIT_UNITS + [OKX_UNIT]), tmp_path)
+    with pytest.raises(st.StrategyError) as e:
+        run(h.kill("deribit-test"))
+    assert e.value.status == 409 and "not started" in e.value.message and not deribit.exists() and e.value.detail == {}
+    before = {sid: (okx / sid / "control.json").read_bytes() for sid in ("trend", "longvol")}
+    (okx / "strategies.json").write_text("{broken")
+    with pytest.raises(st.StrategyError) as e:
+        run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).kill("okx-demo"))
+    assert e.value.status == 409 and "Nothing was written" in e.value.message
+    assert {sid: (okx / sid / "control.json").read_bytes() for sid in ("trend", "longvol")} == before
 
 
 def test_kill_live_venue_flattens_its_strategies_only(roots, tmp_path):
     bybit, okx, _ = roots
     h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
     out = run(h.kill("okx-demo"))
-    assert out["ok"] and sorted(out["flattening"]) == ["longvol", "trend"]
+    assert out["ok"] and sorted(out["flattening"]) == ["longvol", "trend"] and sorted(out["confirmed"]) == ["longvol", "trend"]
     for sid in ("trend", "longvol"):
         c = ctl(okx, sid)
         assert c["flatten"] is True and c["enabled"] is False and c["owner_lock"] is True
     assert not (okx / "allocator").exists()  # no allocator on an owner venue
-    assert ctl(bybit, "carry")["flatten"] is False  # another venue is untouched
+    assert ctl(bybit, "carry")["flatten"] is False and alloc_ctl(bybit)["enabled"] is True  # another venue is untouched
 
 
-def test_kill_on_bybit_also_pauses_the_allocator(roots, tmp_path):
-    h = hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path)
-    run(h.kill("bybit-demo"))
-    assert json.loads((roots[0] / "allocator" / "control.json").read_text())["enabled"] is False
+def test_partial_kill_write_reports_what_was_written(roots, tmp_path):
+    okx = roots[1]
+    (okx / "trend").chmod(0o500)  # control.json there cannot be replaced
+    try:
+        with pytest.raises(st.StrategyError) as e:
+            run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path).kill("okx-demo"))
+    finally:
+        (okx / "trend").chmod(0o700)
+    assert e.value.status == 500 and e.value.detail["written"] == ["longvol"] and "trend" in e.value.detail["failed"]
+    assert "partially written" in e.value.message and ctl(okx, "longvol")["flatten"] is True
 
 
 def test_kill_all_reports_per_venue_and_skips_not_started(roots, tmp_path):
     out = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).kill_all())
     by = {r["venue"]: r for r in out["venues"]}
-    assert by["bybit-demo"]["ok"] and by["okx-demo"]["ok"] is False and "refused" in by["okx-demo"]["error"]
+    assert by["bybit-demo"]["ok"] and by["okx-demo"]["ok"] is False and "NOT confirmed" in by["okx-demo"]["error"]
+    assert sorted(by["okx-demo"]["written"]) == ["longvol", "trend"]  # written although not confirmed
     assert by["deribit-test"]["skipped"] is True
-    assert out["ok"] is False  # a live-config venue was refused
+    assert out["ok"] is False
+
+
+def test_enable_after_a_kill_clears_the_flatten_flag(roots, tmp_path):
+    h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
+    run(h.kill("okx-demo"))
+    run(h.service("okx-demo").act("trend", "enable", llm_trading=False, venue="demo"))
+    c = ctl(roots[1], "trend")
+    assert c["enabled"] is True and c["flatten"] is False and c["owner_lock"] is True
+
+
+def test_unlock_is_refused_on_an_owner_venue(roots, tmp_path):
+    h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
+    with pytest.raises(st.StrategyError) as e:
+        run(h.service("okx-demo").act("trend", "unlock", llm_trading=False, venue="demo"))
+    assert e.value.status == 409 and ctl(roots[1], "trend")["set_by"] == "owner"
 
 
 def test_unknown_venue_is_404(roots, tmp_path):
@@ -309,17 +369,20 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             assert ctl(roots[1], "longvol")["enabled"] is False
             assert (await c.post("/api/strategies/carry/pause", json={})).status == 200  # the old route: bybit-demo
             assert ctl(roots[0], "carry")["enabled"] is False
-            # kill: bybit refused (runner down), the old /api/kill alias too; OKX goes through
+            # kill: bybit's runner is down, so its flags are written but not confirmed (409 with the detail); OKX confirms
             r = await c.post("/api/venues/bybit-demo/kill", json={})
-            assert r.status == 409 and "refused" in (await r.json())["error"]
-            r = await c.post("/api/kill", json={})
-            assert r.status == 409
-            assert ctl(roots[0], "trend").get("flatten") is not True
+            body = await r.json()
+            assert r.status == 409 and "NOT confirmed" in body["error"] and sorted(body["written"]) == ["carry", "trend", "xsmom"]
+            assert ctl(roots[0], "trend")["flatten"] is True and alloc_ctl(roots[0])["enabled"] is False
+            r = await c.post("/api/kill", json={})  # the old alias answers the same way and says the bot's auto-trade is off
+            body = await r.json()
+            assert r.status == 409 and body["bot_auto_trade"] == "off"
             r = await c.post("/api/kill-all", json={})
             body = await r.json()
-            assert r.status == 200 and body["ok"] is False
+            assert r.status == 200 and body["ok"] is False and body["bot_auto_trade"] == "off"
             assert {x["venue"]: x["ok"] for x in body["venues"]} == {"bybit-demo": False, "okx-demo": True, "deribit-test": False}
             assert ctl(roots[1], "trend")["flatten"] is True
+            assert (await c.post("/api/venues/okx-demo/strategies/trend/unlock", json={})).status == 409
             r = await c.post("/api/strategies/auto-set", json={"ids": ["carry"]})
             assert r.status == 200 and (await r.json())["ids"] == ["carry"]
 

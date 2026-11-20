@@ -125,7 +125,7 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             return None
 
     def refused(exc: strat_mod.StrategyError) -> web.Response:
-        return j({"error": exc.message}, exc.status)
+        return j({"error": exc.message, **exc.detail}, exc.status)
 
     def bot_only() -> web.Response | None:
         """409 when the strategies own the demo account (mode is not "bot"); None when the old bot's settings may change."""
@@ -371,20 +371,24 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
 
     @routes.post("/api/venues/{vid}/kill")
     async def venue_kill(req: web.Request) -> web.Response:
-        """Pause and flatten every strategy of one venue (and the allocator on bybit-demo). 409 unless the runner is live."""
+        """Pause and flag to flatten every strategy of one venue (and the allocator on bybit-demo). 200 when the runner
+        confirms; 409 "written, NOT confirmed" when it is down or stale; 409 with nothing written when the venue has not
+        started or its strategies.json is unusable."""
         try:
             out = await hub.kill(req.match_info["vid"])
         except strat_mod.StrategyError as exc:
-            engine.emit("event", engine.db.event("warn", "killed", f"kill refused: {exc.message}"))
+            engine.emit("event", engine.db.event("warn", "killed", f"kill: {exc.message}"))
             return refused(exc)
         engine.emit("event", engine.db.event("warn", "killed", f"{out['label']} kill: strategies flattening: {', '.join(out['flattening'])}"))
         return j(out)
 
     @routes.post("/api/kill-all")
     async def kill_all(_: web.Request) -> web.Response:
-        """Every venue that is live is killed; the others answer why not. The per-symbol bot's auto-trade goes off too."""
-        s.trading_enabled = False
+        """Every venue that has started gets its kill flags written and says whether that is confirmed. The per-symbol
+        bot's AUTO-TRADE is switched off afterwards (the answer says so)."""
         out = await hub.kill_all()
+        s.trading_enabled = False
+        out["bot_auto_trade"] = "off"
         msg = "; ".join(f"{r['label']}: {'flattening ' + ', '.join(r['flattening']) if r['ok'] else r['error']}" for r in out["venues"])
         engine.emit("event", engine.db.event("warn", "killed", f"kill all: {msg}"))
         return j(out)
@@ -486,15 +490,18 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
     @routes.post("/api/kill")
     async def kill(_: web.Request) -> web.Response:
         if strat.owns_account():  # the runner owns the positions: flatten through its books, never behind its back
-            s.trading_enabled = False
-            try:  # alias of /api/venues/bybit-demo/kill: refused when the runner is down or stale
+            try:  # alias of /api/venues/bybit-demo/kill: written always, confirmed only when the runner is up and fresh
                 out = await hub.kill(hub.primary_id)
             except strat_mod.StrategyError as exc:
-                engine.emit("event", engine.db.event("warn", "killed", f"kill refused: {exc.message}"))
+                if exc.detail:  # the flags were written: the bot's auto-trade goes off with them, and the answer says so
+                    s.trading_enabled = False
+                    exc.detail["bot_auto_trade"] = "off"
+                engine.emit("event", engine.db.event("warn", "killed", f"kill: {exc.message}"))
                 return refused(exc)
+            s.trading_enabled = False
             done = out["flattening"]
             engine.emit("event", engine.db.event("warn", "killed", f"kill switch: allocator paused, strategies flattening: {', '.join(done)}"))
-            return j({"ok": True, "flattening": done})
+            return j({**out, "ok": True, "flattening": done, "bot_auto_trade": "off"})
         if engine.executor:
             await engine.executor.kill("dashboard kill switch")
         s.trading_enabled = False
@@ -508,8 +515,14 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
             return j({"error": "unknown symbol"}, 404)
         if not engine.kairos.configured:
             return j({"error": f"{engine.kairos.spec.key_env} is not set"}, 400)
+        if strat.owns_account():  # engine._bot_paused: no model calls while the strategies own the account
+            return j({"error": f"the per-symbol bot makes no model calls in mode {strat.mode(strat.registry()).upper()}: {BOT_ONLY_MSG}"}, 409)
         row = await engine.decide(sym, force_probe=bool(body.get("probe")))
-        return j(engine._decision_view(row) if row else {"skipped": True})
+        if row:
+            return j(engine._decision_view(row))
+        why = ("a request for this symbol is already in flight" if sym in engine.inflight
+               else "the hourly model request budget is used up (raise it or wait)")
+        return j({"skipped": True, "why": why})
 
     @routes.post("/api/decision-tf")
     async def decision_tf(req: web.Request) -> web.Response:
