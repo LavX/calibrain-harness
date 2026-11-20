@@ -237,49 +237,68 @@ def apply_rules(ids: Sequence[str], w_target: Mapping[str, float], w_prev: Mappi
 
 
 def final_vol_cap(ids: Sequence[str], w: Mapping[str, float], cov: Sequence[Sequence[float]], locked: Sequence[str],
-                  vol_cap: float, n: int | None = None) -> tuple[dict[str, float], dict[str, Any]]:
+                  vol_cap: float, n: int | None = None, *, min_weight: float = 0.0001) -> tuple[dict[str, float], dict[str, Any]]:
     """The vol cap on the final holdings of one venue. `ids` is the order of `cov` and covers every book of the venue;
-    `n` is its number of books (the portfolio is their average, as in portfolio_vol_ann). Locked books are fixed; the
-    others are scaled down together by the largest factor f in [0, 1] that brings the portfolio within the cap. Nothing
-    is ever raised. When no f in [0, 1] is enough (the locked books alone are over the cap, say), the unlocked books are
-    cut to the f with the lowest volatility (0 unless they hedge the locked ones) and the result says infeasible.
-    Returns (weights, info): info has vol_before, vol_after, factor, cut (ids changed) and infeasible."""
+    `n` is its number of books (the portfolio is their average, as in portfolio_vol_ann). Locked books are fixed.
+    Scale the others by the largest common factor that meets the cap, stopping each at its minimum weight or its
+    starting weight if already lower. If there is no such factor, use the one with the lowest volatility and report
+    infeasibility."""
     n = n or len(ids)
     lk = set(locked)
     x = [max(0.0, float(w[i])) for i in ids]
-    u = [0.0 if i in lk else v for i, v in zip(ids, x)]   # the part that may move
-    l = [v if i in lk else 0.0 for i, v in zip(ids, x)]   # the part that may not
+    floors = [v if i in lk else min(v, max(0.0001, min_weight)) for i, v in zip(ids, x)]
     m = len(ids)
 
     def quad(a: Sequence[float], b: Sequence[float]) -> float:
         return sum(a[r] * cov[r][c] * b[c] for r in range(m) for c in range(m))
 
-    def vol(f: float) -> float:
-        return portfolio_vol_ann([lv + f * uv for lv, uv in zip(l, u)], cov, n)
+    def weights_at(factor: float) -> list[float]:
+        return [max(floor, factor * initial) for floor, initial in zip(floors, x)]
 
-    before = vol(1.0)
+    before = portfolio_vol_ann(x, cov, n)
     info: dict[str, Any] = {"vol_before": round(before, 6), "vol_after": round(before, 6), "factor": 1.0, "cut": [], "infeasible": False,
                             "vol_cap": vol_cap}
-    if before <= vol_cap + 1e-12 or not any(u):
+    if before <= vol_cap + 1e-12 or floors == x:
         info["infeasible"] = before > vol_cap + 1e-12
         return {i: v for i, v in zip(ids, x)}, info
-    # 365 (a f^2 + 2 b f + c) / n^2 <= cap^2: the largest root in [0, 1], else the minimum of the parabola in [0, 1]
-    a, b, c = quad(u, u), quad(u, l), quad(l, l)
-    q = vol_cap ** 2 * n ** 2 / DAYS
-    disc = b * b - a * (c - q)
-    f = None
-    if a > 0 and disc >= 0:
-        hi = (-b + math.sqrt(disc)) / a
-        lo = (-b - math.sqrt(disc)) / a
-        if hi >= 0 and lo <= 1:
-            f = min(1.0, hi)
-    if f is None:
-        f = min(1.0, max(0.0, -b / a)) if a > 0 else 0.0
-        info["infeasible"] = True
-    f = max(0.0, min(1.0, f))
-    out = {i: (lv + f * uv) for i, lv, uv in zip(ids, l, u)}
-    info.update({"vol_after": round(vol(f), 6), "factor": round(f, 6), "cut": [i for i, uv in zip(ids, u) if uv > 0 and f < 1.0]})
-    return out, info
+
+    # Between floor crossings, variance is quadratic in the scale factor. Search from the least cut down.
+    crossings = [floor / initial if initial else 1.0 for floor, initial in zip(floors, x)]
+    bounds = sorted({0.0, 1.0, *crossings}, reverse=True)
+    cap_variance = vol_cap ** 2 * n ** 2 / DAYS
+    best_factor, best_variance = 1.0, quad(x, x)
+    factor = None
+    for upper, lower in zip(bounds, bounds[1:]):
+        moving = [initial if crossing < upper else 0.0 for initial, crossing in zip(x, crossings)]
+        fixed = [floor if crossing >= upper else 0.0 for floor, crossing in zip(floors, crossings)]
+        a, c = quad(moving, moving), quad(fixed, fixed)
+        b = quad(moving, fixed) + quad(fixed, moving)
+        upper_variance = (a * upper + b) * upper + c
+        if upper_variance <= cap_variance:
+            factor = upper
+            break
+        candidate = min(upper, max(lower, -b / (2 * a))) if a > 0 else lower
+        variance = (a * candidate + b) * candidate + c
+        if variance < best_variance:
+            best_factor, best_variance = candidate, variance
+        if variance <= cap_variance:
+            # A feasible point and an over-cap edge bracket the largest feasible factor in this interval.
+            left, right = candidate, upper
+            for _ in range(48):
+                mid = (left + right) / 2
+                if (a * mid + b) * mid + c <= cap_variance:
+                    left = mid
+                else:
+                    right = mid
+            factor = left
+            break
+
+    info["infeasible"] = factor is None
+    factor = best_factor if factor is None else factor
+    out = weights_at(factor)
+    info.update({"vol_after": round(portfolio_vol_ann(out, cov, n), 6), "factor": round(factor, 6),
+                 "cut": [i for i, old, new in zip(ids, x, out) if new < old]})
+    return dict(zip(ids, out)), info
 
 
 # ---------------------------------------------------------------------------------- text

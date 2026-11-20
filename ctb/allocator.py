@@ -312,6 +312,7 @@ class Current:
     owner_lock: bool
     drawdown_pct: float | None
     gross: float | None = None   # gross exposure per unit of capital at weight 1 (None: unknown, 1 is used)
+    confirmed_flat: bool = False  # only an explicit empty positions list confirms a flat book
 
 
 @dataclass
@@ -945,7 +946,7 @@ class Allocator:
             "last_error": status.get("last_error"),
         }
         return ctx, Current(enabled=enabled, weight=weight, owner_lock=lock, drawdown_pct=dd,
-                            gross=gross_per_unit(positions, eq, weight))
+                            gross=gross_per_unit(positions, eq, weight), confirmed_flat=status.get("positions") == [])
 
     async def build_context(self, now_ms: int) -> tuple[dict[str, Any], dict[str, Current], list[dict[str, Any]]]:
         rows = self.strategies()
@@ -1330,7 +1331,7 @@ class Allocator:
                         reasons[sid] = f"risk floor: book {current[sid].drawdown_pct:.1f}% below its peak, weight forced to 0"
                     else:
                         reasons[sid] = calc_out["reasons"][sid] if calc_out else why
-            final_cap = self._final_cap(self.primary, plan, current, reasons, fc) if plan and kind != "refresh" else None
+            final_cap = self._final_cap(self.primary, plan, current, reasons, fc) if plan and self.primary.managed and kind != "refresh" else None
             if final_cap:
                 record["final_cap"] = final_cap
             applied: dict[str, bool] = {}
@@ -1445,27 +1446,29 @@ class Allocator:
         return [[cov_ij(a, b) for b in ids] for a in ids], notes
 
     def _final_cap(self, v: AllocVenue, plan: Plan, current: dict[str, Current], reasons: dict[str, str],
-                   fc: Forecast | None) -> dict[str, Any] | None:
-        """The vol cap on the weights this venue will hold after every rule (buffer, step, veto, exploration floor, drawdown
-        floor, owner locks), every book of the venue counted. Cuts unlocked books in plan (never raises one); a cut to 0
-        switches the book off. Returns what it did for the record, None when no volatility is known at all."""
+                   fc: Forecast | None) -> dict[str, Any]:
+        """Cap the managed venue's modeled volatility by scaling down unlocked trading books, keeping them enabled."""
         ids = list(current)
         cov, notes = self._risk_cov(ids, fc)
         if cov is None:
             return {"checked": False, "note": "no volatility known for any book: the final vol cap was not checked"}
         locked = [s for s in ids if current[s].owner_lock or s in plan.skipped_owner_lock]
-        w = {s: float(plan.weights.get(s, current[s].weight)) for s in ids}
-        new, info = M.final_vol_cap(ids, w, cov, locked, self.calc.rules.vol_cap, len(ids))
+        disabled = [s for s in ids if not plan.enabled[s]]
+        w = dict(plan.weights)
+        for sid in disabled:
+            c = current[sid]
+            # Disabling stops orders but can leave positions open at the previous exposure.
+            w[sid] = 0.0 if c.confirmed_flat else c.weight
+        min_weight = math.ceil(self.calc.rules.explore_floor * 1e4) / 1e4
+        new, info = M.final_vol_cap(ids, w, cov, locked + disabled, self.calc.rules.vol_cap, len(ids), min_weight=min_weight)
         for sid in info["cut"]:
-            plan.weights[sid] = math.floor(new[sid] * 1e4 + 1e-6) / 1e4  # rounded down: never back over the cap
-            if plan.weights[sid] <= 0:
-                plan.enabled[sid] = False
+            plan.weights[sid] = math.floor(new[sid] * 1e4 + 1e-6) / 1e4  # round down to control.json precision
             reasons[sid] = (f"{reasons.get(sid, '')} -> {plan.weights[sid]:.2f} after the final vol cap ({v.label} at "
                             f"{info['vol_before'] * 100:.1f}% > {info['vol_cap'] * 100:.0f}%)").strip()
         info.update({"checked": True, "notes": notes, "locked": locked})
         if info["infeasible"]:
-            info["note"] = (f"cap infeasible on {v.label}: {info['vol_after'] * 100:.1f}% after cutting every unlocked book as far as "
-                            f"it goes (cap {info['vol_cap'] * 100:.0f}%); the owner-locked books {', '.join(locked) or '(none)'} carry the rest")
+            info["note"] = (f"cap infeasible on {v.label}: modeled volatility is {info['vol_after'] * 100:.1f}% "
+                            f"at the lowest-risk permitted weights (cap {info['vol_cap'] * 100:.0f}%)")
         return info
 
     @staticmethod
@@ -1578,7 +1581,7 @@ class Allocator:
         reasons = {sid: (self._floor_reason(v, c) if sid in plan.floored
                          else held if sid not in covered else (calc_out["reasons"][sid] if calc_out else why))
                    for sid, c in current.items()}
-        final_cap = self._final_cap(v, plan, current, reasons, fc) if kind != "refresh" else None
+        final_cap = self._final_cap(v, plan, current, reasons, fc) if v.managed and kind != "refresh" else None
         cap_cut = set(final_cap.get("cut") or []) if final_cap else set()
         # a held strategy (no decision covers it) is not written at all; only the drawdown floor and the final vol cap may cut it
         writable = {s: c for s, c in current.items() if s in covered or s in plan.floored or s in cap_cut}
