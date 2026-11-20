@@ -118,9 +118,11 @@ P&L today uses the harness's own 00:00 UTC baseline, one small JSON file per ven
 (next to the database: `data/venues/baseline-<vid>.json`). A background task samples every minute, so the file is
 written within a minute of midnight while the dashboard runs and survives restarts. Every P&L today figure carries the
 real time of its baseline: "since 00:00 UTC" only for a sample taken in the first 90 s of the UTC day, else "since
-HH:MM UTC" (a 00:04 sample reads 00:04). A strategy first seen later in the day gets its own baseline; a venue whose
-strategies' baselines differ is marked partial with the reason (the harness's first sample of the day was late, a
-strategy appeared later and is counted from then, or a strategy has no sample yet). There is no account-level P&L today on bybit-demo: the USDT coin's
+HH:MM UTC" (a 00:04 sample reads 00:04). A strategy first seen later in the day gets its own baseline. Only a fresh status (written
+in the last 3 minutes) seeds a baseline: a runner stopped or hung across midnight would otherwise carry yesterday's
+equity into today, so such a strategy is counted from its first fresh status. A venue whose strategies' baselines differ
+is marked partial with the reason (the harness's first sample of the day was late, a strategy's status was stale until
+later, a strategy appeared later and is counted from then, or a strategy has no fresh status yet). There is no account-level P&L today on bybit-demo: the USDT coin's
 equity drops when a spot leg is bought with USDT, which is not a loss. The account line shows the USDT equity apart from
 all collateral, and "unattributed" compares like with like: the exchange's derivatives unrealised P&L minus the books'
 perp and future legs (spot legs excluded); it is unknown when any leg's uPnL is unknown. Other venues show sums over their

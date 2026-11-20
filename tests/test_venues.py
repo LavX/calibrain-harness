@@ -335,6 +335,7 @@ def test_baseline_resets_on_the_next_utc_day(roots, tmp_path):
     sd = FakeSystemd(active=BYBIT_UNITS)
     run(hub(roots, sd, tmp_path).summary())
     nxt = NOW + 86400
+    freshen(roots[0], nxt - 10)  # the runner kept writing overnight
     run(hub(roots, sd, tmp_path, now=nxt).summary())
     assert json.loads((tmp_path / "state" / "baseline-bybit-demo.json").read_text())["day"] == V.utc_day(nxt)
     status = roots[0] / "carry" / "status.json"
@@ -348,13 +349,46 @@ def test_baseline_resets_on_the_next_utc_day(roots, tmp_path):
 MIDNIGHT = 1_800_057_600  # a UTC midnight; NOW is 08:00:30 UTC the day before
 
 
+def test_a_stale_status_never_seeds_the_baseline(roots, tmp_path):
+    okx = roots[1]
+    sd = FakeSystemd(active=[OKX_UNIT])
+    set_status(okx, "trend", updated_ms=MIDNIGHT * 1000)  # alive at midnight
+    set_status(okx, "longvol", updated_ms=(MIDNIGHT - 3600) * 1000, equity_usdt=9000.0)  # hung since 23:00 yesterday
+    v = run(hub(roots, sd, tmp_path, now=MIDNIGHT + 30).summary())["venues"][1]
+    rows = {r["id"]: r for r in v["strategies"]}
+    assert rows["trend"]["pnl_today_since"] == "since 00:00 UTC" and rows["longvol"]["pnl_today"] is None
+    assert v["pnl_today_partial"] is True and "no fresh status yet today for Long-only" in v["pnl_today_note"]
+    later = MIDNIGHT + 45 * 60  # the runner comes back at 00:45 and writes 10,000
+    set_status(okx, "longvol", updated_ms=later * 1000, equity_usdt=10000.0)
+    set_status(okx, "trend", updated_ms=later * 1000)
+    v = run(hub(roots, sd, tmp_path, now=later + 5).summary())["venues"][1]
+    rows = {r["id"]: r for r in v["strategies"]}
+    assert rows["longvol"]["pnl_today"] == 0.0 and rows["longvol"]["pnl_today_since"] == "since 00:45 UTC"  # not +1,000 from yesterday
+    assert "Long-only counted from 00:45 UTC (its status was stale until then" in v["pnl_today_note"]
+    assert "harness took" not in v["pnl_today_note"]  # the harness was sampling at midnight
+
+
 def test_since_label_says_when_the_baseline_was_taken():
     assert V.since_label(MIDNIGHT * 1000 + 60_000) == "since 00:00 UTC"  # the sampler's first minute
     assert V.since_label(MIDNIGHT * 1000 + 4 * 60_000) == "since 00:04 UTC"  # never rounded down to midnight
     assert V.since_label(MIDNIGHT * 1000 + 3 * 3600_000) == "since 03:00 UTC"
 
 
+def set_status(root, sid, **changes):
+    p = root / sid / "status.json"
+    doc = json.loads(p.read_text())
+    doc.update(changes)
+    p.write_text(json.dumps(doc))
+
+
+def freshen(root, t_s):
+    """Every status.json under root written at t_s (the runner is alive then)."""
+    for p in root.glob("*/status.json"):
+        set_status(root, p.parent.name, updated_ms=int(t_s * 1000))
+
+
 def test_venue_label_at_midnight_is_plain(roots, tmp_path):
+    freshen(roots[1], MIDNIGHT)
     v = run(hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path, now=MIDNIGHT + 30).summary())["venues"][1]
     assert v["pnl_today_since"] == "since 00:00 UTC" and v["pnl_today_partial"] is False and v["pnl_today_note"] is None
 

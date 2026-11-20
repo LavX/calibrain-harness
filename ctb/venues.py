@@ -24,7 +24,8 @@ and its status.json is fresh; otherwise 409 "written, NOT confirmed" names the s
 strategies.json) or whose strategies.json is unusable is refused with nothing written.
 
 P&L today: the harness keeps its own 00:00 UTC baseline per venue (the first sample of each UTC day, from the books'
-equity in the status files) in a small JSON file under its data directory, so the number survives a restart. There is no
+equity in the status files; a status older than 3 minutes never seeds a baseline, so a runner stopped or hung across
+midnight is counted from its first fresh status, and the page says so) in a small JSON file under its data directory, so the number survives a restart. There is no
 account-level P&L today: the USDT coin's equity moves when a spot leg is bought with USDT, which is not a loss. A background task samples every minute; when the harness was down at midnight the baseline is the
 first sample after it came back, and the page says since when.
 """
@@ -295,8 +296,11 @@ def alerts(v: dict, now_ms: float) -> list[dict]:
 
 # ------------------------------------------------------------------------------------------------ baselines
 class Baselines:
-    """The persisted 00:00 UTC sample per venue: {"day", "t_ms", "strategies": {id: {"equity", "t_ms"}}}. Written once
-    per UTC day, topped up when a strategy first appears later that day (with its own t_ms). Survives restarts (a file per venue under the harness's data directory)."""
+    """The persisted 00:00 UTC sample per venue: {"day", "t_ms", "strategies": {id: {"equity", "t_ms", "after_stale"}},
+    "waited": {id: t_ms}}. Created at the day's first sampling attempt; a strategy gets its baseline from its first FRESH
+    status of the day (a stale status, from a runner stopped or hung across midnight, would carry yesterday's equity into
+    today). "waited" records strategies that were seen stale first, so the page can say why they count from later.
+    Survives restarts (a file per venue under the harness's data directory)."""
 
     def __init__(self, directory: Path) -> None:
         self.dir = directory
@@ -308,15 +312,21 @@ class Baselines:
         doc = S.read_json(self.path(vid))
         return doc if doc and doc.get("day") == utc_day(now_s) else None
 
-    def sample(self, vid: str, now_s: float, equities: dict[str, float]) -> dict:
+    def sample(self, vid: str, now_s: float, equities: dict[str, float], stale: tuple[str, ...] = ()) -> dict:
+        """equities: strategies with a fresh status; stale: strategies whose status is too old to seed a baseline."""
         day, now_ms = utc_day(now_s), int(now_s * 1000)
         doc = self.get(vid, now_s)
         changed = doc is None
         if doc is None:
-            doc = {"day": day, "t_ms": now_ms, "strategies": {}}
+            doc = {"day": day, "t_ms": now_ms, "strategies": {}, "waited": {}}
+        waited = doc.setdefault("waited", {})
+        for sid in stale:
+            if sid not in doc["strategies"] and sid not in waited:
+                waited[sid] = now_ms
+                changed = True
         for sid, eq in equities.items():
             if eq is not None and sid not in doc["strategies"]:
-                doc["strategies"][sid] = {"equity": eq, "t_ms": now_ms}
+                doc["strategies"][sid] = {"equity": eq, "t_ms": now_ms, "after_stale": sid in waited}
                 changed = True
         if changed:
             try:
@@ -337,12 +347,20 @@ def since_label(t_ms: float | None, now_s: float | None = None) -> str | None:
     return "since " + datetime.fromtimestamp(t_ms / 1000, timezone.utc).strftime("%H:%M") + " UTC"
 
 
-def today_basis(rows: list[dict], base: dict | None) -> tuple[str | None, bool, str | None]:
+def is_fresh(status: dict | None, now_ms: float) -> bool:
+    return bool(status) and status.get("updated_ms") is not None and now_ms - status["updated_ms"] <= S.STALE_S * 1000
+
+
+def today_basis(rows: list[dict], base: dict | None, now_ms: float | None = None) -> tuple[str | None, bool, str | None]:
     """The venue's P&L today label: (since label or None when the strategies' baselines differ, partial, the reason).
-    Reasons are the real ones: the harness took the day's first sample late, a strategy appeared later in the day (it is
-    counted from then), or a strategy has no sample yet (left out of the sum)."""
+    Reasons are the real ones: the harness took the day's first sample late, a strategy's status was stale until later
+    (runner stopped or hung across midnight) or it appeared later in the day (counted from then), or a strategy has no
+    sample yet (left out of the sum)."""
     counted = [r for r in rows if r["pnl_today"] is not None]
-    missing = [r["name"] for r in rows if r["pnl_today"] is None and r["equity"] is not None]
+    gone = [r for r in rows if r["pnl_today"] is None and r["equity"] is not None]
+    stale_now = [r["name"] for r in gone if now_ms is not None and r["updated_ms"] is not None and now_ms - r["updated_ms"] > S.STALE_S * 1000]
+    missing = [r["name"] for r in gone if r["name"] not in stale_now]
+    entries = (base or {}).get("strategies", {})
     stamps = [r["pnl_today_since_ms"] for r in counted if r["pnl_today_since_ms"] is not None]
     notes: list[str] = []
     first = (base or {}).get("t_ms")
@@ -351,12 +369,18 @@ def today_basis(rows: list[dict], base: dict | None) -> tuple[str | None, bool, 
     late = [r for r in counted if first is not None and r["pnl_today_since_ms"] is not None
             and r["pnl_today_since_ms"] - first > MIDNIGHT_SLACK_MS]
     for r in late:
-        notes.append(f"{r['name']} first seen {since_label(r['pnl_today_since_ms'])[6:]}, counted from then")
+        when = since_label(r["pnl_today_since_ms"])[6:]
+        if entries.get(r["id"], {}).get("after_stale"):
+            notes.append(f"{r['name']} counted from {when} (its status was stale until then: runner stopped or hung)")
+        else:
+            notes.append(f"{r['name']} first seen {when}, counted from then")
+    if stale_now:
+        notes.append(f"no fresh status yet today for {', '.join(stale_now)} (runner stopped or hung; left out)")
     if missing:
         notes.append(f"no sample yet for {', '.join(missing)} (left out)")
     mixed = bool(stamps) and max(stamps) - min(stamps) > MIDNIGHT_SLACK_MS
     label = None if not stamps or mixed else since_label(min(stamps))
-    return label, mixed or bool(missing), "; ".join(notes) or None
+    return label, mixed or bool(gone), "; ".join(notes) or None
 
 
 # ------------------------------------------------------------------------------------------------ the hub
@@ -429,10 +453,14 @@ class VenueHub:
         return account if mine is None or not accounts or mine in accounts else None
 
     def _sample(self, cfg: VenueConfig, doc: dict, now: float) -> dict | None:
-        equities = {v["id"]: v["status"]["equity_usdt"] for v in doc["strategies"] if v.get("status")}
-        if not any(e is not None for e in equities.values()):
+        """Only a fresh status seeds a baseline; a stale one is recorded as waited for (see Baselines)."""
+        now_ms = now * 1000
+        with_status = [v for v in doc["strategies"] if v.get("status") and v["status"].get("equity_usdt") is not None]
+        if not with_status:
             return self.baselines.get(cfg.id, now)
-        return self.baselines.sample(cfg.id, now, equities)
+        fresh = {v["id"]: v["status"]["equity_usdt"] for v in with_status if is_fresh(v["status"], now_ms)}
+        stale = tuple(v["id"] for v in with_status if v["id"] not in fresh)
+        return self.baselines.sample(cfg.id, now, fresh, stale)
 
     async def summary(self, account: dict | None = None) -> dict[str, Any]:
         """GET /api/venues: per venue presence, books, account, today's P&L, strategies and netted positions, plus the alerts."""
@@ -472,7 +500,7 @@ class VenueHub:
                  # strategies whose equity or P&L is unknown: the sums above leave them out, the page says "partial"
                  "incomplete": [r["name"] for r in rows if r["equity"] is None or r["pnl"] is None],
                  "legs": sum(r["positions_n"] or 0 for r in rows)}
-        since, partial, note = today_basis(rows, base)
+        since, partial, note = today_basis(rows, base, now_ms)
         acct = self._account_for(cfg, doc, account)
         account_block = None
         if acct:
