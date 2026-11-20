@@ -23,7 +23,7 @@ Environment=CTB_LIVE_ROOT=%h/Documents/calibrain-study/data/live
 #Environment=CTB_LIVE_ROOTS=bybit-demo=%h/Documents/calibrain-study/data/live,okx-demo=%h/Documents/calibrain-study/data/live-okx,deribit-test=%h/Documents/calibrain-study/data/live-deribit,bitget-demo=%h/Documents/calibrain-study/data/live-bitget
 # The demo account the per-symbol bot would use. Strategies whose account equals it, or all of them when this is unset,
 # are treated as sharing the account (only one mode trades it at a time).
-Environment=CTB_DASHBOARD_ACCOUNT=demo-dashboard
+Environment=CTB_DASHBOARD_ACCOUNT=demo-main
 # Runner units the dashboard may start before strategies.json exists (comma separated, exact unit names).
 Environment=CTB_LIVE_UNITS=calibrain-live@carry.service,calibrain-live@trend.service,calibrain-live@xsmom.service
 # API keys, model keys and the venue come from the repo's .env, which this unit does not print or copy.
