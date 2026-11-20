@@ -593,11 +593,14 @@ class VenueHub:
             raise S.StrategyError(409, kill_message(cfg, out), detail=out)
         return out
 
-    async def kill_all(self) -> dict[str, Any]:
+    async def kill_all(self, skip: dict[str, str] | None = None) -> dict[str, Any]:
         """Every venue: each one that has started gets its flags written and says whether that is confirmed; a venue that
-        has not started is skipped."""
+        has not started is skipped, and so is one named in `skip` (with its reason: bybit-demo in PER-SYMBOL BOT mode)."""
         res = []
         for cfg in self.venues:
+            if skip and cfg.id in skip:
+                res.append({"ok": False, "venue": cfg.id, "label": cfg.label, "skipped": True, "error": skip[cfg.id]})
+                continue
             try:
                 res.append(await self.kill(cfg.id))
             except S.StrategyError as exc:

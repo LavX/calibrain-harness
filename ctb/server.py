@@ -393,12 +393,36 @@ def make_app(engine: Engine, strategies_svc: strat_mod.StrategyService | None = 
 
     @routes.post("/api/kill-all")
     async def kill_all(_: web.Request) -> web.Response:
-        """Every venue that has started gets its kill flags written and says whether that is confirmed. The per-symbol
-        bot's AUTO-TRADE is switched off afterwards (the answer says so)."""
-        out = await hub.kill_all()
+        """Every venue that has started gets its kill flags written and says whether that is confirmed, and the per-symbol
+        bot is killed when it owns the Bybit account (mode PER-SYMBOL BOT): its positions closed, orders cancelled, trading off.
+        In that mode the bybit-demo strategies are skipped: they are already paused and their runner stopped. The bot's part
+        is reported on its own ("bot"). Outside that mode the bot is not touched on the exchange: Executor.kill closes every
+        position on the account, which would close the strategies' netted legs behind their runner."""
+        bot_mode = not strat.owns_account()
+        bot_open = bool(engine.db.one("SELECT id FROM trades WHERE status IN ('open','opening') LIMIT 1"))
+        skip = {hub.primary_id: ("the header mode is PER-SYMBOL BOT: these strategies are paused and their runner stopped; "
+                                 "the per-symbol bot is killed instead")} if bot_mode else None
+        out = await hub.kill_all(skip=skip)
+        ex = getattr(engine, "executor", None)
+        if bot_mode and ex is not None:
+            try:
+                await ex.kill("dashboard KILL ALL")
+                bot = {"killed": True, "why": "per-symbol bot: positions closed, orders cancelled, trading off"}
+            except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+                bot = {"killed": False, "why": f"per-symbol bot kill failed: {exc}"}
+        elif bot_mode:
+            bot = {"killed": False, "why": "per-symbol bot: no executor (no keys for its venue), nothing to close"}
+        elif bot_open:
+            bot = {"killed": False, "why": ("per-symbol bot has open trades but the strategies own the account: not closed here, "
+                                            "because closing a symbol would close the strategies' netted legs too")}
+        else:
+            bot = {"killed": False, "why": "per-symbol bot is not active and holds no trades"}
         s.trading_enabled = False
+        out["bot"] = {**bot, "auto_trade": "off"}
         out["bot_auto_trade"] = "off"
-        msg = "; ".join(f"{r['label']}: {'flattening ' + ', '.join(r['flattening']) if r['ok'] else r['error']}" for r in out["venues"])
+        if bot_mode or bot_open:
+            out["ok"] = out["ok"] and bot["killed"]
+        msg = "; ".join(f"{r['label']}: {'flattening ' + ', '.join(r['flattening']) if r['ok'] else r['error']}" for r in out["venues"]) + f"; {bot['why']}"
         engine.emit("event", engine.db.event("warn", "killed", f"kill all: {msg}"))
         return j(out)
 

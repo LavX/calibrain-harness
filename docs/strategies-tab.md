@@ -108,7 +108,11 @@ its status.json is fresh (checked per strategy, since units can be per strategy)
 confirmed" naming the strategies nobody may be acting for yet: a hung or restarting runner reads the flags when it comes
 back. A failed write answers 500 with what was and was not written. Only a venue that has not started, or whose
 strategies.json is unusable, is refused with nothing written. KILL ALL does every venue and reports each one (a venue
-that has not started is skipped) and then switches the per-symbol bot's AUTO-TRADE off. `/api/kill` (the old header
+that has not started is skipped) and then switches the per-symbol bot's AUTO-TRADE off. In mode PER-SYMBOL BOT it also
+kills the bot (all its positions closed, orders cancelled) and skips the bybit-demo strategies, which that mode has
+already paused with their runner stopped. In the other modes the bot is not touched on the exchange: its kill closes
+every position on the account, which would close the strategies' netted legs behind their runner. The answer reports
+the bot's part on its own. `/api/kill` (the old header
 button) is the bybit-demo kill in LLM DECIDES and MANUAL.
 
 A pending kill (`flatten: true`) ends in one of two ways only: the runner, once flat, clears the flag itself

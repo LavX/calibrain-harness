@@ -644,3 +644,46 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             assert r.status == 200 and (await r.json())["ids"] == ["carry"]
 
     run(go())
+
+
+@pytest.mark.parametrize("mode", ["bot", "manual"])
+def test_kill_all_kills_the_per_symbol_bot_only_when_it_owns_the_account(roots, tmp_path, monkeypatch, mode):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from ctb.server import make_app
+
+    kills: list[str] = []
+
+    async def executor_kill(reason):
+        kills.append(reason)
+
+    class Engine:
+        s = SimpleNamespace(trading_enabled=mode == "bot", public_view=lambda: {})
+        db = SimpleNamespace(event=lambda *a: a, one=lambda *a: None)
+        executor = SimpleNamespace(kill=executor_kill)
+
+        async def start(self): ...
+        async def stop(self): ...
+        def emit(self, *a): ...
+
+    monkeypatch.setenv("CTB_VENUE", "demo")
+    h = hub(roots, FakeSystemd(active=BYBIT_UNITS + [OKX_UNIT]), tmp_path)
+    h.primary._mode = mode
+    eng = Engine()
+    app = make_app(eng, hub=h)
+    app.on_startup.clear()
+    app.on_cleanup.clear()
+
+    async def go():
+        async with TestClient(TestServer(app)) as c:
+            return await (await c.post("/api/kill-all", json={})).json()
+
+    body = run(go())
+    by = {x["venue"]: x for x in body["venues"]}
+    assert by["okx-demo"]["ok"] is True and eng.s.trading_enabled is False and body["bot"]["auto_trade"] == "off"
+    if mode == "bot":  # the bot owns the account: it is killed, the paused bybit strategies are skipped with the reason
+        assert kills == ["dashboard KILL ALL"] and body["bot"]["killed"] is True
+        assert by["bybit-demo"]["skipped"] is True and "PER-SYMBOL BOT" in by["bybit-demo"]["error"]
+        assert ctl(roots[0], "carry").get("flatten") is False
+    else:  # the strategies own it: Executor.kill would close their netted legs, so the bot is not touched on the exchange
+        assert kills == [] and body["bot"]["killed"] is False and by["bybit-demo"]["ok"] is True

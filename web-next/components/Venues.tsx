@@ -94,15 +94,19 @@ export async function killAll(doc: VenuesDoc | null) {
   if (!doc) return; // the button is disabled until the venues have loaded
   const lines = doc.venues.map((v) => {
     const what = `${v.controlled_by === "allocator" ? "allocator paused, " : ""}${v.counts.total} strategies paused and flagged to flatten`;
+    if (doc.mode === "bot" && v.id === doc.primary) return `${v.label}: skipped (PER-SYMBOL BOT mode: its strategies are paused, runner stopped)`;
     return v.presence === "absent" ? `${v.label}: not started, skipped` : !v.kill.available ? `${v.kill.why}`
       : v.kill.ok ? `${v.label}: ${what}`
         : `${v.label}: ${what}, NOT confirmable now (${PRESENCE[v.presence]?.[0] || v.presence}): ${v.kill.why}`;
   });
-  if (!confirm(`KILL ALL venues?\n\n${lines.join("\n")}\n\nThe per-symbol bot's AUTO-TRADE is switched off too. Positions close through each runner's books.`)) return;
+  const botLine = doc.mode === "bot"
+    ? "PER-SYMBOL BOT (the header mode): all its positions on the Bybit account closed, its orders cancelled, its trading off. The BYBIT·DEMO strategies are skipped: already paused, runner stopped."
+    : "Per-symbol bot: AUTO-TRADE switched off (it is not trading in this mode, so nothing of it is closed on the exchange).";
+  if (!confirm(`KILL ALL venues?\n\n${lines.join("\n")}\n\n${botLine}\n\nStrategy positions close through each runner's books.`)) return;
   try {
     const r = await post("/api/kill-all");
-    alert(r.venues.map((x: any) => `${x.label}: ${x.ok ? `confirmed, flattening ${x.flattening.join(", ")}` : x.skipped ? "not started, skipped" : x.error}`).join("\n")
-      + "\n\nThe per-symbol bot's AUTO-TRADE is off.");
+    alert(r.venues.map((x: any) => `${x.label}: ${x.ok ? `confirmed, flattening ${x.flattening.join(", ")}` : x.skipped && /has not started/.test(x.error) ? "not started, skipped" : x.error}`).join("\n")
+      + `\n\n${r.bot?.why || "per-symbol bot"} (AUTO-TRADE off).`);
   } catch (e: any) {
     alert(e.message);
   }
