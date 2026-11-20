@@ -229,3 +229,19 @@ def test_no_em_dashes_in_the_ui_text():
     for f in [base / "ctb" / "predictions.py", base / "web-next" / "components" / "Predictions.tsx"]:
         if f.exists():
             assert dash not in f.read_text(), f
+
+
+def test_history_keeps_a_retired_strategy_from_its_recorded_weights(root):
+    """basis was held in the recorded policies and has its returns file, but is no longer in the registry, the forecast,
+    the latest weights line or the scores: its days are still computed, not missing."""
+    lines = [json.loads(x) for x in (root / "allocator" / "policies.jsonl").read_text().splitlines()]
+    for rec in lines:
+        if rec["venue"] == "bybit-demo":
+            for w in rec["policies"].values():
+                w["basis"] = 0.2
+    (root / "allocator" / "policies.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (root / "returns" / "basis.csv").write_text("date,ret_net\n2026-11-20,0.01\n2026-11-21,-0.02\n")
+    h = pr.build(root, NOW, "2026-11-19")["history"]
+    assert h["days"] == ["2026-11-20", "2026-11-21"] and h["missing_days"] == ["2026-11-19"]
+    d1 = (0.5 * -0.0001 + 0.3 * 0.004 + 0.2 * 0.002 + 0.2 * 0.01) / 4  # core on 11-20, four books now
+    assert h["core_pct"][0] == pytest.approx(d1 * 100, abs=1e-4)  # stored at 4 decimals

@@ -320,7 +320,9 @@ def history_section(root: Path, ids: list[str], go_live: str, by_day: dict[str, 
     portfolio is the average of its books, sum(w r) / N. A day with no recorded weights, or a weighted book without a
     return, is missing: listed in missing_days and left out, never counted as a zero return. None until a day is recorded."""
     by_day = policy_days(root) if by_day is None else by_day
-    rets = {sid: read_returns(root / "returns" / f"{sid}.csv") for sid in ids}
+    # the returns of every strategy a recorded policy ever held, not only today's: a retired one still has its history
+    held = {sid for pol in by_day.values() for w in pol.values() for sid in w}
+    rets = {sid: read_returns(root / "returns" / f"{sid}.csv") for sid in dict.fromkeys([*ids, *sorted(held)])}
     all_days = sorted({d for r in rets.values() for d in r if d >= go_live} | {d for d in by_day if d >= go_live})
     growth = {k: 1.0 for k, _ in POLICY_KEYS}
     days: list[str] = []
