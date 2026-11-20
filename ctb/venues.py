@@ -151,6 +151,8 @@ def strategy_liveness(cfg: VenueConfig, view: dict, runners: list[dict], now_ms:
         state = "not installed" if u and u.get("load") == "not-found" else (u or {}).get("active") or "unknown"
         return False, f"unit {unit} is {state}"
     st = view.get("status")
+    if st and st.get("state") == "latched":  # the runner skips a latched strategy before it reads flatten (runner.py, latches)
+        return False, "latched: the runner skips it until the latch is reset; the flatten runs after the reset"
     if not st or st.get("updated_ms") is None:
         return False, "no status.json yet"
     age_ms = now_ms - st["updated_ms"]
@@ -297,7 +299,11 @@ def alerts(v: dict, now_ms: float) -> list[dict]:
         sid, name, p = s["id"], s["name"], s["pill"]
         err = s.get("last_error") or ""
         if s["kill_open"]:
-            add("warn", "kill_pending", "flatten requested, waiting for the runner to close the positions", sid, name)
+            if p == "latched":
+                add("crit", "kill_pending", "kill pending but latched: the runner skips it until the latch is reset (F7 RESET LATCH); "
+                    "the flatten runs after the reset", sid, name)
+            else:
+                add("warn", "kill_pending", "flatten requested, waiting for the runner to close the positions", sid, name)
         if p == "latched":
             add("crit", "latched", err or "latched: check the account, then reset the latch (F7)", sid, name)
         elif p == "error":

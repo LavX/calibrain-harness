@@ -59,6 +59,9 @@ def okx_root(tmp_path: Path) -> Path:
 def roots(tmp_path):
     bybit = tmp_path / "live"
     shutil.copytree(FIX, bybit)
+    # the shared fixture's xsmom is latched; here it runs, so a kill can be confirmed (the latched case has its own test)
+    xs = json.loads((bybit / "xsmom" / "status.json").read_text())
+    (bybit / "xsmom" / "status.json").write_text(json.dumps({**xs, "state": "running", "last_error": None}))
     return bybit, okx_root(tmp_path), tmp_path / "live-deribit"
 
 
@@ -286,6 +289,22 @@ def test_kill_liveness_is_per_strategy_when_units_are(roots, tmp_path):
     d = e.value.detail
     assert d["confirmed"] == ["carry"] and sorted(d["unconfirmed"]) == ["trend", "xsmom"]
     assert "calibrain-live@trend.service is inactive" in d["unconfirmed"]["trend"] and "Confirmed: carry" in e.value.message
+
+
+def test_a_latched_strategy_is_never_confirmed(roots, tmp_path):
+    set_status(roots[0], "xsmom", state="latched", last_error="venue position differs from the book: SOLUSDT")
+    h = hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path)
+    v = run(h.summary())["venues"][0]
+    assert v["kill"]["ok"] is False and "latched" in v["kill"]["why"]  # the preview says it before
+    with pytest.raises(st.StrategyError) as e:
+        run(h.kill("bybit-demo"))
+    d = e.value.detail
+    assert e.value.status == 409 and sorted(d["confirmed"]) == ["carry", "trend"] and "latched" in d["unconfirmed"]["xsmom"]
+    assert "flatten runs after the reset" in e.value.message and ctl(roots[0], "xsmom")["flatten"] is True  # written all the same
+    set_status(roots[0], "xsmom", positions=[{"symbol": "SOLUSDT", "side": "long", "qty": 1, "entry_price": 1, "mark_price": 1,
+                                              "upnl_usdt": 0.0, "market": "linear"}])
+    alerts = run(hub(roots, FakeSystemd(active=BYBIT_UNITS), tmp_path).summary())["alerts"]  # a fresh hub: no snapshot cache
+    assert any(a["strategy"] == "xsmom" and a["kind"] == "kill_pending" and a["level"] == "crit" and "latched" in a["text"] for a in alerts)
 
 
 def test_kill_on_absent_or_broken_roots_writes_nothing(roots, tmp_path):
