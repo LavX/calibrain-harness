@@ -147,8 +147,8 @@ export function CommandBar() {
   const autoTip = mode === "unknown" ? "Loading the strategies' state: the switch works once it is known" : mode === "bot"
     ? `Allow the per-symbol bot to place orders on ${botVenue}`
     : mode === "llm"
-      ? `Every venue the LLM allocator controls (${allVenues}). On: the allocator decides which strategies trade there and how much. Off: the allocator pauses and every strategy there is paused; positions stay open (use KILL to close them).`
-      : `On: the strategies in the ${allocVenue} header set (F7) are switched on. Off: every strategy on ${allVenues} is paused; positions stay open (use KILL to close them).`;
+      ? `Every venue the LLM allocator controls (${allVenues}). On: the allocator decides which strategies trade there and how much. Off: the allocator pauses and every strategy there is paused; positions stay open, except that the 15% drawdown floor still closes a book that falls 15% below its peak. Use KILL to close everything.`
+      : `On: the strategies in the ${allocVenue} header set (F7) are switched on. Off: every strategy on ${allVenues} is paused; positions stay open, except that the 15% drawdown floor still closes a book that falls 15% below its peak. Use KILL to close everything.`;
 
   return (
     <header className="cmdbar">

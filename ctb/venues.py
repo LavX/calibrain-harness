@@ -543,7 +543,8 @@ class VenueHub:
 
     async def auto_others(self, enabled: bool, mode: str) -> dict[str, str]:
         """The header AUTO-TRADE switch on the venues other than the allocator venue that the allocator controls. OFF (any
-        mode) pauses every strategy there, positions stay open. ON in LLM DECIDES makes sure their runners run (the allocator
+        mode) pauses every strategy there; positions stay open, except that the drawdown floor (which runs while paused) still
+        closes a book 15% below its peak. ON in LLM DECIDES makes sure their runners run (the allocator
         then writes their controls); ON in MANUAL changes nothing there (the header set is the allocator venue's)."""
         out: dict[str, str] = {}
         for cfg in self.venues:

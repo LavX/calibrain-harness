@@ -11,7 +11,7 @@ The header has a mode selector next to AUTO-TRADE. Exactly one mode trades the d
 
 | Mode | Who decides | AUTO-TRADE switch |
 | --- | --- | --- |
-| LLM DECIDES | the LLM allocator (`ctb/allocator.py`) picks which strategies trade and their weight | on: allocator on and runner started; off: allocator paused and every strategy off |
+| LLM DECIDES | the LLM allocator (`ctb/allocator.py`) picks which strategies trade and their weight | on: allocator on and runner started; off: allocator paused and every strategy off (positions stay open, but the drawdown floor still closes a book 15% below its peak) |
 | MANUAL | you, per card (the allocator is paused) | on: the strategies ticked "in header set" are switched on and the runner started; off: all off |
 | PER-SYMBOL BOT | the older per-symbol LLM bot | the existing switch (`/api/trading`) |
 

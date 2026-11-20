@@ -81,8 +81,8 @@ export async function switchMode(from: string, to: string, doc?: StratDoc | null
       : "The per-symbol bot trades another account, so nothing of the strategies changes: the LLM allocator and the BYBIT·DEMO strategies keep running as they are. Only the header mode changes. Other venues are not affected."
     : from === "bot"
       ? "The per-symbol bot's AUTO-TRADE is turned off first."
-      : to === "manual" ? "The LLM allocator is paused. Strategies stay as they are and you switch them per card."
-        : "When AUTO-TRADE is on, the allocator decides which BYBIT·DEMO strategies trade and how much. Strategies you switched by hand stay locked until you unlock them.";
+      : to === "manual" ? "The LLM allocator is paused: it makes no decisions, but its 15% drawdown floor still closes a book that falls 15% below its peak (not one you switched by hand). Strategies stay as they are and you switch them per card."
+        : "When AUTO-TRADE is on, the allocator decides which strategies trade on every venue it controls and how much. Strategies you switched by hand stay locked until you unlock them.";
   if (to === "bot") {
     const typed = prompt(`Switch the auto-trade mode to PER-SYMBOL BOT?\n\n${what}\n\nType BOT to confirm.`);
     if ((typed || "").trim().toUpperCase() !== "BOT") return;
@@ -109,7 +109,7 @@ export async function headerAuto(doc: StratDoc, on: boolean, venue = "BYBIT·DEM
     ? doc.mode === "llm"
       ? `Turn AUTO-TRADE on for ${venue}${everywhere}? The LLM allocator will decide which strategies trade there and how much. Their strategy runners are started if needed.`
       : `Turn AUTO-TRADE on for ${set.join(", ") || "no strategy"} on ${venue}? The strategy runner is started if needed.${others.length ? ` On ${others.join(", ")} nothing changes in MANUAL: switch their strategies per card.` : ""}`
-    : `Turn AUTO-TRADE off for ${venue}${everywhere}? ${doc.mode === "llm" ? "The allocator pauses and every" : "Every"} strategy there is paused: it places no new orders. Positions stay open (use KILL to close them).`;
+    : `Turn AUTO-TRADE off for ${venue}${everywhere}? ${doc.mode === "llm" ? "The allocator pauses and every" : "Every"} strategy there is paused: it places no new orders. Positions stay open, except that the 15% drawdown floor still closes a book that falls 15% below its peak. Use KILL to close everything.`;
   // a status showing no position does not prove a book flat: every pending kill is named and needs the owner's cancel
   const pending = on && doc.mode === "manual" ? doc.strategies.filter((s) => set.includes(s.id) && s.control.flatten_pending) : [];
   if (pending.length) {
