@@ -860,12 +860,17 @@ class Allocator:
             record.pop("inputs", None)
             record["inputs_omitted"] = True
 
-    def _log_answer(self, now_ms: int, qset: str | None, p: dict[str, float]) -> None:
+    def _log_answer(self, now_ms: int, qset: str | None, p: dict[str, float], best: dict[str, float] | None,
+                    e0: dict[str, float | None], w0: dict[str, float]) -> None:
         """One slim line per decider answer in allocator/answers.jsonl: each p is the probability that the strategy's unit
-        book return over [horizon_start_ms, maturity_ms] is positive (the question's next 24 hours from the poll)."""
+        book return over [horizon_start_ms, maturity_ms] is positive (the question's next 24 hours from the poll). The
+        books asked about are the allocator venue's (`venue`); e0 is each book's equity at the poll and w0 the weight it
+        holds after the poll, which is what the label needs: unit return = (equity at maturity / e0 - 1) / w0."""
         append_jsonl(self.dir / "answers.jsonl", {
             "issued_ms": now_ms, "horizon_start_ms": now_ms, "maturity_ms": now_ms + ANSWER_HORIZON_MS,
-            "question_version": qset or QUESTION_SET_VERSION, "model": self.model, "p": {sid: round(float(v), 6) for sid, v in p.items()}})
+            "question_version": qset or QUESTION_SET_VERSION, "model": self.model, "p": {sid: round(float(v), 6) for sid, v in p.items()},
+            "venue": self.primary.id, "e0": {sid: e0.get(sid) for sid in p}, "w0": {sid: round(float(w0[sid]), 4) for sid in p if sid in w0},
+            "best": {k: round(float(v), 4) for k, v in best.items()} if isinstance(best, dict) else None})
 
     def _push_p(self, p: dict[str, float], now_ms: int) -> None:
         hist = self._state()["p_hist"]
@@ -1344,9 +1349,12 @@ class Allocator:
             extra.pop("mapping", None)  # the decider-only mapping never sets weights
             record.update(extra)
             p_new = (extra.get("answers") or {}).get("p") or {}
+            answer = None
             if p_new and not dry_run:
                 self._push_p(p_new, now_ms)
-                self._log_answer(now_ms, extra.get("qset"), p_new)
+                answer = (extra.get("qset"), p_new, (extra.get("answers") or {}).get("best"),
+                          {sid: _num(row.get("equity_usdt")) for sid, row in ((record.get("inputs") or {}).get("strategies") or {}).items()
+                           if isinstance(row, dict)})
             fresh = self.p_fresh(ids, p_new if dry_run else None, now_ms)
             p_now = {sid: v for sid, (v, _) in fresh.items()}
             weights_run = trigger != "schedule" or self.weights_due(now_ms)
@@ -1420,6 +1428,13 @@ class Allocator:
             record["venues"] = venues
             # every venue's live writes are done: only now the evaluation recording runs, and nothing it does can propagate
             not_recorded = self._record_policies(venues, kind, now_ms, dry_run)
+            if answer:
+                try:
+                    held = self._held(plan, current, applied, dry_run) if plan else {sid: c.weight for sid, c in current.items()}
+                    self._log_answer(now_ms, *answer, held)
+                except Exception as exc:  # noqa: BLE001 - recording only
+                    log.exception("allocator: answers.jsonl not written")
+                    not_recorded = _join_errors(not_recorded, f"answers.jsonl not written ({type(exc).__name__}: {exc})"[:300])
             # only a weights run rewrites every book: an hourly refresh or a held run leaves earlier failures standing
             not_applied = self._write_failures(venues, now_ms, dry_run, replace=kind == "computed")
             # Refreshes do not check the cap, so only a weights run can clear its last error.
@@ -1967,12 +1982,46 @@ def _equity_at(hist: list, t_ms: int, tol_ms: int) -> float | None:
     return float(best[1]) if best and abs(best[0] - t_ms) <= tol_ms else None
 
 
+def _scored_items(alloc: Path, pv: str, qsets: tuple[str, ...]) -> list[dict[str, Any]]:
+    """The answers to score, oldest first: every line of answers.jsonl, then (for the time before answers.jsonl existed) the
+    decision lines that still carry their model input. Each item: t, venue, p, best, e0 and w per strategy."""
+    items: list[dict[str, Any]] = []
+    try:
+        with open(alloc / "answers.jsonl") as f:
+            for raw in f:
+                try:
+                    a = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(a, dict) or a.get("question_version") not in qsets or _num(a.get("issued_ms")) is None:
+                    continue
+                items.append({"t": int(a["issued_ms"]), "venue": a.get("venue") or pv, "p": a.get("p") or {}, "best": a.get("best"),
+                              "e0": a.get("e0") or {}, "w": a.get("w0") or {}})
+    except OSError:
+        pass
+    first = min((x["t"] for x in items), default=None)
+    for d in DL.tail(alloc, 5000):
+        ans = d.get("answers")
+        if d.get("qset") not in qsets or d.get("error") or d.get("dry_run") or not isinstance(ans, dict):
+            continue
+        t = int(d["t_ms"])
+        if first is not None and t >= first:
+            continue  # answers.jsonl has it
+        strategies = ((d.get("inputs") or {}).get("strategies") or {})
+        items.append({"t": t, "venue": pv, "p": ans.get("p") or {}, "best": ans.get("best"),
+                      "e0": {sid: _num((strategies.get(sid) or {}).get("equity_usdt")) for sid in (ans.get("p") or {})},
+                      "w": d.get("weights") or {}})
+    return sorted(items, key=lambda x: x["t"])
+
+
 def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None = None, tol_min: int = 45,
                     min_weight: float = 0.1, qset: str | None = None) -> dict[str, Any]:
-    """Score logged alloc-v1.0 and alloc-v1.1 answers (same questions; pass qset to keep one of them) against the realised net book return, from the equity at the
-    decision (logged inputs) and the equity samples in allocator/state.json (kept 8 days: run this at
-    least weekly). A book's return is divided by its weight, so it is the return on the capital the
-    strategy deploys; a book held below min_weight cannot be labelled and is counted as flat."""
+    """Score the decider's alloc-v1.0 and alloc-v1.1 answers (same questions; pass qset to keep one of them) against the
+    realised net book return. Every answer of allocator/answers.jsonl is scored from its own starting equity (e0) and
+    weight (w0); before that file existed, the decision lines that carry their model input are used. The equity at
+    maturity comes from the samples in allocator/state.json (kept 8 days: run this at least weekly). A book's return is
+    divided by its weight, so it is the return on the capital the strategy deploys; a book held below min_weight cannot
+    be labelled and is counted as flat."""
     alloc = Path(root) / ALLOCATOR_ID
     now_ms = now_ms or int(time.time() * 1000)
     state = read_json(alloc / "state.json") or {}
@@ -1982,20 +2031,16 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
     per: dict[str, dict[str, Any]] = {}
     best_stats = {"n": 0, "correct": 0, "p_realised": 0.0}
     pending, unlabelled = 0, {"flat": 0, "no_equity": 0}
-    for d in DL.tail(alloc, 5000):
-        ans = d.get("answers")
-        if d.get("qset") not in (SCORED_QSETS if qset is None else (qset,)) or d.get("error") or d.get("dry_run") or not isinstance(ans, dict):
-            continue
-        t = int(d["t_ms"])
+    for it in _scored_items(alloc, pv, SCORED_QSETS if qset is None else (qset,)):
+        t = it["t"]
         if t + h_ms > now_ms:
             pending += 1
             continue
-        strategies = ((d.get("inputs") or {}).get("strategies") or {})
         returns: dict[str, float] = {}
-        for sid, p in (ans.get("p") or {}).items():
-            e0 = _num((strategies.get(sid) or {}).get("equity_usdt"))
-            e1 = _equity_at(hist.get(f"{pv}/{sid}") or hist.get(sid, []), t + h_ms, tol)
-            w = _num((d.get("weights") or {}).get(sid)) or 0.0
+        for sid, p in it["p"].items():
+            e0 = _num(it["e0"].get(sid))
+            e1 = _equity_at(hist.get(f"{it['venue']}/{sid}") or hist.get(sid, []), t + h_ms, tol)
+            w = _num(it["w"].get(sid)) or 0.0
             if w < min_weight:
                 unlabelled["flat"] += 1
             elif e0 is None or e0 <= 0 or e1 is None:
@@ -2006,8 +2051,8 @@ def score_decisions(root: Path | str, *, horizon_h: int = 24, now_ms: int | None
                 st = per.setdefault(sid, {"n": 0, "pos": 0, "p_sum": 0.0, "brier": 0.0, "hits": 0})
                 y = 1 if r > 0 else 0
                 st["n"] += 1; st["pos"] += y; st["p_sum"] += p; st["brier"] += (p - y) ** 2; st["hits"] += int((p > 0.5) == bool(y))
-        best = ans.get("best")
-        if best and len(returns) == len(ans.get("p") or {}) and returns:
+        best = it["best"]
+        if best and len(returns) == len(it["p"]) and returns:
             top = max(returns, key=lambda k: returns[k])
             realised = top if returns[top] > 0 else NONE_ID
             best_stats["n"] += 1

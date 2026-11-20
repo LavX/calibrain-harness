@@ -205,7 +205,10 @@ weight the book already had where it was not (owner-locked, a pending kill, paus
   locked book sits at its live weight in every policy) and the final vol cap. A held run holds them. The same lines,
   slim, go to `allocator/policies.jsonl` (plus `weights_mode`) for the dashboard.
 - **Decider answers.** Every poll appends one slim line to `allocator/answers.jsonl`: `issued_ms`, `horizon_start_ms`
-  (= `issued_ms`), `maturity_ms` (+24 h), `question_version`, `model`, `p` per strategy. No model input.
+  (= `issued_ms`), `maturity_ms` (+24 h), `question_version`, `model`, `p` per strategy, and what the label needs:
+  `venue` (the allocator venue, whose books the question is about), `e0` (each book's equity at the poll), `w0` (the
+  weight it holds after the poll) and `best` (the best-strategy answer). No model input. `python -m ctb.allocator score`
+  reads it, and the decision lines that carry their input only for the time before it existed.
 - **The full model input** stays in `decisions.jsonl` on weights runs, on polls with an error and on every
   `CTB_ALLOCATOR_FULL_INPUT_EVERY`-th routine poll (default 60); other polls mark `inputs_omitted` and keep `state_bytes`.
 - **Rotation.** When the first line of a new UTC day is appended, `decisions.jsonl` becomes `decisions-<day>.jsonl`

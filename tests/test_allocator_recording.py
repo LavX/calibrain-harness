@@ -28,9 +28,13 @@ def test_every_decider_answer_is_one_slim_line_in_answers_jsonl(root):
     decide(a, trigger="schedule")
     rows = jl(root / "allocator" / "answers.jsonl")
     t = int(T0 * 1000)
-    assert rows[0] == {"issued_ms": t, "horizon_start_ms": t, "maturity_ms": t + 24 * 3600_000, "question_version": "alloc-v1.1",
-                       "model": "ordecide / test", "p": {"carry": 0.61, "trend": 0.48, "xsmom": 0.57}}
-    assert len(rows) == 2 and len((root / "allocator" / "answers.jsonl").read_text().splitlines()[0]) < 400  # no model input
+    assert {k: rows[0][k] for k in ("issued_ms", "horizon_start_ms", "maturity_ms", "question_version", "model", "p")} == {
+        "issued_ms": t, "horizon_start_ms": t, "maturity_ms": t + 24 * 3600_000, "question_version": "alloc-v1.1",
+        "model": "ordecide / test", "p": {"carry": 0.61, "trend": 0.48, "xsmom": 0.57}}
+    # what the label needs: the allocator venue's books, their equity at the poll and the weight they hold after it
+    assert rows[0]["venue"] == "bybit-demo" and rows[0]["e0"] == {"carry": 1000.0, "trend": 1000.0, "xsmom": 1000.0}
+    assert rows[0]["w0"] == {i: ctl(root, i)["weight"] for i in ("carry", "trend", "xsmom")} and rows[0]["best"]["trend"] == 0.3
+    assert len(rows) == 2 and len((root / "allocator" / "answers.jsonl").read_text().splitlines()[0]) < 600  # no model input
 
 
 def test_a_dry_run_or_a_failed_poll_writes_no_answer(root):
@@ -273,3 +277,39 @@ def test_the_live_policy_is_what_the_books_hold_after_the_writes(root, monkeypat
     assert "trend" in vr["write_failed"] and rec["weights"]["trend"] != 0.2  # the plan moved trend, the write failed
     assert vr["policies"]["live"]["trend"] == 0.2 == ctl(root, "trend")["weight"]  # live records what the book holds
     assert vr["policies"]["live"]["carry"] == ctl(root, "carry")["weight"] == rec["weights"]["carry"]
+
+
+def test_routine_polls_without_their_input_are_still_scored(root):
+    """59 of 60 routine polls drop the model input; the scorer reads answers.jsonl, so they are labelled all the same."""
+    t = int(T0 * 1000)
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "last_weights_ms": int((SLOT - DAY + 60) * 1000)})
+    a = make(root, FakeDecider(answers({"carry": 0.6, "trend": 0.6, "xsmom": 0.6})))
+    decide(a, trigger="schedule")
+    line = jl(root / "allocator" / "decisions.jsonl")[-1]
+    assert line["weights_mode"] == "refresh" and line["inputs_omitted"] is True
+    st = json.loads((root / "allocator" / "state.json").read_text())
+    later = t + 24 * 3600_000
+    st["history"] = {"bybit-demo/carry": [[later, 1010.0]], "bybit-demo/trend": [[later, 990.0]], "bybit-demo/xsmom": [[later, 1003.0]]}
+    (root / "allocator" / "state.json").write_text(json.dumps(st))
+    out = A.score_decisions(root, now_ms=later + 3600_000)
+    assert out["unlabelled"] == {"flat": 0, "no_equity": 0} and {k: v["n"] for k, v in out["strategies"].items()} == {"carry": 1, "trend": 1, "xsmom": 1}
+    assert out["strategies"]["trend"]["base_rate"] == 0.0 and out["strategies"]["carry"]["base_rate"] == 1.0
+
+
+def test_the_scorer_still_reads_old_decision_lines_once(tmp_path):
+    """Lines from before answers.jsonl carry their input and are scored from it; from the first answer on, answers.jsonl
+    is the only source, so nothing counts twice."""
+    alloc = tmp_path / "allocator"
+    alloc.mkdir()
+    h = 24 * 3600_000
+    t = 1_000_000_000_000
+    old = {"t_ms": t, "qset": "alloc-v1.1", "error": None, "dry_run": False, "weights": {"carry": 1.0}, "answers": {"p": {"carry": 0.7}, "best": None},
+           "inputs": {"strategies": {"carry": {"equity_usdt": 1000.0}}}}
+    dup = {**old, "t_ms": t + 2 * h}
+    (alloc / "decisions.jsonl").write_text(json.dumps(old) + "\n" + json.dumps(dup) + "\n")
+    (alloc / "answers.jsonl").write_text(json.dumps({"issued_ms": t + 2 * h, "horizon_start_ms": t + 2 * h, "maturity_ms": t + 3 * h,
+                                                     "question_version": "alloc-v1.1", "model": "m", "p": {"carry": 0.4}, "venue": "bybit-demo",
+                                                     "e0": {"carry": 1000.0}, "w0": {"carry": 1.0}, "best": None}) + "\n")
+    (alloc / "state.json").write_text(json.dumps({"history": {"carry": [[t + h, 1020.0], [t + 3 * h, 990.0]]}}))
+    c = A.score_decisions(tmp_path, now_ms=t + 10 * h)["strategies"]["carry"]
+    assert c["n"] == 2 and c["brier"] == pytest.approx(((0.7 - 1) ** 2 + (0.4 - 0) ** 2) / 2, abs=1e-4)
