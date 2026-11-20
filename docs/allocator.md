@@ -128,6 +128,17 @@ Per strategy, a weights run does:
    drawdown floor (weight 0, flatten) and `owner_lock` (weight untouched) override everything, the lock
    wins over the floor.
 6. A strategy with no forecast (or no sigma) is held at its weight and listed in `no_forecast`.
+7. The final vol cap, per venue, on the weights that will actually be held: after every rule above, the drawdown floor
+   and the owner locks, the venue's portfolio (`sqrt(365 w'Sigma w) / N`, N its number of books) is checked again with
+   every book counted: owner-locked, held, and strategies without a forecast. The buffer, the exploration floor and the
+   locks run after the first cap and could push the portfolio over it (one 20%-vol sleeve: the cap gives 0.50, the
+   buffer keeps 0.55, 11%). Unlocked books are scaled down together until the cap holds; nothing is raised and locked
+   books never move. A sleeve with no sigma in today's forecast counts at its last known one (`state.json`
+   `risk_model`, kept from every fresh forecast); one never seen counts at the largest known sigma. If the cap cannot be
+   met (the locked books alone are over it), the unlocked books are cut as far as they go and the decision line and
+   `status.json` `last_error` say "cap infeasible". The check runs on every weights run, also a held one (forecast
+   missing or stale: it uses the last known volatilities), and its result is `final_cap` in the decision line (per venue
+   under `venues`).
 
 ### Tilt room by skill
 

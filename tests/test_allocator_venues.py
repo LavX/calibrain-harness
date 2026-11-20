@@ -504,6 +504,25 @@ def test_without_a_forecast_every_venue_holds_its_own_allocation(roots):
     assert ctl(bybit, "trend")["weight"] == 0.8 and ctl(bybit, "xsmom")["weight"] == 0.0
 
 
+def test_the_final_vol_cap_counts_every_book_of_a_venue_and_cuts_a_held_one_too(roots):
+    """OKX's longvol is not on Bybit (held, no decision covers it) and has no forecast; it still counts in OKX's final vol
+    cap, at the largest known volatility, and is cut with the others."""
+    from test_allocator_computed import FakeDecider, answers, forecast
+
+    bybit, okx = roots
+    day0 = T0 - T0 % 86_400
+    t = day0 + 8 * 3600
+    put(bybit / "forecast" / "latest.json", forecast(t - 7200))
+    for i in OKX_IDS:
+        book(okx, i, weight=0.9, enabled=True)
+    a = A.Allocator(bybit, FakeDecider(answers({i: 0.5 for i in BYBIT_IDS})), market, model="ordecide / test", clock=lambda: t,
+                    budget=RateBudget(50), venues=venues(bybit, okx))
+    rec = decide(a, trigger="decide_now")
+    cap = rec["venues"]["okx-demo"]["final_cap"]
+    assert cap["vol_after"] <= 0.10 + 1e-9 and "longvol" in cap["cut"] and cap["notes"]["longvol"].startswith("volatility unknown")
+    assert ctl(okx, "longvol")["weight"] < 0.9 and rec["venues"]["okx-demo"]["applied"]["longvol"] is True
+
+
 def test_an_unusable_venue_strategies_json_writes_nothing_there(roots):
     bybit, okx = roots
     put(okx / "strategies.json", [{"id": "../live/carry", "label": "escape"}])  # an id that would leave the venue's root

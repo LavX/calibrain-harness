@@ -1286,6 +1286,8 @@ class Allocator:
                 why = " | ".join(calc_out["reasons"][sid] for sid in ids)
                 decision = Decision(dict(calc_out["w_final"]), {sid: current[sid].enabled for sid in ids}, why, None,
                                     derive_enabled=tuple(calc_out["opt"]))
+            if fc.state == "fresh" and not dry_run:
+                self._remember_risk(fc)
             plan = resolve(current, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct) if current else None
             reasons: dict[str, str] = {}
             if plan:
@@ -1294,12 +1296,16 @@ class Allocator:
                         reasons[sid] = f"risk floor: book {current[sid].drawdown_pct:.1f}% below its peak, weight forced to 0"
                     else:
                         reasons[sid] = calc_out["reasons"][sid] if calc_out else why
+            final_cap = self._final_cap(self.primary, plan, current, reasons, fc) if plan and kind != "refresh" else None
+            if final_cap:
+                record["final_cap"] = final_cap
             applied: dict[str, bool] = {}
             failed: dict[str, str] = {}
             if plan and not dry_run and self.primary.managed:
                 applied = self._apply(plan, current, reasons, now_ms, refresh_reasons=kind == "computed", errors=failed)
             venues = {self.primary.id: self._venue_record(self.primary, plan, current, reasons, applied, None,
-                                                          {"write_failed": failed} if failed else None)}
+                                                          {**({"write_failed": failed} if failed else {}),
+                                                           **({"final_cap": final_cap} if final_cap else {})})}
             if kind == "computed" and plan and not dry_run:
                 self._state()["last_weights_ms"] = now_ms
                 self._dirty = True
@@ -1331,13 +1337,106 @@ class Allocator:
             record["venues"] = venues
             # only a weights run rewrites every book: an hourly refresh or a held run leaves earlier failures standing
             not_applied = self._write_failures(venues, now_ms, dry_run, replace=kind == "computed")
-            record["error"] = _join_errors(record["error"], not_applied)
+            infeasible = self._cap_infeasible(venues)
+            record["error"] = _join_errors(record["error"], infeasible, not_applied)
             if not dry_run:
                 append_jsonl(self.dir / "decisions.jsonl", record)
-                self.last_error = _join_errors(error, not_applied)  # the forecast's error is said by write_status, as before
+                self.last_error = _join_errors(error, infeasible, not_applied)  # the forecast's error is said by write_status, as before
                 self._save_state()
                 self.write_status(now_ms, last_decision_ms=now_ms)
             return record
+
+    # ---- the final vol cap (allocator_math.final_vol_cap) on what a venue will actually hold
+    def _remember_risk(self, fc: Forecast) -> None:
+        """Keep each strategy's last known sigma_d and the last covariance matrix, so a sleeve that drops out of the forecast,
+        or a forecast that goes missing, still has a volatility for the final vol cap."""
+        rm = self._state().setdefault("risk_model", {})
+        sig = rm.setdefault("sigma_d", {})
+        data = fc.data or {}
+        for sid, f in (data.get("strategies") or {}).items():
+            v = _num(f.get("sigma_d")) if isinstance(f, dict) else None
+            if v is not None and v > 0:
+                sig[sid] = [v, fc.made_ms]
+        cov = data.get("cov_d") if isinstance(data.get("cov_d"), dict) else {}
+        ids, matrix = cov.get("ids"), cov.get("matrix")
+        if isinstance(ids, list) and isinstance(matrix, list) and len(matrix) == len(ids) and all(isinstance(r, list) and len(r) == len(ids) for r in matrix):
+            rm["cov"] = {"ids": ids, "matrix": matrix, "made_ms": fc.made_ms}
+        self._dirty = True
+
+    def _risk_cov(self, ids: list[str], fc: Forecast | None) -> tuple[list[list[float]] | None, dict[str, str]]:
+        """The covariance of the given books for the final vol cap: the forecast in use when it has them, else the last known
+        sigma and covariance (state.json risk_model). A pair with no known covariance counts as independent, like
+        compute_weights. A book with no known sigma at all gets the largest known one (said in the notes). None when no
+        sigma is known for any book."""
+        rm = self._state().get("risk_model") if isinstance(self._state().get("risk_model"), dict) else {}
+        data = (fc.data if fc is not None and fc.state == "fresh" else None) or {}
+        fstrat = data.get("strategies") if isinstance(data.get("strategies"), dict) else {}
+        stored = rm.get("sigma_d") if isinstance(rm.get("sigma_d"), dict) else {}
+        notes: dict[str, str] = {}
+        sigma: dict[str, float | None] = {}
+        for sid in ids:
+            f = fstrat.get(sid)
+            v = _num(f.get("sigma_d")) if isinstance(f, dict) else None
+            if v is None or v <= 0:
+                old = stored.get(sid)
+                v = _num(old[0]) if isinstance(old, list) and old else None
+                if v is not None and v > 0:
+                    notes[sid] = "last known volatility"
+            sigma[sid] = v if v is not None and v > 0 else None
+        known = [v for v in sigma.values() if v is not None]
+        if not known:
+            return None, {}
+        for sid in ids:
+            if sigma[sid] is None:
+                sigma[sid], notes[sid] = max(known), "volatility unknown, the largest known one assumed"
+        mats = []
+        for src in (data.get("cov_d"), rm.get("cov")):
+            if isinstance(src, dict) and isinstance(src.get("ids"), list) and isinstance(src.get("matrix"), list):
+                mats.append((src["ids"], src["matrix"]))
+
+        def cov_ij(a: str, b: str) -> float:
+            if a == b:
+                return sigma[a] ** 2
+            for cids, matrix in mats:
+                if a in cids and b in cids:
+                    try:
+                        v = _num(matrix[cids.index(a)][cids.index(b)])
+                    except (IndexError, TypeError):
+                        v = None
+                    if v is not None:
+                        return v
+            return 0.0
+
+        return [[cov_ij(a, b) for b in ids] for a in ids], notes
+
+    def _final_cap(self, v: AllocVenue, plan: Plan, current: dict[str, Current], reasons: dict[str, str],
+                   fc: Forecast | None) -> dict[str, Any] | None:
+        """The vol cap on the weights this venue will hold after every rule (buffer, step, veto, exploration floor, drawdown
+        floor, owner locks), every book of the venue counted. Cuts unlocked books in plan (never raises one); a cut to 0
+        switches the book off. Returns what it did for the record, None when no volatility is known at all."""
+        ids = list(current)
+        cov, notes = self._risk_cov(ids, fc)
+        if cov is None:
+            return {"checked": False, "note": "no volatility known for any book: the final vol cap was not checked"}
+        locked = [s for s in ids if current[s].owner_lock or s in plan.skipped_owner_lock]
+        w = {s: float(plan.weights.get(s, current[s].weight)) for s in ids}
+        new, info = M.final_vol_cap(ids, w, cov, locked, self.calc.rules.vol_cap, len(ids))
+        for sid in info["cut"]:
+            plan.weights[sid] = math.floor(new[sid] * 1e4 + 1e-6) / 1e4  # rounded down: never back over the cap
+            if plan.weights[sid] <= 0:
+                plan.enabled[sid] = False
+            reasons[sid] = (f"{reasons.get(sid, '')} -> {plan.weights[sid]:.2f} after the final vol cap ({v.label} at "
+                            f"{info['vol_before'] * 100:.1f}% > {info['vol_cap'] * 100:.0f}%)").strip()
+        info.update({"checked": True, "notes": notes, "locked": locked})
+        if info["infeasible"]:
+            info["note"] = (f"cap infeasible on {v.label}: {info['vol_after'] * 100:.1f}% after cutting every unlocked book as far as "
+                            f"it goes (cap {info['vol_cap'] * 100:.0f}%); the owner-locked books {', '.join(locked) or '(none)'} carry the rest")
+        return info
+
+    @staticmethod
+    def _cap_infeasible(venues: dict[str, dict[str, Any]]) -> str | None:
+        notes = [vr["final_cap"]["note"] for vr in venues.values() if isinstance(vr.get("final_cap"), dict) and vr["final_cap"].get("infeasible")]
+        return "; ".join(notes) or None
 
     def _other_venue(self, v: AllocVenue, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         """One other venue's part of a decision. Anything that goes wrong there (beyond a single write, which _apply keeps
@@ -1442,8 +1541,10 @@ class Allocator:
         reasons = {sid: (self._floor_reason(v, c) if sid in plan.floored
                          else held if sid not in covered else (calc_out["reasons"][sid] if calc_out else why))
                    for sid, c in current.items()}
-        # a held strategy (no decision covers it) is not written at all; only the drawdown floor may still cut it
-        writable = {s: c for s, c in current.items() if s in covered or s in plan.floored}
+        final_cap = self._final_cap(v, plan, current, reasons, fc) if kind != "refresh" else None
+        cap_cut = set(final_cap.get("cut") or []) if final_cap else set()
+        # a held strategy (no decision covers it) is not written at all; only the drawdown floor and the final vol cap may cut it
+        writable = {s: c for s, c in current.items() if s in covered or s in plan.floored or s in cap_cut}
         failed: dict[str, str] = {}
         applied = (self._apply(plan, writable, reasons, now_ms, refresh_reasons=kind == "computed", venue=v, errors=failed)
                    if not dry_run and v.managed else {})
@@ -1452,6 +1553,8 @@ class Allocator:
                  "w_target": {k: round(x, 6) for k, x in calc_out["w_target"].items()}, "steps": calc_out["steps"]} if calc_out else {}
         if failed:
             extra["write_failed"] = failed
+        if final_cap:
+            extra["final_cap"] = final_cap
         return self._venue_record(v, plan, current, reasons, applied, None, extra)
 
     def _explore_floor(self) -> float:
@@ -1745,6 +1848,10 @@ def format_table(rec: dict[str, Any]) -> str:
                      *[("-" if key not in steps or i not in steps[key]["after"] else f"{steps[key]['after'][i]:.2f}") for key, _ in RULE_COLUMNS],
                      f"{rec['w_final'][i]:.2f}"])
     out += _grid(rows)
+    fcap = rec.get("final_cap") or {}
+    if fcap.get("checked"):
+        out += ["", f"final vol cap: {fcap['vol_before'] * 100:.1f}% -> {fcap['vol_after'] * 100:.1f}% (cap {fcap['vol_cap'] * 100:.0f}%)"
+                    + (f", cut {', '.join(fcap['cut'])}" if fcap.get("cut") else "") + (" INFEASIBLE" if fcap.get("infeasible") else "")]
     out += ["", "reasons:", *[f"  {rec['reasons'][i]}" for i in ids if i in (rec.get("reasons") or {})]]
     return "\n".join(out)
 

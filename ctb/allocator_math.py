@@ -15,6 +15,9 @@ weights. This module turns them, together with the decider's probabilities, into
      logged as the shadow.
   4. the rules, in order: vol cap, buffer, step, decider veto, exploration floor, then the drawdown
      floor and owner_lock, which override everything (see apply_rules)
+  5. the final check (final_vol_cap): the vol cap again, on the weights that will actually be held on a venue, every
+     book of it included (owner-locked, held, without a forecast). The buffer, the exploration floor and the locks run
+     after the first cap and can push the portfolio over it; this check only ever cuts, and only unlocked books.
 
 solve_weights, the mean-variance optimiser of the first version (w* = argmax mu'w - gamma/2 w'Sigma w - cost
 term), is kept for the comparison and no longer used for the target.
@@ -224,6 +227,52 @@ def apply_rules(ids: Sequence[str], w_target: Mapping[str, float], w_prev: Mappi
     fl, lk = set(floored), set(locked)
     record("floor_lock", {i: (w_prev[i] if i in lk else (0.0 if i in fl else w[i])) for i in ids})
     return {i: min(1.0, max(0.0, w[i])) for i in ids}, steps
+
+
+def final_vol_cap(ids: Sequence[str], w: Mapping[str, float], cov: Sequence[Sequence[float]], locked: Sequence[str],
+                  vol_cap: float, n: int | None = None) -> tuple[dict[str, float], dict[str, Any]]:
+    """The vol cap on the final holdings of one venue. `ids` is the order of `cov` and covers every book of the venue;
+    `n` is its number of books (the portfolio is their average, as in portfolio_vol_ann). Locked books are fixed; the
+    others are scaled down together by the largest factor f in [0, 1] that brings the portfolio within the cap. Nothing
+    is ever raised. When no f in [0, 1] is enough (the locked books alone are over the cap, say), the unlocked books are
+    cut to the f with the lowest volatility (0 unless they hedge the locked ones) and the result says infeasible.
+    Returns (weights, info): info has vol_before, vol_after, factor, cut (ids changed) and infeasible."""
+    n = n or len(ids)
+    lk = set(locked)
+    x = [max(0.0, float(w[i])) for i in ids]
+    u = [0.0 if i in lk else v for i, v in zip(ids, x)]   # the part that may move
+    l = [v if i in lk else 0.0 for i, v in zip(ids, x)]   # the part that may not
+    m = len(ids)
+
+    def quad(a: Sequence[float], b: Sequence[float]) -> float:
+        return sum(a[r] * cov[r][c] * b[c] for r in range(m) for c in range(m))
+
+    def vol(f: float) -> float:
+        return portfolio_vol_ann([lv + f * uv for lv, uv in zip(l, u)], cov, n)
+
+    before = vol(1.0)
+    info: dict[str, Any] = {"vol_before": round(before, 6), "vol_after": round(before, 6), "factor": 1.0, "cut": [], "infeasible": False,
+                            "vol_cap": vol_cap}
+    if before <= vol_cap + 1e-12 or not any(u):
+        info["infeasible"] = before > vol_cap + 1e-12
+        return {i: v for i, v in zip(ids, x)}, info
+    # 365 (a f^2 + 2 b f + c) / n^2 <= cap^2: the largest root in [0, 1], else the minimum of the parabola in [0, 1]
+    a, b, c = quad(u, u), quad(u, l), quad(l, l)
+    q = vol_cap ** 2 * n ** 2 / DAYS
+    disc = b * b - a * (c - q)
+    f = None
+    if a > 0 and disc >= 0:
+        hi = (-b + math.sqrt(disc)) / a
+        lo = (-b - math.sqrt(disc)) / a
+        if hi >= 0 and lo <= 1:
+            f = min(1.0, hi)
+    if f is None:
+        f = min(1.0, max(0.0, -b / a)) if a > 0 else 0.0
+        info["infeasible"] = True
+    f = max(0.0, min(1.0, f))
+    out = {i: (lv + f * uv) for i, lv, uv in zip(ids, l, u)}
+    info.update({"vol_after": round(vol(f), 6), "factor": round(f, 6), "cut": [i for i, uv in zip(ids, u) if uv > 0 and f < 1.0]})
+    return out, info
 
 
 # ---------------------------------------------------------------------------------- text
