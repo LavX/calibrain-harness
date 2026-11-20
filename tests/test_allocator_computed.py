@@ -6,12 +6,14 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from ctb import allocator as A
 from ctb import allocator_math as M
+from ctb.config import Settings
 from ctb.kairos.client import KairosError, KairosResult, RateBudget
 
 DAY = 86_400
@@ -87,6 +89,8 @@ def root(tmp_path):
 
 
 def make(root, llm=None, clock=None, **kw):
+    # these tests pin the math with one or a few decider answers; the age and minimum-count rules have their own tests
+    kw.setdefault("calc", replace(A.Calc.from_settings(Settings()), p_min_fresh=1))
     return A.Allocator(root, llm or FakeDecider(answers({i: 0.5 for i in IDS})), market, model="ordecide / test", clock=clock or Clock(T0),
                        budget=RateBudget(50), **kw)
 
@@ -160,7 +164,8 @@ def test_forecast_weights_come_from_the_file_and_the_ledger_when_absent(root):
 
 
 def test_decider_probability_is_the_mean_of_its_last_24_answers_and_vetoes(root):
-    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": [[1, 0.2]] * 30, "carry": [[1, 0.9]] * 3}})
+    t = int(T0 * 1000) - 3600_000  # an hour ago: fresh
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": [[t, 0.2]] * 30, "carry": [[t, 0.9]] * 3}})
     # the model now says 0.6 for trend: history is cut to the last 24 (0.2 x 23) plus the new answer
     a = make(root, FakeDecider(answers({"carry": 0.9, "trend": 0.6, "xsmom": 0.5})))
     rec = decide(a, trigger="decide_now")
@@ -172,6 +177,39 @@ def test_decider_probability_is_the_mean_of_its_last_24_answers_and_vetoes(root)
     assert rec["w_final"]["trend"] <= 0.1 + 1e-9 and "trend" in rec["steps"][3]["changed"] + ["trend"]
     stored = json.loads((root / "allocator" / "state.json").read_text())["p_hist"]["trend"]
     assert len(stored) == 24 and stored[-1][1] == 0.6
+
+
+def _hist(*runs):
+    """p_hist rows: (count, p, hours ago), oldest first."""
+    now = int(T0 * 1000)
+    return [[now - h * 3600_000, p] for n, p, h in runs for _ in range(n)]
+
+
+def test_decider_answers_older_than_36_h_do_not_count_in_p(root):
+    """20 answers of 0.2 from two days ago and 12 of 0.6 from the last hours: the old ones used to pull p under 0.40 and
+    halve trend; now only the fresh ones count and the veto does not fire."""
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": _hist((20, 0.2, 48), (12, 0.6, 2))}})
+    a = make(root, FakeDecider(answers({"carry": 0.5, "trend": 0.6, "xsmom": 0.5})), calc=A.Calc.from_settings(Settings()))
+    rec = decide(a, trigger="decide_now")
+    assert rec["p_decider"]["trend"] == pytest.approx(0.6) and rec["p_fresh_n"]["trend"] == 13
+    assert "trend" not in next(st for st in rec["steps"] if st["step"] == "veto")["changed"] and rec["w_final"]["trend"] > 0.4
+
+
+def test_too_few_fresh_answers_hold_the_veto_off_and_the_feed_says_so(root):
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": _hist((24, 0.2, 40))}})
+    a = make(root, FakeDecider(answers({"carry": 0.5, "trend": 0.2, "xsmom": 0.5})), calc=A.Calc.from_settings(Settings()))
+    rec = decide(a, trigger="decide_now")
+    assert rec["p_decider"]["trend"] is None and rec["p_fresh_n"]["trend"] == 1 and rec["p_too_few"] == ["carry", "trend", "xsmom"]
+    assert "decider" not in rec["mu"]["trend"] and rec["w_final"]["trend"] > 0.4  # no veto: the core steps up from 0.2
+    assert "fewer than 12: no p, the veto holds off" in rec["reasons"]["trend"] and "fewer than 12" in ctl(root, "trend")["reason"]
+
+
+def test_enough_fresh_low_answers_still_veto(root):
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": _hist((23, 0.2, 3))}})
+    a = make(root, FakeDecider(answers({"carry": 0.5, "trend": 0.2, "xsmom": 0.5})), calc=A.Calc.from_settings(Settings()))
+    rec = decide(a, trigger="decide_now")
+    assert rec["p_decider"]["trend"] == pytest.approx(0.2) and rec["p_fresh_n"]["trend"] == 24
+    assert "trend" in next(st for st in rec["steps"] if st["step"] == "veto")["changed"] and rec["w_final"]["trend"] <= 0.1 + 1e-9
 
 
 def test_hourly_tick_only_refreshes_the_decider(root):

@@ -10,7 +10,7 @@ answers one JSON allocation directly.
 
 Computed weights (ctb/allocator_math.py): when <root>/forecast/latest.json exists (written daily by the
 prediction layer) the decider is only one forecaster. It is still asked every hour, p is the mean of its
-last 24 answers, and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: core plus tilt (the
+last 24 answers from the last 36 h (none with fewer than 12 such answers: no veto then), and the weights are SET once a day at 23:50 UTC and on DECIDE NOW: core plus tilt (the
 static inverse-volatility mix, tilted by at most +-T by each strategy's forecast Sharpe, with the tilt room kappa 0 until
 the shadow tilt has earned it, so live weights start as the core), then the vol cap,
 buffer, step, decider veto, exploration floor, the drawdown floor and owner_lock. A forecast that is missing, unreadable
@@ -388,6 +388,8 @@ class Calc:
     sharpe_cap: float = 1.5
     decider_k: float = 0.8
     p_window: int = 24
+    p_max_age_h: float = 36.0   # an answer older than this does not count in p
+    p_min_fresh: int = 12       # with fewer fresh answers p is None: the veto does not fire, the decider is no forecaster
     stale_h: float = 36.0
     weights_utc: tuple[int, int] = (23, 50)
     rules: M.RuleParams = M.RuleParams()
@@ -409,7 +411,8 @@ class Calc:
             floor = 0.0
         return Calc(gamma=s.allocator_gamma, horizon_days=s.allocator_horizon_days, cost_bp=s.allocator_cost_bp,
                     carry_cost_bp=s.allocator_carry_cost_bp, sharpe_cap=s.allocator_sharpe_cap, decider_k=s.allocator_decider_k,
-                    p_window=max(1, s.allocator_p_window), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
+                    p_window=max(1, s.allocator_p_window), p_max_age_h=s.allocator_p_max_age_h,
+                    p_min_fresh=max(1, s.allocator_p_min_fresh), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
                     rules=M.RuleParams(vol_cap=s.allocator_vol_cap, buffer=s.allocator_buffer, step_up=s.allocator_step_up,
                                        veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, explore_floor=floor),
                     tilt=M.TiltParams(sr_full=s.allocator_tilt_sr_full, t_max=s.allocator_tilt_max),
@@ -817,16 +820,34 @@ class Allocator:
             hist[sid] = hist[sid][-self.calc.p_window:]
         self._dirty = True
 
-    def p_means(self, ids: list[str], extra: dict[str, float] | None = None) -> dict[str, float | None]:
-        """p per strategy: the mean of the decider's last p_window answers (`extra`: one more, not stored, for dry runs)."""
+    def p_means(self, ids: list[str], extra: dict[str, float] | None = None, now_ms: int | None = None) -> dict[str, float | None]:
+        """p per strategy: the mean of the decider's last p_window answers that are at most p_max_age_h old (`extra`: one
+        more at now, not stored, for dry runs). None when fewer than p_min_fresh such answers exist: then the veto does not
+        fire and the decider is not a forecaster for that strategy (see p_fresh for the counts)."""
+        return {sid: v for sid, (v, _) in self.p_fresh(ids, extra, now_ms).items()}
+
+    def p_fresh(self, ids: list[str], extra: dict[str, float] | None = None, now_ms: int | None = None) -> dict[str, tuple[float | None, int]]:
+        """Per strategy (p, number of fresh answers it is the mean of)."""
+        now_ms = self.now_ms() if now_ms is None else now_ms
+        oldest = now_ms - self.calc.p_max_age_h * 3_600_000
         hist = self._state()["p_hist"]
-        out: dict[str, float | None] = {}
+        out: dict[str, tuple[float | None, int]] = {}
         for sid in ids:
-            vals = [v for _, v in (hist.get(sid) or [])]
+            vals = [v for t, v in (hist.get(sid) or []) if (_num(t) or 0) >= oldest]
             if extra and sid in extra:
                 vals.append(extra[sid])
-            out[sid] = M.mean_p(vals[-self.calc.p_window:])
+            vals = vals[-self.calc.p_window:]
+            out[sid] = (M.mean_p(vals) if len(vals) >= self.calc.p_min_fresh else None, len(vals))
         return out
+
+    def _p_note(self, fresh: dict[str, tuple[float | None, int]], reasons: dict[str, str]) -> list[str]:
+        """Names the strategies whose p has too few fresh answers in their reason; returns them."""
+        few = [sid for sid, (p, n) in fresh.items() if p is None]
+        for sid in few:
+            if sid in reasons:
+                reasons[sid] += (f" [decider: {fresh[sid][1]} answers in the last {self.calc.p_max_age_h:g} h, fewer than "
+                                 f"{self.calc.p_min_fresh}: no p, the veto holds off]")
+        return few
 
     def weights_due(self, now_ms: int) -> bool:
         """True when the daily weight-setting slot (23:50 UTC) has passed since weights were last set, or never were."""
@@ -1269,7 +1290,8 @@ class Allocator:
             p_new = (extra.get("answers") or {}).get("p") or {}
             if p_new and not dry_run:
                 self._push_p(p_new, now_ms)
-            p_now = self.p_means(ids, p_new if dry_run else None)
+            fresh = self.p_fresh(ids, p_new if dry_run else None, now_ms)
+            p_now = {sid: v for sid, (v, _) in fresh.items()}
             weights_run = trigger != "schedule" or self.weights_due(now_ms)
             calc_out: dict[str, Any] | None = None
             decision: Decision | None = None
@@ -1283,6 +1305,7 @@ class Allocator:
                 kind = "computed"
                 anchored = self._day_anchor(current, now_ms, persist=not dry_run)
                 calc_out = compute_weights(ids, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+                record["p_too_few"] = self._p_note(fresh, calc_out["reasons"])
                 why = " | ".join(calc_out["reasons"][sid] for sid in ids)
                 decision = Decision(dict(calc_out["w_final"]), {sid: current[sid].enabled for sid in ids}, why, None,
                                     derive_enabled=tuple(calc_out["opt"]))
@@ -1317,7 +1340,7 @@ class Allocator:
                 "skipped_paused": [x for x in self._paused_skips if x in applied],
                 "risk_floor": plan.floored if plan else [],
                 "step_limited": next((st["changed"] for st in (calc_out or {}).get("steps", []) if st["step"] == "step"), []),
-                "p_decider": p_now,
+                "p_decider": p_now, "p_fresh_n": {sid: n for sid, (_, n) in fresh.items()},
                 "error": error or fc.error, "dry_run": dry_run,
             })
             if calc_out:
@@ -1532,8 +1555,10 @@ class Allocator:
         decision: Decision | None = None
         if kind == "computed" and covered:
             anchored = self._day_anchor({s: current[s] for s in covered}, now_ms, persist=not dry_run, venue=v)
-            p_now = self.p_means(covered, p_new if dry_run else None)
+            fresh = self.p_fresh(covered, p_new if dry_run else None, now_ms)
+            p_now = {sid: v for sid, (v, _) in fresh.items()}
             calc_out = compute_weights(covered, fc.data or {}, anchored, p_now, self.calc, regime_text(self.root), self.dd_floor_pct)
+            self._p_note(fresh, calc_out["reasons"])
             decision = Decision({**{s: current[s].weight for s in ids}, **calc_out["w_final"]}, {sid: current[sid].enabled for sid in ids},
                                 " | ".join(calc_out["reasons"][sid] for sid in covered), None, derive_enabled=tuple(calc_out["opt"]))
         plan = resolve(current, decision, max_step=1.0, dd_floor_pct=self.dd_floor_pct)

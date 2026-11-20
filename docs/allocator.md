@@ -98,7 +98,10 @@ Schedule:
 
 Per strategy, a weights run does:
 
-1. `p` = mean of the decider's last 24 answers; `mu_decider = (2p - 1) * 0.8 * sigma_d`.
+1. `p` = mean of the decider's last 24 answers that are at most 36 h old (`CTB_ALLOCATOR_P_MAX_AGE_H`);
+   `mu_decider = (2p - 1) * 0.8 * sigma_d`. With fewer than 12 such answers (`CTB_ALLOCATOR_P_MIN_FRESH`) there is no
+   p: the veto does not fire and the decider is not a forecaster for that strategy. The decision line lists them in
+   `p_too_few` (and `p_fresh_n` per strategy), and the card's reason says so.
 2. Clip every forecast to annual Sharpe +-1.5: `|mu| <= 1.5 sigma_d / sqrt(365)`.
 3. `mu = sum_k W_k mu_k`, `W` from `weights_k` (the decider's weight too). If the file has no row for a
    strategy, or no `decider` key, the ledger's starting weights fill in (base 0.30, regime 0.25, ridge 0.20,
