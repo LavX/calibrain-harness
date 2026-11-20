@@ -634,7 +634,7 @@ class VenueHub:
         for i in res["missing"]:  # listed in strategies.json but no directory: not flagged, so nothing confirms it is flat
             unconfirmed[i] = "no directory under the root, so it was not flagged (the runner has not created it, or it was removed)"
         out = {"ok": not failed and not unconfirmed, "venue": vid, "label": cfg.label, "written": written, "flattening": written,
-               "confirmed": confirmed, "unconfirmed": unconfirmed, "failed": failed,
+               "already_flat": res["already_flat"], "confirmed": confirmed, "unconfirmed": unconfirmed, "failed": failed,
                "allocator_paused": res["allocator_paused"] if vid == self.primary_id else None}
         if failed:
             raise S.StrategyError(500, kill_message(cfg, out), detail=out)
@@ -666,7 +666,12 @@ def kill_preview(cfg: VenueConfig, pres: str, why: str | None, doc: dict, now_ms
         return {"ok": False, "available": False, "why": kill_refusal(cfg, pres, why)}
     if pres != "live":
         return {"ok": False, "available": True, "why": kill_refusal(cfg, pres, why)}
-    bad = {v["id"]: w for v in doc["strategies"] for ok, w in [strategy_liveness(cfg, v, doc["runners"], now_ms)] if not ok}
+    def paused_and_flat(v: dict) -> bool:  # the kill only locks these (nothing to close), so no runner has to confirm them
+        st = v.get("status")
+        return not (v.get("control") or {}).get("enabled") and bool(st) and not st["positions"]
+
+    bad = {v["id"]: w for v in doc["strategies"] if not paused_and_flat(v)
+           for ok, w in [strategy_liveness(cfg, v, doc["runners"], now_ms)] if not ok}
     bad.update({v["id"]: "no directory, it would not be flagged" for v in doc["strategies"] if not (cfg.root / v["id"]).is_dir()})
     if not bad:
         return {"ok": True, "available": True, "why": None}
@@ -681,8 +686,9 @@ def kill_message(cfg: VenueConfig, out: dict) -> str:
         return (f"{cfg.label} KILL partially written: could not write {fails}. Written (paused, owner-locked, flatten "
                 f"requested{alloc}): {written}. Fix the file permissions and kill again.")
     why = "; ".join(f"{k} ({v})" for k, v in out["unconfirmed"].items())  # includes strategies not flagged (no directory)
+    flat = f" Already flat and paused (only locked): {', '.join(out['already_flat'])}." if out.get("already_flat") else ""
     return (f"{cfg.label} KILL written, NOT confirmed: {why}. The flags are on disk for {written} (paused, owner-locked, "
-            f"flatten requested{alloc}); nothing closes until the runner reads them. Confirmed: {', '.join(out['confirmed']) or 'none'}.")
+            f"flatten requested{alloc}); nothing closes until the runner reads them. Confirmed: {', '.join(out['confirmed']) or 'none'}.{flat}")
 
 
 def kill_refusal(cfg: VenueConfig, pres: str, why: str | None) -> str:

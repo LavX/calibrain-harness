@@ -221,7 +221,8 @@ def test_a_stopped_unit_of_one_strategy_raises_an_alert(roots, tmp_path):
     downs = {a["strategy"]: a for a in out["alerts"] if a["kind"] == "unit_down" and a["venue"] == "bybit-demo"}
     assert sorted(downs) == ["trend", "xsmom"] and "calibrain-live@trend.service" in downs["trend"]["text"]
     k = out["venues"][0]["kill"]  # the preview agrees with what KILL would answer: not confirmable for trend and xsmom
-    assert k["available"] is True and k["ok"] is False and "trend" in k["why"] and "xsmom" in k["why"]
+    assert k["available"] is True and k["ok"] is False and "xsmom" in k["why"]
+    assert "trend" not in k["why"]  # paused and flat: the kill only locks it, no runner has to confirm anything
 
 
 def test_unit_times_come_as_unix_seconds_with_a_fallback():
@@ -312,8 +313,8 @@ def test_kill_liveness_is_per_strategy_when_units_are(roots, tmp_path):
     with pytest.raises(st.StrategyError) as e:
         run(h.kill("bybit-demo"))
     d = e.value.detail
-    assert d["confirmed"] == ["carry"] and sorted(d["unconfirmed"]) == ["trend", "xsmom"]
-    assert "calibrain-live@trend.service is inactive" in d["unconfirmed"]["trend"] and "Confirmed: carry" in e.value.message
+    assert d["confirmed"] == ["carry"] and sorted(d["unconfirmed"]) == ["xsmom"] and d["already_flat"] == ["trend"]
+    assert "calibrain-live@xsmom.service is inactive" in d["unconfirmed"]["xsmom"] and "Confirmed: carry" in e.value.message
 
 
 def test_a_latched_strategy_is_never_confirmed(roots, tmp_path):
@@ -324,7 +325,7 @@ def test_a_latched_strategy_is_never_confirmed(roots, tmp_path):
     with pytest.raises(st.StrategyError) as e:
         run(h.kill("bybit-demo"))
     d = e.value.detail
-    assert e.value.status == 409 and sorted(d["confirmed"]) == ["carry", "trend"] and "latched" in d["unconfirmed"]["xsmom"]
+    assert e.value.status == 409 and d["confirmed"] == ["carry"] and d["already_flat"] == ["trend"] and "latched" in d["unconfirmed"]["xsmom"]
     assert "flatten runs after the reset" in e.value.message and ctl(roots[0], "xsmom")["flatten"] is True  # written all the same
     set_status(roots[0], "xsmom", positions=[{"symbol": "SOLUSDT", "side": "long", "qty": 1, "entry_price": 1, "mark_price": 1,
                                               "upnl_usdt": 0.0, "market": "linear"}])
@@ -413,6 +414,8 @@ def test_an_enable_racing_a_kill_does_not_switch_on_over_it(roots, tmp_path):
 
 def test_manual_header_switch_does_not_cancel_a_pending_kill(roots, tmp_path):
     sd = FakeSystemd(active=BYBIT_UNITS)
+    set_status(roots[0], "trend", positions=[{"symbol": "ETHUSDT", "side": "long", "qty": 1, "entry_price": 1, "mark_price": 1,
+                                              "upnl_usdt": 0.0, "market": "linear"}])  # trend holds something: its kill has work
     h = hub(roots, sd, tmp_path)
     run(h.kill("bybit-demo"))
     svc = h.primary  # MANUAL in the test hub
@@ -744,8 +747,9 @@ def test_routes_aliases_and_kill_refusal(roots, tmp_path, monkeypatch):
             # kill: bybit's runner is down, so its flags are written but not confirmed (409 with the detail); OKX confirms
             r = await c.post("/api/venues/bybit-demo/kill", json={})
             body = await r.json()
-            assert r.status == 409 and "NOT confirmed" in body["error"] and sorted(body["written"]) == ["carry", "trend", "xsmom"]
-            assert ctl(roots[0], "trend")["flatten"] is True and alloc_ctl(roots[0])["enabled"] is False
+            assert r.status == 409 and "NOT confirmed" in body["error"] and sorted(body["written"]) == ["carry", "xsmom"]
+            assert body["already_flat"] == ["trend"] and ctl(roots[0], "trend")["flatten"] is False  # paused and flat: only locked
+            assert ctl(roots[0], "carry")["flatten"] is True and alloc_ctl(roots[0])["enabled"] is False
             r = await c.post("/api/kill", json={})  # the old alias answers the same way and says the bot's auto-trade is off
             body = await r.json()
             assert r.status == 409 and body["bot_auto_trade"] == "off"
@@ -866,3 +870,32 @@ def test_a_decision_in_flight_does_not_switch_strategies_back_on_after_a_pause(r
     assert {sid: ctl(bybit, sid)["enabled"] for sid in ("carry", "trend", "xsmom")} == {"carry": False, "trend": False, "xsmom": False}
     last = json.loads((bybit / "allocator" / "decisions.jsonl").read_text().splitlines()[-1])
     assert sorted(last["skipped_paused"]) == ["carry", "trend", "xsmom"]  # the feed says why nothing was applied
+
+
+def test_bot_mode_kill_all_then_back_to_manual_and_auto_trade_works(roots, tmp_path):
+    """PER-SYMBOL BOT pauses the bybit strategies and stops their runner (they share the bot's account). KILL ALL there must not
+    leave flags nobody clears: back in MANUAL, AUTO-TRADE on works."""
+    bybit = roots[0]
+    set_status(bybit, "carry", positions=[])  # set_mode("bot") requires the strategies flat
+    sd = FakeSystemd(active=BYBIT_UNITS)
+    h = hub(roots, sd, tmp_path)
+    svc = h.primary
+    run(svc.set_mode("bot", venue="demo", bot_open=False))
+    assert not sd.active & set(BYBIT_UNITS)  # the runner is stopped
+    out = run(h.kill_all())
+    by = {r["venue"]: r for r in out["venues"]}
+    assert by["bybit-demo"]["ok"] is True and sorted(by["bybit-demo"]["already_flat"]) == ["carry", "trend", "xsmom"]
+    assert all(ctl(bybit, i).get("flatten") is not True and ctl(bybit, i)["owner_lock"] is True for i in ("carry", "trend", "xsmom"))
+    run(svc.set_mode("manual", venue="demo", bot_open=False))
+    run(svc.auto(True, None, llm_trading=False, venue="demo"))
+    assert all(ctl(bybit, i)["enabled"] is True for i in ("carry", "trend", "xsmom"))
+
+
+def test_enable_clears_a_stale_flag_on_a_flat_book_without_cancel(roots, tmp_path):
+    okx = roots[1]
+    c = ctl(okx, "longvol")  # longvol is flat
+    (okx / "longvol" / "control.json").write_text(json.dumps({**c, "enabled": False, "flatten": True}))
+    h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
+    run(h.service("okx-demo").act("longvol", "enable", llm_trading=False, venue="demo"))  # no cancel_kill needed: nothing to keep open
+    c = ctl(okx, "longvol")
+    assert c["enabled"] is True and c["flatten"] is False

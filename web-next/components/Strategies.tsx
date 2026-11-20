@@ -103,7 +103,9 @@ export async function headerAuto(doc: StratDoc, on: boolean, venue = "BYBIT·DEM
       ? `Turn AUTO-TRADE on for ${venue}? The LLM allocator will decide which strategies trade there and how much. The strategy runner is started if needed. Other venues are not affected.`
       : `Turn AUTO-TRADE on for ${set.join(", ") || "no strategy"} on ${venue}? The strategy runner is started if needed. Other venues are not affected.`
     : `Turn AUTO-TRADE off for ${venue}? ${doc.mode === "llm" ? "The allocator pauses and every" : "Every"} ${venue} strategy is paused: it places no new orders. Positions stay open (use KILL to close them).`;
-  const pending = on && doc.mode === "manual" ? doc.strategies.filter((s) => set.includes(s.id) && s.control.flatten_pending) : [];
+  // a kill still has something to close only while the book holds positions (a flat book's leftover flag is cleared on enable)
+  const pending = on && doc.mode === "manual"
+    ? doc.strategies.filter((s) => set.includes(s.id) && s.control.flatten_pending && (s.status?.positions.length ?? 1) > 0) : [];
   if (pending.length) {
     if (!confirm(`A kill is pending for ${pending.map((s) => s.name || s.label).join(", ")} on ${venue}. Turning AUTO-TRADE on cancels it for them: if the runner has not started closing yet, their positions will not be closed and they trade from them. Cancel the kill and turn AUTO-TRADE on?`)) return;
   } else if (!confirm(msg)) return;
@@ -166,7 +168,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
   // A pending kill ends when the runner, flat, clears it, or when the owner cancels it here, never as a side effect.
   const cancelTxt = `A kill is pending for ${s.label} on ${venue}${open_n ? ` and ${open_n} positions are still open` : ""}. Cancel the kill? If the runner has not started closing yet, the positions will not be closed.`;
   const flip = (on: boolean) => {
-    if (on && c.flatten_pending) {
+    if (on && c.flatten_pending && open_n > 0) {  // a flat book's leftover flag is cleared by the server on enable: nothing to keep open
       if (confirm(`${cancelTxt} It is then switched on and trades from them.${lockTxt}`)) act("enable", { cancel_kill: true });
       return;
     }
@@ -175,7 +177,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
     act(on ? "enable" : "pause");
   };
   const unlock = () => {
-    if (c.flatten_pending) {
+    if (c.flatten_pending && open_n > 0) {
       if (confirm(`${cancelTxt} It is then handed back to the LLM allocator, which may switch it on.`)) act("unlock", { cancel_kill: true });
       return;
     }

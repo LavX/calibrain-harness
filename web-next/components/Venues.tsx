@@ -82,7 +82,7 @@ export async function killVenue(v: Venue) {
   if (!confirm(killText(v))) return;
   try {
     const r = await post(`/api/venues/${encodeURIComponent(v.id)}/kill`);
-    alert(`${v.label}: confirmed, flattening ${r.flattening.length} strategies (${r.flattening.join(", ")}). Watch the alerts until they are flat.`);
+    alert(`${v.label}: confirmed, flattening ${r.flattening.length} strategies (${r.flattening.join(", ") || "none"})${r.already_flat?.length ? `; already flat and paused, locked: ${r.already_flat.join(", ")}` : ""}. Watch the alerts until they are flat.`);
   } catch (e: any) {
     alert(e.message); // "written, NOT confirmed: ...", "partially written: ..." or "has not started"
   }
@@ -104,7 +104,7 @@ export async function killAll(doc: VenuesDoc | null) {
   if (!confirm(`KILL ALL venues?\n\n${lines.join("\n")}\n\n${botLine}\n\nStrategy positions close through each runner's books.`)) return;
   try {
     const r = await post("/api/kill-all");
-    alert(r.venues.map((x: any) => `${x.label}: ${x.ok ? `confirmed, flattening ${x.flattening.join(", ")}` : x.skipped && /has not started/.test(x.error) ? "not started, skipped" : x.error}`).join("\n")
+    alert(r.venues.map((x: any) => `${x.label}: ${x.ok ? `confirmed, flattening ${x.flattening.join(", ") || "none"}${x.already_flat?.length ? `; already flat and paused: ${x.already_flat.join(", ")}` : ""}` : x.skipped && /has not started/.test(x.error) ? "not started, skipped" : x.error}`).join("\n")
       + `\n\n${r.bot?.why || "per-symbol bot"} (AUTO-TRADE off).`);
   } catch (e: any) {
     alert(e.message);
