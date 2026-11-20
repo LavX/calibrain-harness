@@ -99,7 +99,9 @@ write the owner lock, a pending kill and the allocator's pause (only risk-reduci
 AUTO-TRADE switch and the mode apply to every allocator venue: OFF pauses their strategies, ON in LLM DECIDES starts
 their runners (ON in MANUAL switches only the bybit-demo header set). KILL stays per venue. F7's HAND TO ALLOCATOR
 (`POST /api/venues/{vid}/hand-to-allocator`, body `{"cancel_kill": true}` to cancel pending kills) clears the owner
-locks on a venue's strategies so the allocator decides them at its next weights run.
+locks on a venue's strategies so the allocator decides them at its next weights run. A strategy without an owner lock
+is the allocator's from its first tick (the drawdown floor can cut it at once); see docs/allocator.md "Venues" for the
+step from the day anchor and the vol cap, which uses bybit-demo's forecast for every venue (an approximation elsewhere).
 
 bybit-demo must be listed: the allocator, the predictions panel and the per-symbol bot's guard stay bound to it, and
 `/api/strategies` (and its actions) are aliases of `/api/venues/bybit-demo/...`. Unset, the dashboard has one venue,

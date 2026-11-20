@@ -203,7 +203,7 @@ function Card({ s, doc, inSet, toggleSet }: { s: Strat; doc: StratDoc; inSet: bo
         <span className="ph-r" data-tip={s.label}>{venue} · {s.unit || "no unit"}{s.account ? ` · account ${s.account}` : ""}</span></div>
       <div className="pb">
         <div className="strat-actions">
-          <label className="arm" data-tip={`Auto trade: on = the runner places this strategy's orders on ${venue}, off = it stops placing new orders and keeps its positions open.${doc.allocator_venue ? " Flipping it by hand locks it against the LLM allocator." : ""}`}>
+          <label className="arm" data-tip={`Auto trade: on = the runner places this strategy's orders on ${venue}, off = it stops placing new orders and keeps its positions open.${byAllocator ? " Flipping it by hand locks it against the LLM allocator." : ""}`}>
             <input type="checkbox" checked={c.enabled} disabled={busy || mode === "bot"} onChange={(e) => flip(e.target.checked)} />
             <span className="arm-box" /><span>AUTO TRADE</span>
           </label>
@@ -341,10 +341,12 @@ function AllocatorPanel({ doc }: { doc: StratDoc }) {
             <thead><tr><th>Time</th><th>Weights · {doc.venue_label}</th><th>Other venues</th><th>Reasoning</th></tr></thead>
             <tbody>{a.decisions.map((d) => (
               <tr key={d.t_ms}><td>{dt(d.t_ms / 1000)}</td>
-                <td className="wrap">{Object.entries(d.weights || {}).map(([id, w]) => (
+                <td className="wrap">{d.venue && d.venue !== doc.venue_id ? <span className="muted">see {d.venue_label}</span> : Object.entries(d.weights || {}).map(([id, w]) => (
                   <div key={id}><span className="amb" data-tip={id}>{names.get(id) || id}</span> {fx(w, 2)}{d.enabled?.[id] === false ? " (off)" : ""}{d.skipped_owner_lock?.includes(id) ? " (owner lock, not applied)" : ""}{d.skipped_kill_pending?.includes(id) ? " (kill pending, not switched on)" : ""}{d.skipped_paused?.includes(id) ? " (allocator paused during the decision, not applied)" : ""}</div>
                 ))}</td>
-                <td className="wrap">{d.venue_label && <div className="amb">{d.venue_label}</div>}<VenueLines d={d} names={names} primary={doc.venue_id} /></td>
+                <td className="wrap">{d.venue && d.venue !== doc.venue_id && (
+                  <div><span className="amb">{d.venue_label}:</span> {Object.entries(d.weights || {}).filter(([id]) => d.risk_floor?.includes(id)).map(([id, w]) => `${names.get(id) || id} ${fx(w, 2)}`).join(", ")} <span className="muted">(risk floor)</span></div>
+                )}<VenueLines d={d} names={names} primary={doc.venue_id} /></td>
                 <td className="wrap">{d.error && <div className="dn">failed: {d.error}</div>}{d.risk_floor?.length ? <div className="amb">risk floor: {d.risk_floor.join(", ")}</div> : null}{d.reasoning}<span className="muted"> {d.trigger ? `(${d.trigger})` : ""}</span></td></tr>
             ))}</tbody>
           </table>

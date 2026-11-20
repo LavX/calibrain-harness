@@ -38,6 +38,17 @@ migrated on load: their keys become `bybit-demo/<id>`, values unchanged; `keys_v
 (`p_hist`) stay per strategy. A decision line keeps bybit-demo's fields at the top level and adds `venues`: per venue the
 weights, what was written, and the owner-lock, kill-pending, paused and risk-floor skips. A risk-floor line names its venue.
 
+Things to know before handing a venue over:
+- A venue's control.json without `owner_lock` is the allocator's from its first tick: the drawdown floor (every tick,
+  30 s, also while the allocator is paused) can cut a book more than 15% below its peak at once.
+- HAND TO ALLOCATOR keeps the current enabled and weight; the next weights run (DECIDE NOW, or 23:50 UTC) sets them. The
+  day anchor is the weight at that day's first weights run, so a cut lands at once and an increase is capped at +0.25 per
+  day from the anchor (computed mode; the decider-only fallback steps at most 0.5 per decision).
+- The vol cap of every venue is computed from bybit-demo's forecast (sigma and covariance of Bybit's return series) over
+  that venue's strategies. For another exchange it is an approximation: its fills, symbols and margin currency differ.
+- The drawdown floor keeps running while the allocator is paused (AUTO-TRADE OFF, MANUAL, PER-SYMBOL BOT, a bybit-demo
+  KILL): pausing stops decisions, not the floor on books that are still open.
+
 ## Rules enforced in code
 
 - A weight moves at most 0.5 per decision.

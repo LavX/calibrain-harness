@@ -203,13 +203,48 @@ def test_old_state_keys_are_migrated_without_moving_bybit(roots, tmp_path):
 
 def test_score_reads_the_migrated_history(roots):
     bybit, okx = roots
-    legacy_state(bybit)
+    t_dec = int(T0 * 1000) - 25 * 3600_000  # a decision 25 h ago, its 24 h horizon is over
+    put(bybit / "allocator" / "state.json", {"peaks": {"trend": 1100.0},
+                                              "history": {"trend": [[t_dec + 24 * 3600_000, 1050.0]]}})  # legacy key, the outcome sample
+    (bybit / "allocator" / "decisions.jsonl").write_text(json.dumps({
+        "t_ms": t_dec, "qset": "alloc-v1.1", "answers": {"p": {"trend": 0.7}}, "weights": {"trend": 1.0},
+        "inputs": {"strategies": {"trend": {"equity_usdt": 1000.0}}}}) + "\n")
     a = chat_alloc(bybit, okx)
     a._state()
-    a._save_state()
-    state = json.loads((bybit / "allocator" / "state.json").read_text())
-    assert "bybit-demo/trend" in state["history"]
-    assert A.score_decisions(bybit, now_ms=int(T0 * 1000))["pending"] == 0  # reads the new keys without failing
+    a._save_state()  # the migration writes "bybit-demo/trend"
+    assert "bybit-demo/trend" in json.loads((bybit / "allocator" / "state.json").read_text())["history"]
+    out = A.score_decisions(bybit, now_ms=int(T0 * 1000))
+    assert out["strategies"]["trend"]["n"] == 1 and out["strategies"]["trend"]["base_rate"] == 1.0  # labelled from the new key
+
+
+def test_an_old_day_anchor_is_migrated_and_still_limits_the_step(roots, tmp_path):
+    """The computed mode steps up from the day's anchor: a migrated anchor must bind exactly as before."""
+    import shutil
+    import time
+
+    from test_allocator_computed import FakeDecider, answers, forecast
+
+    bybit, okx = roots
+    t = (T0 - T0 % 86_400) + 8 * 3600
+    put(bybit / "forecast" / "latest.json", forecast(t - 7200))
+    for i, w in zip(BYBIT_IDS, (0.5, 0.6, 0.3)):
+        book(bybit, i, weight=w, enabled=True)
+    twin = tmp_path / "twin"
+    shutil.copytree(bybit, twin)
+    day = time.strftime("%Y-%m-%d", time.gmtime(t))
+    anchor = {"carry": 0.1, "trend": 0.1, "xsmom": 0.3}  # this morning's weights: trend may rise to 0.35 at most today
+    put(bybit / "allocator" / "state.json", {"day_anchor": {"day": day, "w": anchor}})
+    put(twin / "allocator" / "state.json", {"keys_version": 2, "primary_venue": "bybit-demo",
+                                             "day_anchor": {"day": day, "w": {f"bybit-demo/{k}": v for k, v in anchor.items()}}})
+
+    def run_on(root, vs=None):
+        a = A.Allocator(root, FakeDecider(answers({i: 0.5 for i in BYBIT_IDS})), market, model="ordecide / test", clock=lambda: t,
+                        budget=RateBudget(50), venues=vs)
+        return decide(a, trigger="decide_now")
+
+    migrated, reference = run_on(bybit, venues(bybit, okx)), run_on(twin)
+    assert migrated["weights"] == reference["weights"]
+    assert migrated["weights"]["trend"] <= 0.1 + 0.25 + 1e-9  # the migrated anchor bound the step (without it: from 0.6)
 
 
 # ---------------------------------------------------------------- the opt-out
