@@ -184,6 +184,48 @@ prints the full table (mu per forecaster in %/yr, p, sigma, previous weight, cor
 after each rule, final, the reasons) and writes nothing. Without a usable forecast file it prints the held table.
 The chat fallback (`CTB_ALLOCATOR_MODEL=llm`) never uses the forecast.
 
+## What is recorded for the evaluation
+
+The allocator records what an honest comparison needs; none of it changes a live weight (a test runs three weights
+runs on two venues with and without the recording and compares every `control.json`). The policies are computed only
+after every venue's live writes, each venue's recording in its own try: a failure (a damaged `policy_state`, a full
+disk, a bug) is logged, named on the venue as `policies_error` and in the decision's `error` and `status.json`
+`last_error` ("evaluation recording failed, live weights unaffected"), and the decision line, `last_weights_ms`, the
+budget and the status are written as always. An unusable `policy_state` restarts the shadows from the live weights
+(`policy_state_reset` on the venue).
+
+- **Paired executable policies.** Every weights run (the 23:50 UTC slot, DECIDE NOW, the CLI, and held runs), per managed
+  venue, the venue's part of the decision line carries
+  `"policies": {"core": {sid: w}, "live": {sid: w}, "tilt": {sid: w}, "core_veto": {sid: w}}` with `t_ms`, `venue` and
+  `policy_state_version`. `live` is what the books hold after the writes: the planned weight where it was written, the
+weight the book already had where it was not (owner-locked, a pending kill, paused meanwhile, a failed write). Every
+policy's weights are exposures: a switched-off book whose status confirms it flat counts 0 (its control may keep a
+weight), one still holding positions keeps its weight; `policy_enabled` beside `policies` says which books are on. `core` is the inverse-vol core without tilt or veto, `tilt` the core
+  with the forecast tilt at kappa 1 and no veto, `core_veto` the core with the decider veto and no tilt. Each shadow
+  policy keeps its own weights and day anchor (`state.json` `policy_state`; the live weights the first time) and goes
+  through the same rules as live: buffer, step from its own anchor, exploration floor, drawdown floor, owner locks (a
+  locked book sits at its live weight in every policy) and the final vol cap. A held run holds them. The same lines,
+  slim, go to `allocator/policies.jsonl` (plus `weights_mode`) for the dashboard.
+- **Decider answers.** Every poll appends one slim line to `allocator/answers.jsonl`: `issued_ms`, `horizon_start_ms`
+  (= `issued_ms`), `maturity_ms` (+24 h), `question_version`, `model`, `p` per strategy, and what the label needs:
+  `venue` (the allocator venue, whose books the question is about), `e0` (each book's equity at the poll), `w0` (the
+  weight it holds after the poll) and `best` (the best-strategy answer). No model input. `python -m ctb.allocator score`
+  reads it, and the decision lines that carry their input only for the time before it existed.
+- **The full model input** stays in `decisions.jsonl` on weights runs, on polls with an error and on every
+  `CTB_ALLOCATOR_FULL_INPUT_EVERY`-th routine poll (default 60); other polls mark `inputs_omitted` and keep `state_bytes`.
+- **Rotation.** At the first line of a new UTC day the allocator renames `decisions.jsonl` to `decisions-<day>.jsonl`
+  in one `os.replace`, under an fcntl lock on `allocator/decisions.lock` that every writer takes (the dashboard's
+  allocator and `python -m ctb.allocator once`), then appends the line; the current file's day is in
+  `allocator/decisions.day`. That rename is all the live path does: no split, no gzip, no read of the file. If it fails
+  it is logged once and shown in `status.json` `last_error` ("decision log rotation failed"), the line goes to the
+  current file anyway and the rename is tried again with the next line. The log from before this existed is renamed
+  once, unsplit, to `decisions-legacy-<first day>-<last day>.jsonl` and never touched again. A nightly
+  `python -m ctb.decision_log compact` (templates `docs/deploy/calibrain-decision-log-compact.service` and `.timer`, not
+  installed for you) gzips dated archives older than 2 days through a synced temp file and a rename, and deletes dated
+  archives older than 90 days; it is safe to rerun and never touches the current file or a legacy archive. Readers
+  (`decision_log.tail`, `decision_log.iter_all`) read legacy, dated (plain before gzipped) and current files in order,
+  skip the unreadable rest of a damaged archive and report it once. With rename only, no line is ever written twice.
+
 ## Model and question set
 
 The decision model decides (default). `CTB_ALLOCATOR_MODEL` is `kairos`, `jev`, `ordecide` or

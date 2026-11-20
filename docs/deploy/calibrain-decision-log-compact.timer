@@ -1,0 +1,11 @@
+# Runs calibrain-decision-log-compact.service once a night, away from the 23:50 UTC weights run. Template, see the .service.
+[Unit]
+Description=Nightly calibrain decision log compaction
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

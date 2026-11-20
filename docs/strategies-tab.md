@@ -58,7 +58,7 @@ attempts and risk-floor actions too.
 ## Predictions panel and scoreboard
 
 Under the allocator panel, from `GET /api/predictions` (read-only, cached 30 s, `ctb/predictions.py`). It reads, under the
-live root: `regime/latest.json`, `forecast/latest.json`, `forecast/scores.json`, `forecast/archive/<day>.json`,
+live root: `regime/latest.json`, `forecast/latest.json`, `forecast/scores.json`, `allocator/policies.jsonl`,
 the newest `allocator/decisions.jsonl` line that carries the `core` breakdown, `returns/<id>.csv`, and each strategy's
 `status.json` and `control.json`. A missing or damaged file blanks only its own section, which then says "not computed yet".
 
@@ -69,10 +69,11 @@ the newest `allocator/decisions.jsonl` line that carries the `core` breakdown, `
 - SCOREBOARD: per strategy and forecaster the loss L and weight W, the decider's Brier score against the base rate and the
   number of days scored, kappa and the 90 and 180-day tilt skill, and the line "tilt live control: off until the shadow tilt
   beats the core over 90 days (n/90 days so far)". Below it live P&L (`status.json`) next to the modelled shadow return of
-  `returns/<id>.csv` from the go-live day (2026-11-19, `CTB_GO_LIVE_DATE` overrides it), at weight 1 and at the live weight,
-  and a chart of the cumulative return of the core book against the shadow-tilted book (full tilt, no rules, no costs, no
-  decider, the series the tilt skill is judged on). The chart needs a forecast archived on or after go-live plus the next
-  day's returns, so it starts empty.
+  `returns/<id>.csv` from the go-live day (2026-11-19, `CTB_GO_LIVE_DATE` overrides it), at weight 1 and at each day's
+  recorded live weight, and a chart of the cumulative return of the recorded policies (core, tilt at kappa 1, live, core
+  with the veto; `allocator/policies.jsonl`). A day's weights are those set by the last weights run of the day before;
+  a day without one is missing, shown as such and left out, never counted at today's weight or as a zero return. The
+  chart starts empty until a recorded day has returns.
 
 ## Venues (several exchanges)
 
@@ -218,6 +219,10 @@ cp docs/deploy/calibrain-harness.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now calibrain-harness.service
 systemctl --user status calibrain-harness.service
+# the nightly decision-log compaction (gzip after 2 days, delete after 90), outside the dashboard process:
+cp docs/deploy/calibrain-decision-log-compact.service docs/deploy/calibrain-decision-log-compact.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now calibrain-decision-log-compact.timer
 ```
 
 Open `http://100.96.108.128:8800/` (tailnet) or tunnel with `ssh -L 8800:127.0.0.1:8800 lavx@aurora4` and open

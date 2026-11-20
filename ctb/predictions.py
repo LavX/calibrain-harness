@@ -6,8 +6,9 @@ Strategies tab reads). Nothing here writes a file, calls an exchange or reads a 
   regime/latest.json          the day's state, the 8 features and the 7-day state probabilities (research/live/regime.py)
   forecast/latest.json        sigma and mu per forecaster per strategy, kappa (research/live/forecast.py run)
   forecast/scores.json        L and W per forecaster, the decider's Brier score, tilt_skill and kappa (forecast.py score)
-  forecast/archive/<day>.json the forecast as it stood on each day, for the shadow chart
   allocator/decisions.jsonl   the newest weights line carries core, sr, tau, shadow_tau, mu_ann_pct, p_decider, reasons
+  allocator/policies.jsonl    the paired policies (core, live, tilt, core_veto) of every weights run: each day's own weights
+                              for the P&L and history comparisons (never today's weight applied backwards)
   returns/<id>.csv            the strategy's modelled daily net return at weight 1 (research/live/backtest.py)
   <id>/status.json, control.json   live P&L and the live weight
 
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import allocator_math as M
+from . import decision_log as DL
 from .strategies import live_root, load_registry, read_json
 
 GO_LIVE = os.environ.get("CTB_GO_LIVE_DATE") or "2026-11-19"  # the first day the live book trades; P&L comparisons start here
@@ -93,6 +95,40 @@ def read_last_with(path: Path, key: str, max_bytes: int = DECISIONS_READ_BYTES) 
             continue
         if isinstance(rec, dict) and rec.get(key):  # a non-empty value: a "held" line has an empty core
             return rec
+    return None
+
+
+_ARCHIVE_HITS: dict[tuple[str, str], tuple[int, int, dict | None]] = {}  # (archive, key) -> (mtime_ns, size, newest match)
+
+
+def _newest_in(path: Path, key: str) -> dict | None:
+    """The newest line of a whole (possibly gzipped) archive with a non-empty `key`, remembered per file version: an
+    archive no longer changes once written, so it is read once."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    hit = _ARCHIVE_HITS.get((str(path), key))
+    if hit and hit[:2] == (st.st_mtime_ns, st.st_size):
+        return hit[2]
+    found = None
+    for rec in DL._lines(path):  # a damaged archive yields what is readable
+        if rec.get(key):
+            found = rec
+    _ARCHIVE_HITS[(str(path), key)] = (st.st_mtime_ns, st.st_size, found)
+    return found
+
+
+def newest_with(alloc: Path, key: str) -> dict | None:
+    """The newest decision line with a non-empty `key`: the end of the current decisions.jsonl, else the file being split
+    and the archives, newest first, compressed ones too (days of held runs can push the last weights line far back)."""
+    line = read_last_with(alloc / DL.LOG, key)
+    if line is not None:
+        return line
+    for path in DL._newest_first(alloc)[1:]:
+        line = _newest_in(path, key)
+        if line is not None:
+            return line
     return None
 
 
@@ -227,9 +263,38 @@ def compound_pct(rets: list[float]) -> float:
     return (g - 1.0) * 100.0
 
 
-def pnl_section(ids: list[str], labels: dict[str, str], root: Path, go_live: str) -> list[dict]:
+def policy_days(root: Path, venue: str | None = None) -> dict[str, dict[str, dict[str, float]]]:
+    """{day: {policy: {sid: weight}}}: the weights each policy held on each UTC day, from allocator/policies.jsonl. A day's
+    weights are those of the last weights run during the day before it (the 23:50 slot, or a DECIDE NOW); a day with no
+    weights run the day before has no entry: it is missing, never weight 0. `venue` is the allocator venue by default."""
+    venue = venue or ((read_json(root / "allocator" / "state.json") or {}).get("primary_venue") or "bybit-demo")
+    lines = []
+    try:
+        with open(root / "allocator" / "policies.jsonl") as f:
+            for raw in f:
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("venue") == venue and isinstance(rec.get("policies"), dict) and _num(rec.get("t_ms")) is not None:
+                    lines.append(rec)
+    except OSError:
+        return {}
+    out: dict[str, dict[str, dict[str, float]]] = {}
+    for rec in sorted(lines, key=lambda r: r["t_ms"]):
+        start = int(rec["t_ms"]) // 86_400_000 * 86_400_000
+        governed = date.fromordinal(date(1970, 1, 1).toordinal() + start // 86_400_000 + 1).isoformat()
+        out[governed] = {k: {sid: float(w) for sid, w in v.items() if _num(w) is not None}
+                         for k, v in rec["policies"].items() if isinstance(v, dict)}
+    return out
+
+
+def pnl_section(ids: list[str], labels: dict[str, str], root: Path, go_live: str,
+                by_day: dict[str, dict[str, dict[str, float]]] | None = None) -> list[dict]:
     """Live P&L (status.json, since the book started) next to the modelled shadow return of returns/<id>.csv from the go-live day.
-    The shadow is at weight 1 and ends at yesterday's close; the live book runs at its weight up to now."""
+    The shadow is at weight 1 and ends at yesterday's close; the live book runs at its weight up to now. The weighted shadow
+    uses each day's recorded live weight (policy_days); a day without one is missing and left out, counted in missing_days."""
+    by_day = policy_days(root) if by_day is None else by_day
     out = []
     for sid in ids:
         st = read_json(root / sid / "status.json") or {}
@@ -237,88 +302,50 @@ def pnl_section(ids: list[str], labels: dict[str, str], root: Path, go_live: str
         rets = read_returns(root / "returns" / f"{sid}.csv")
         days = sorted(d for d in rets if d >= go_live)
         shadow = compound_pct([rets[d] for d in days]) if days else None
-        w = _num(ctl.get("weight"))
+        recorded = [(d, by_day[d]["live"][sid]) for d in days if sid in ((by_day.get(d) or {}).get("live") or {})]
         out.append({"id": sid, "label": labels.get(sid, sid), "live_pnl_pct": _r(_num(st.get("pnl_pct")), 3),
                     "live_pnl_usdt": _r(_num(st.get("pnl_usdt")), 2), "shadow_pct": _r(shadow, 3),
-                    "shadow_weighted_pct": _r(compound_pct([rets[d] * w for d in days]), 3) if days and w is not None else None,
-                    "weight": _r(w, 3), "days": len(days), "last_day": days[-1] if days else None})
+                    "shadow_weighted_pct": _r(compound_pct([rets[d] * w for d, w in recorded]), 3) if recorded else None,
+                    "weighted_days": len(recorded), "missing_days": len(days) - len(recorded),
+                    "weight": _r(_num(ctl.get("weight")), 3), "days": len(days), "last_day": days[-1] if days else None})
     return out
 
 
-def load_archive(root: Path) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    d = root / "forecast" / "archive"
-    try:
-        files = sorted(d.glob("*.json"))
-    except OSError:
-        return out
-    for p in files:
-        try:
-            date.fromisoformat(p.stem)
-        except ValueError:
+POLICY_KEYS = (("core", "core_pct"), ("tilt", "tilted_pct"), ("live", "live_pct"), ("core_veto", "core_veto_pct"))
+
+
+def history_section(root: Path, ids: list[str], go_live: str, by_day: dict[str, dict[str, dict[str, float]]] | None = None) -> dict | None:
+    """Cumulative return since go-live of the recorded policies (core, tilt at kappa 1, live, core with the veto), each day at
+    the weights that policy actually held that day (policy_days) and the modelled returns of returns/<id>.csv: the venue's
+    portfolio is the average of its books, sum(w r) / N. A day with no recorded weights, or a weighted book without a
+    return, is missing: listed in missing_days and left out, never counted as a zero return. None until a day is recorded."""
+    by_day = policy_days(root) if by_day is None else by_day
+    # the returns of every strategy a recorded policy ever held, not only today's: a retired one still has its history
+    held = {sid for pol in by_day.values() for w in pol.values() for sid in w}
+    rets = {sid: read_returns(root / "returns" / f"{sid}.csv") for sid in dict.fromkeys([*ids, *sorted(held)])}
+    all_days = sorted({d for r in rets.values() for d in r if d >= go_live} | {d for d in by_day if d >= go_live})
+    growth = {k: 1.0 for k, _ in POLICY_KEYS}
+    days: list[str] = []
+    series: dict[str, list[float | None]] = {out: [] for _, out in POLICY_KEYS}
+    missing: list[str] = []
+    for d in all_days:
+        pol = by_day.get(d)
+        day_r: dict[str, float] = {}
+        for k, _ in POLICY_KEYS:
+            w = (pol or {}).get(k)
+            if not w or any(x > 0 and d not in rets.get(sid, {}) for sid, x in w.items()):
+                break
+            day_r[k] = sum(x * rets[sid][d] for sid, x in w.items() if x > 0) / len(w)
+        if len(day_r) < len(POLICY_KEYS):
+            missing.append(d)
             continue
-        doc = read_json(p)
-        if doc and isinstance(doc.get("strategies"), dict):
-            out[p.stem] = doc
-    return out
-
-
-def tilt_params() -> tuple[M.TiltParams, float]:
-    """The allocator's own constants (CTB_ALLOCATOR_*), at full room for the shadow."""
-    try:
-        from .config import load_settings
-        s = load_settings()
-        return M.TiltParams(sr_full=s.allocator_tilt_sr_full, t_max=s.allocator_tilt_max, kappa=1.0), s.allocator_vol_cap
-    except Exception:  # noqa: BLE001 - a settings problem must not blank the panel
-        return M.TiltParams(kappa=1.0), M.RuleParams().vol_cap
-
-
-def history_section(root: Path, ids: list[str], go_live: str) -> dict | None:
-    """Cumulative return since go-live of the static core book and the shadow-tilted book (full T, kappa 1, no rules, no costs,
-    no decider: the same series the tilt skill is judged on). The forecast made on day d governs day d + 1; only governed days
-    on or after the go-live day count. None when no archived forecast has a returns day yet."""
-    archive = load_archive(root)
-    rets = {sid: read_returns(root / "returns" / f"{sid}.csv") for sid in ids}
-    tilt, vol_cap = tilt_params()
-    days, core_c, tilt_c = [], [], []
-    gc = gt = 1.0
-    for made in sorted(archive):
-        t = date.fromordinal(date.fromisoformat(made).toordinal() + 1).isoformat()
-        if t < go_live:
-            continue
-        doc = archive[made]
-        fs = doc["strategies"]
-        use = [sid for sid in ids if isinstance(fs.get(sid), dict) and (_num(fs[sid].get("sigma_d")) or 0) > 0 and t in rets.get(sid, {})]
-        if not use:
-            continue
-        sigma = [float(fs[sid]["sigma_d"]) for sid in use]
-        cov_in = doc.get("cov_d") if isinstance(doc.get("cov_d"), dict) else {}
-        cids = cov_in.get("ids") if isinstance(cov_in.get("ids"), list) else []
-        mat = cov_in.get("matrix") if isinstance(cov_in.get("matrix"), list) else []
-
-        def cov_ij(a: str, b: str) -> float:
-            try:
-                v = _num(mat[cids.index(a)][cids.index(b)])
-            except (ValueError, IndexError, TypeError):
-                v = None
-            return v if v is not None else (float(fs[a]["sigma_d"]) ** 2 if a == b else 0.0)
-
-        cov = [[cov_ij(a, b) for b in use] for a in use]
-        core = M.core_weights(sigma, cov, vol_cap, len(use))
-        comb = doc.get("mu_combined") if isinstance(doc.get("mu_combined"), dict) else {}
-        mu = [_num(comb.get(sid)) for sid in use]
-        tau = [M.tilt_tau(M.forecast_sharpe(m or 0.0, s), tilt) for m, s in zip(mu, sigma)]
-        target = M.tilted_target(core, tau)
-        r = [rets[sid][t] for sid in use]
-        n = len(use)
-        gc *= 1.0 + sum(c * x for c, x in zip(core, r)) / n
-        gt *= 1.0 + sum(w * x for w, x in zip(target, r)) / n
-        days.append(t)
-        core_c.append(_r((gc - 1.0) * 100.0, 4))
-        tilt_c.append(_r((gt - 1.0) * 100.0, 4))
+        days.append(d)
+        for k, out in POLICY_KEYS:
+            growth[k] *= 1.0 + day_r[k]
+            series[out].append(_r((growth[k] - 1.0) * 100.0, 4))
     if not days:
         return None
-    return {"since": go_live, "days": days, "core_pct": core_c, "tilted_pct": tilt_c}
+    return {"since": go_live, "days": days, **series, "missing_days": missing}
 
 
 # ------------------------------------------------------------------------------------------------ service
@@ -328,13 +355,14 @@ def build(root: Path, now_s: float, go_live: str = GO_LIVE) -> dict[str, Any]:
     regime = read_json(root / "regime" / "latest.json")
     fc = read_json(root / "forecast" / "latest.json")
     scores = read_json(root / "forecast" / "scores.json")
-    line = read_last_with(root / "allocator" / "decisions.jsonl", "core")
+    line = newest_with(root / "allocator", "core")
     ids = list(labels)
     for src in ((fc or {}).get("strategies"), (line or {}).get("core"), (scores or {}).get("loss")):
         if isinstance(src, dict):
             ids += [k for k in src if isinstance(k, str) and k not in ids]
     ids = sorted(dict.fromkeys(ids), key=_order)
     missing = [name for name, doc in (("regime", regime), ("forecast", fc), ("scores", scores), ("allocator", line)) if not doc]
+    by_day = policy_days(root)
     return {
         "generated_at": now_s, "go_live": go_live, "root": str(root),
         "regime": regime_section(regime), "forecast": forecast_section(fc, now_s),
@@ -343,8 +371,8 @@ def build(root: Path, now_s: float, go_live: str = GO_LIVE) -> dict[str, Any]:
                                            "model": line.get("model") if isinstance(line.get("model"), str) else None},
         "strategies": strategy_rows(ids, labels, fc, line, root, scores) if (fc or line) else [],
         "scoreboard": scoreboard_section(scores),
-        "pnl": pnl_section(ids, labels, root, go_live) if ids else [],
-        "history": history_section(root, ids, go_live) if ids else None,
+        "pnl": pnl_section(ids, labels, root, go_live, by_day) if ids else [],
+        "history": history_section(root, ids, go_live, by_day) if ids else None,
         "missing": missing,
     }
 

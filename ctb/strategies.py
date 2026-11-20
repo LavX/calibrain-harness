@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from . import decision_log as DL
 from .config import ROOT
 from .control_lock import locked
 
@@ -616,7 +617,7 @@ class StrategyService:
             except Exception:  # noqa: BLE001 - fall back to the files
                 pass
         d = self.root / ALLOCATOR
-        return clean_allocator(read_json(d / "status.json"), read_json(d / "control.json"), tail_jsonl(d / "decisions.jsonl", FEED_N))
+        return clean_allocator(read_json(d / "status.json"), read_json(d / "control.json"), list(reversed(DL.tail(d, FEED_N))))
 
     def _sample(self, sid: str, now: float, equity: float | None) -> list[list[float]]:
         ring = self._equity.setdefault(sid, deque(maxlen=EQUITY_POINTS))

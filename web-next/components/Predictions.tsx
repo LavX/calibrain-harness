@@ -18,7 +18,7 @@ type Score = {
 };
 type Pnl = {
   id: string; label: string; live_pnl_pct: number | null; live_pnl_usdt: number | null; shadow_pct: number | null; shadow_weighted_pct: number | null;
-  weight: number | null; days: number; last_day: string | null;
+  weighted_days: number; missing_days: number; weight: number | null; days: number; last_day: string | null;
 };
 export type PredDoc = {
   generated_at: number; go_live: string; error?: string; missing: string[];
@@ -31,7 +31,9 @@ export type PredDoc = {
     tilt: { n_days: number; days_needed: number; kappa: number | null; skill_90_ann_pct: number | null; skill_180_ann_pct: number | null; live: boolean; line: string };
   } | null;
   pnl: Pnl[];
-  history: { since: string; days: string[]; core_pct: number[]; tilted_pct: number[] } | null;
+  history: {
+    since: string; days: string[]; core_pct: number[]; tilted_pct: number[]; live_pct: number[]; core_veto_pct: number[]; missing_days: string[];
+  } | null;
 };
 
 const KS = ["base", "regime", "ridge", "structural", "decider"] as const;
@@ -139,29 +141,37 @@ export function PredictionsPanel() {
   );
 }
 
+/** The recorded policies, each at the weights it held that day. Days without a record are missing: listed, not drawn as zero. */
+const SERIES = [
+  { key: "core_pct", label: "core", color: "var(--s1)" },
+  { key: "tilted_pct", label: "tilt (kappa 1)", color: "var(--amber)" },
+  { key: "live_pct", label: "live", color: "var(--s3)" },
+  { key: "core_veto_pct", label: "core + veto", color: "var(--s5)" },
+] as const;
+
 function Chart({ h }: { h: NonNullable<PredDoc["history"]> }) {
   const W = 640, H = 120, P = 6;
-  const all = [0, ...h.core_pct, ...h.tilted_pct];
+  const all = [0, ...SERIES.flatMap((s) => h[s.key])];
   const lo = Math.min(...all), hi = Math.max(...all), span = hi - lo || 1;
   const n = h.days.length;
   const x = (i: number) => (n === 1 ? W / 2 : P + (i / (n - 1)) * (W - 2 * P));
   const y = (v: number) => H - P - ((v - lo) / span) * (H - 2 * P);
   const line = (vs: number[]) => vs.map((v, i) => `${x(i)},${y(v)}`).join(" ");
   const last = (vs: number[]) => vs[vs.length - 1];
+  const miss = h.missing_days.length;
   return (
     <div>
       <svg viewBox={`0 0 ${W} ${H}`} className="pred-chart" role="img"
-        aria-label={`Cumulative return since ${h.since}: core ${pct(last(h.core_pct), 2)}, shadow tilted ${pct(last(h.tilted_pct), 2)}`}>
+        aria-label={`Cumulative return since ${h.since}: ${SERIES.map((s) => `${s.label} ${pct(last(h[s.key]), 2)}`).join(", ")}`}>
         <line x1={0} x2={W} y1={y(0)} y2={y(0)} stroke="var(--line)" strokeDasharray="3 3" />
-        <polyline points={line(h.core_pct)} fill="none" stroke="var(--s1)" strokeWidth={1.5} />
-        <polyline points={line(h.tilted_pct)} fill="none" stroke="var(--amber)" strokeWidth={1.5} />
-        {n === 1 && <><circle cx={x(0)} cy={y(h.core_pct[0])} r={3} fill="var(--s1)" /><circle cx={x(0)} cy={y(h.tilted_pct[0])} r={3} fill="var(--amber)" /></>}
+        {SERIES.map((s) => <polyline key={s.key} points={line(h[s.key])} fill="none" stroke={s.color} strokeWidth={1.5} />)}
+        {n === 1 && SERIES.map((s) => <circle key={s.key} cx={x(0)} cy={y(h[s.key][0])} r={3} fill={s.color} />)}
       </svg>
       <div className="muted pred-legend">
-        <span><i className="sw" style={{ background: "var(--s1)" }} /> core {pct(last(h.core_pct), 2)}</span>
-        <span><i className="sw" style={{ background: "var(--amber)" }} /> shadow tilted {pct(last(h.tilted_pct), 2)}</span>
-        <span>{h.days[0]} to {h.days[n - 1]} · {n} day{n === 1 ? "" : "s"} · scale {pct(lo, 2)} to {pct(hi, 2)}</span>
+        {SERIES.map((s) => <span key={s.key}><i className="sw" style={{ background: s.color }} /> {s.label} {pct(last(h[s.key]), 2)}</span>)}
+        <span>{h.days[0]} to {h.days[n - 1]} · {n} day{n === 1 ? "" : "s"} recorded{miss ? ` · ${miss} missing` : ""} · scale {pct(lo, 2)} to {pct(hi, 2)}</span>
       </div>
+      {miss ? <div className="muted" data-tip={h.missing_days.join(", ")}>Missing (no recorded weights, left out, not counted as zero): {h.missing_days.slice(-5).join(", ")}{miss > 5 ? ` and ${miss - 5} more` : ""}</div> : null}
     </div>
   );
 }
@@ -207,19 +217,21 @@ export function ScoreboardPanel() {
           </div>
         )}
         <div className="ph sub"><span className="code">PNL</span>Demo P&amp;L against the modelled shadow since go-live ({doc.go_live})
-          <span className="ph-r">shadow = returns/&lt;id&gt;.csv, weight 1, to yesterday; live = status.json since the book started</span></div>
+          <span className="ph-r">shadow = returns/&lt;id&gt;.csv to yesterday, at weight 1 and at each day&apos;s recorded live weight; live = status.json since the book started</span></div>
         {doc.pnl.length ? (
           <div className="pred-scroll">
             <table className="t">
               <thead><tr><th>Strategy</th><th className="r">Live P&amp;L</th><th className="r">Live USDT</th><th className="r">Shadow, weight 1</th>
-                <th className="r">Shadow at live w</th><th className="r">Live w</th><th className="r">Shadow days</th></tr></thead>
+                <th className="r" data-tip="Each day at the live weight recorded by the weights run of the day before. A day without a record is missing: left out, never today's weight">Shadow at recorded w</th>
+                <th className="r">Live w now</th><th className="r">Shadow days</th></tr></thead>
               <tbody>{doc.pnl.map((p) => (
                 <tr key={p.id}>
                   <td className="sym" data-tip={p.label}>{p.id}</td>
                   <td className={`r ${ud(p.live_pnl_pct)}`}>{pct(p.live_pnl_pct, 2)}</td>
                   <td className={`r ${ud(p.live_pnl_usdt)}`}>{sg(p.live_pnl_usdt, 2)}</td>
                   <td className={`r ${ud(p.shadow_pct)}`}>{p.days ? pct(p.shadow_pct, 2) : NOT_YET}</td>
-                  <td className={`r ${ud(p.shadow_weighted_pct)}`}>{p.days ? pct(p.shadow_weighted_pct, 2) : NOT_YET}</td>
+                  <td className={`r ${ud(p.shadow_weighted_pct)}`}>{p.weighted_days ? pct(p.shadow_weighted_pct, 2) : p.days ? "no recorded weight" : NOT_YET}
+                    {p.missing_days ? <span className="muted"> ({p.missing_days} missing)</span> : null}</td>
                   <td className="r">{num(p.weight)}</td>
                   <td className="r">{p.days}{p.last_day ? <span className="muted"> to {p.last_day}</span> : null}</td>
                 </tr>
@@ -227,9 +239,9 @@ export function ScoreboardPanel() {
             </table>
           </div>
         ) : <NotYet what="Returns (returns/<id>.csv)" />}
-        <div className="ph sub"><span className="code">HIST</span>Core against shadow tilted, cumulative since go-live
-          <span className="ph-r">full tilt, no rules, no costs, no decider: the series the tilt skill is judged on</span></div>
-        {doc.history ? <Chart h={doc.history} /> : <div className="empty">History: {NOT_YET}. It starts after the first forecast made on or after go-live has a day of returns.</div>}
+        <div className="ph sub"><span className="code">HIST</span>Recorded policies, cumulative since go-live
+          <span className="ph-r">each policy at the weights it held that day (modelled returns at weight 1, no costs); days without a record are missing</span></div>
+        {doc.history ? <Chart h={doc.history} /> : <div className="empty">History: {NOT_YET}. It starts with the first day that has recorded policy weights (allocator/policies.jsonl) and returns.</div>}
       </div>
     </section>
   );

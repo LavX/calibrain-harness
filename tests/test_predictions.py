@@ -82,29 +82,37 @@ def test_live_pnl_against_the_shadow_return_since_go_live(root):
     assert c["days"] == 3 and c["last_day"] == "2026-11-21"
     assert c["shadow_pct"] == pytest.approx(((1.0002 * 0.9999 * 1.0003) - 1) * 100, abs=1e-3)
     assert c["live_pnl_pct"] == 1.125 and c["live_pnl_usdt"] == 112.5 and c["weight"] == 0.6
-    assert c["shadow_weighted_pct"] == pytest.approx(((1 + 0.0002 * 0.6) * (1 - 0.0001 * 0.6) * (1 + 0.0003 * 0.6) - 1) * 100, abs=1e-3)
+    # each day at the live weight recorded the evening before: 11-20 at 0.6, 11-21 at 0.4; 11-19 has no record: missing
+    assert c["shadow_weighted_pct"] == pytest.approx(((1 - 0.0001 * 0.6) * (1 + 0.0003 * 0.4) - 1) * 100, abs=5e-4)  # 3 decimals
+    assert (c["weighted_days"], c["missing_days"]) == (2, 1)
     x = rows["xsmom"]
-    assert x["live_pnl_pct"] is not None and x["weight"] is None and x["shadow_weighted_pct"] is None and x["days"] == 3
+    assert x["live_pnl_pct"] is not None and x["weight"] is None and x["days"] == 3
+    assert x["shadow_weighted_pct"] == pytest.approx(((1 + 0.002 * 0.2) * (1 + 0.005 * 0.2) - 1) * 100, abs=5e-4)
     # an earlier go-live day adds the earlier row
     assert by_id(pr.build(root, NOW, "2026-11-18")["pnl"])["carry"]["days"] == 4
 
 
-def test_history_is_core_against_shadow_tilted_since_go_live(root):
+def test_without_recorded_weights_no_day_is_weighted_with_todays_weight(root):
+    (root / "allocator" / "policies.jsonl").unlink()
+    c = by_id(pr.build(root, NOW, "2026-11-19")["pnl"])["carry"]
+    assert c["weight"] == 0.6 and c["shadow_weighted_pct"] is None and (c["weighted_days"], c["missing_days"]) == (0, 3)
+
+
+def test_history_compares_the_recorded_policies_day_by_day(root):
     h = pr.build(root, NOW, "2026-11-19")["history"]
-    # forecasts made on 11-19 and 11-20 govern 11-20 and 11-21
-    assert h["since"] == "2026-11-19" and h["days"] == ["2026-11-20", "2026-11-21"]
-    assert len(h["core_pct"]) == len(h["tilted_pct"]) == 2
-    assert h["core_pct"][0] != h["tilted_pct"][0]  # the tilt moves the book
-    # recompute the first day by hand from the shared math, with the returns of 2026-11-20
-    S = {"carry": 0.004, "trend": 0.03, "xsmom": 0.035}
-    cov = [[S["carry"] ** 2, 0, 0], [0, S["trend"] ** 2, S["trend"] * S["xsmom"] * 0.3], [0, S["trend"] * S["xsmom"] * 0.3, S["xsmom"] ** 2]]
-    core = M.core_weights(list(S.values()), cov, 0.10, 3)
-    mu = [0.00008, 0.00025, 0.00012]
-    tau = [M.tilt_tau(M.forecast_sharpe(m, s), M.TiltParams(kappa=1.0)) for m, s in zip(mu, S.values())]
-    tgt = M.tilted_target(core, tau)
-    r = [-0.0001, 0.004, 0.002]
-    assert h["core_pct"][0] == pytest.approx((sum(c * x for c, x in zip(core, r)) / 3) * 100, abs=1e-3)
-    assert h["tilted_pct"][0] == pytest.approx((sum(c * x for c, x in zip(tgt, r)) / 3) * 100, abs=1e-3)
+    # the weights runs of 11-19 and 11-20 govern 11-20 and 11-21; 11-19 has no record and is missing, not a zero
+    assert h["since"] == "2026-11-19" and h["days"] == ["2026-11-20", "2026-11-21"] and h["missing_days"] == ["2026-11-19"]
+    r20 = {"carry": -0.0001, "trend": 0.004, "xsmom": 0.002}
+    r21 = {"carry": 0.0003, "trend": -0.002, "xsmom": 0.005}
+    w20 = {"core": {"carry": 0.5, "trend": 0.3, "xsmom": 0.2}, "tilt": {"carry": 0.4, "trend": 0.45, "xsmom": 0.25},
+           "live": {"carry": 0.6, "trend": 0.0, "xsmom": 0.2}, "core_veto": {"carry": 0.5, "trend": 0.15, "xsmom": 0.2}}
+    w21 = {"core": {"carry": 0.5, "trend": 0.35, "xsmom": 0.2}, "tilt": {"carry": 0.35, "trend": 0.5, "xsmom": 0.3},
+           "live": {"carry": 0.4, "trend": 0.1, "xsmom": 0.2}, "core_veto": {"carry": 0.5, "trend": 0.2, "xsmom": 0.2}}
+    for k, out in pr.POLICY_KEYS:
+        d1 = sum(w20[k][s] * r20[s] for s in r20) / 3
+        d2 = sum(w21[k][s] * r21[s] for s in r21) / 3
+        assert h[out] == [pytest.approx(d1 * 100, abs=5e-5), pytest.approx(((1 + d1) * (1 + d2) - 1) * 100, abs=5e-5)]  # 4 decimals
+    assert h["core_pct"][0] != h["tilted_pct"][0]  # the policies differ
 
 
 def test_history_is_null_before_the_first_governed_day(root):
@@ -221,3 +229,19 @@ def test_no_em_dashes_in_the_ui_text():
     for f in [base / "ctb" / "predictions.py", base / "web-next" / "components" / "Predictions.tsx"]:
         if f.exists():
             assert dash not in f.read_text(), f
+
+
+def test_history_keeps_a_retired_strategy_from_its_recorded_weights(root):
+    """basis was held in the recorded policies and has its returns file, but is no longer in the registry, the forecast,
+    the latest weights line or the scores: its days are still computed, not missing."""
+    lines = [json.loads(x) for x in (root / "allocator" / "policies.jsonl").read_text().splitlines()]
+    for rec in lines:
+        if rec["venue"] == "bybit-demo":
+            for w in rec["policies"].values():
+                w["basis"] = 0.2
+    (root / "allocator" / "policies.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (root / "returns" / "basis.csv").write_text("date,ret_net\n2026-11-20,0.01\n2026-11-21,-0.02\n")
+    h = pr.build(root, NOW, "2026-11-19")["history"]
+    assert h["days"] == ["2026-11-20", "2026-11-21"] and h["missing_days"] == ["2026-11-19"]
+    d1 = (0.5 * -0.0001 + 0.3 * 0.004 + 0.2 * 0.002 + 0.2 * 0.01) / 4  # core on 11-20, four books now
+    assert h["core_pct"][0] == pytest.approx(d1 * 100, abs=1e-4)  # stored at 4 decimals
