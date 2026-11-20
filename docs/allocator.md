@@ -216,7 +216,11 @@ weight), one still holding positions keeps its weight; `policy_enabled` beside `
 - **Rotation.** When the first line of a new UTC day is appended, the lines of `decisions.jsonl` move to
   `decisions-<day>.jsonl`, each to the archive of its own UTC day (the log from before rotation, spanning many days, is
   split the same way at the first rotation, before any retention), older archives are gzipped (`decisions-<day>.jsonl.gz`, possibly several gzip
-  members) and archives older than 90 days are deleted (`ctb/decision_log.py`). Read everything with
+  members) and archives older than 90 days are deleted (`ctb/decision_log.py`). Archiving never stands in the way of a
+  decision: the rotation runs in its own try, a failure is logged and shown in `status.json` `last_error` ("decision log
+  rotation failed, lines keep going to decisions.jsonl"), the line is appended to the current file anyway and the
+  rotation is retried after 15 minutes. A `.gz` is written to a temp file, synced and renamed, never appended to; readers
+  skip the unreadable rest of a damaged archive and report it once. Read everything with
   `decision_log.iter_all(<root>/allocator)`, oldest first.
 
 ## Model and question set
