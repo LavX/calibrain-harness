@@ -48,6 +48,10 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 ACTIONS = ("enable", "pause", "unlock", "flatten", "reset")
 MODES = ("llm", "manual", "bot")
 ALLOCATOR = "allocator"  # data/live/allocator/ holds the LLM allocator's files; not a strategy id
+# The one map from strategy id to the short name every screen shows (F1 matrix, F7 cards, alerts). Unknown ids fall back
+# to the label up to its first bracket, then the id.
+SHORT_NAMES = {"carry": "Carry", "dated_carry": "Dated carry", "trend": "Trend", "xsmom": "Momentum", "basis": "Basis",
+               "longvol": "Long-only", "events": "Events"}
 FEED_N = 15
 RUNNER_ACTIONS = ("start", "stop")
 CACHE_S = 15.0
@@ -69,6 +73,13 @@ class StrategyError(Exception):
 
 def live_root() -> Path:
     return Path(os.environ.get("CTB_LIVE_ROOT") or DEFAULT_ROOT)
+
+
+def short_name(sid: str, label: str = "") -> str:
+    if sid in SHORT_NAMES:
+        return SHORT_NAMES[sid]
+    head = re.split(r"[ (]", label.strip(), maxsplit=1)[0] if label.strip() else ""
+    return head or sid
 
 
 # ------------------------------------------------------------------------------------------------ registry
@@ -193,6 +204,9 @@ def clean_status(doc: dict | None) -> dict | None:
     tgt = [{"symbol": str(t.get("symbol", "")), "market": str(t.get("market", "")), "target_qty": _num(t.get("target_qty"))}
            for t in doc.get("targets") or [] if isinstance(t, dict)]
     return {"enabled": bool(doc.get("enabled")), "state": str(doc.get("state") or "error"),
+            # what the runner applied (control.json is only the request): weight, who set it, why, and the owner lock
+            "weight": _num(doc.get("weight")), "set_by": doc.get("set_by") if doc.get("set_by") in ("llm", "owner") else None,
+            "reason": str(doc["reason"])[:500] if doc.get("reason") else None, "owner_lock": bool(doc.get("owner_lock")),
             "updated_ms": _num(doc.get("updated_ms")), "last_rebalance_ms": _num(doc.get("last_rebalance_ms")),
             "next_rebalance_ms": _num(doc.get("next_rebalance_ms")),
             "last_error": str(doc["last_error"])[:500] if doc.get("last_error") else None,
@@ -202,6 +216,11 @@ def clean_status(doc: dict | None) -> dict | None:
             "trades_total": int(doc["trades_total"]) if isinstance(doc.get("trades_total"), int) else None}
 
 
+def is_idle(status: dict) -> bool:
+    """Switched on and running, but holding nothing and wanting nothing: no position, no non-zero target."""
+    return not status["positions"] and not any(t.get("target_qty") for t in status["targets"])
+
+
 def pill(status: dict | None, now_ms: float, runner_active: bool) -> str:
     if status is None:
         return "no_data"
@@ -209,7 +228,9 @@ def pill(status: dict | None, now_ms: float, runner_active: bool) -> str:
         return "stale" if runner_active else "runner_stopped"
     if status["state"] in ("latched", "error"):
         return status["state"]
-    return "running" if status["enabled"] and status["state"] == "running" else "paused"
+    if status["enabled"] and status["state"] == "running":
+        return "idle" if is_idle(status) else "running"
+    return "paused"
 
 
 # ------------------------------------------------------------------------------------------------ systemd
@@ -262,7 +283,11 @@ def clean_allocator(status: dict | None, control: dict | None, decisions: list[d
     stt = None
     if status is not None:
         stt = {"state": str(status.get("state") or "error"), "model": status.get("model"),
-               **{k: _num(status.get(k)) for k in ("last_decision_ms", "next_decision_ms", "cost_usd_today")},
+               # last/next_weights_ms: when the daily weights were last written and are next due (the hourly decision only
+               # refreshes the decider's p); updated_ms: the loop's last tick
+               **{k: _num(status.get(k)) for k in ("last_decision_ms", "next_decision_ms", "cost_usd_today", "last_weights_ms",
+                                                   "next_weights_ms", "updated_ms")},
+               "weights_mode": status.get("weights_mode") if isinstance(status.get("weights_mode"), str) else None,
                "last_error": str(status["last_error"])[:500] if status.get("last_error") else None}
     ctl = {"enabled": bool(control and control.get("enabled")), "interval_min": int(control["interval_min"]) if control and isinstance(control.get("interval_min"), int) else None,
            "decide_now_pending": bool(control and control.get("decide_now"))}
@@ -279,8 +304,13 @@ def control_view(ctl: dict, st: dict | None) -> dict[str, Any]:
 class StrategyService:
     def __init__(self, root: Path | None = None, run: Runner = run_cmd, clock: Callable[[], float] = time.time,
                  extra_units: tuple[str, ...] | None = None, dashboard_account: str | None = None,
-                 allocator_available: bool = False, allocator: Any = None) -> None:
+                 allocator_available: bool = False, allocator: Any = None, shares_bot_account: bool = True,
+                 auto_set_path: Path | None = None) -> None:
         self.root = root if root is not None else live_root()
+        # False for a venue on another exchange (OKX, Deribit, Bitget): the per-symbol bot never trades there, so the
+        # one-mode-at-a-time guard does not apply to its strategies.
+        self.shares_bot_account = shares_bot_account
+        self.auto_set_path = auto_set_path  # the MANUAL header set, kept by the harness (None: every strategy)
         self.run, self.clock = run, clock
         self.extra_units = extra_units if extra_units is not None else extra_units_from_env()
         self.dashboard_account = dashboard_account if dashboard_account is not None else (os.environ.get("CTB_DASHBOARD_ACCOUNT") or None)
@@ -297,7 +327,7 @@ class StrategyService:
     # ----------------------------------------------------------------- the guard
     def conflicting_units(self, reg: Registry, venue: str) -> list[str]:
         """Runner units that trade the account the bot's own auto-trade would use. Only the demo venue can collide."""
-        if venue != "demo":
+        if venue != "demo" or not self.shares_bot_account:
             return []
         mine = self.dashboard_account
         accounts: dict[str, set[str]] = {}
@@ -469,6 +499,8 @@ class StrategyService:
             return {"ok": True, "enabled": []}
         if reg.error:
             raise StrategyError(409, f"strategies.json is unusable: {reg.error}")
+        if ids is None and mode == "manual":
+            ids = self.auto_set()
         targets = list(reg.entries) if mode == "llm" else [e for e in reg.entries if ids is None or e.id in ids]
         if not targets:
             raise StrategyError(409, "no strategy selected")
@@ -486,6 +518,30 @@ class StrategyService:
                 self._write_owner(e, True)
         self._cache = None
         return {"ok": True, "enabled": [e.id for e in targets]}
+
+    def auto_set(self) -> list[str] | None:
+        """Strategy ids the header switch turns on in MANUAL mode, or None for every strategy (nothing saved yet)."""
+        if self.auto_set_path is None:
+            return None
+        doc = read_json(self.auto_set_path)
+        ids = doc.get("ids") if doc else None
+        return [str(i) for i in ids if isinstance(i, str)] if isinstance(ids, list) else None
+
+    def set_auto_set(self, ids: Any) -> dict[str, Any]:
+        if self.auto_set_path is None:
+            raise StrategyError(409, "this venue has no header set")
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise StrategyError(400, "ids must be a list of strategy ids")
+        known = {e.id for e in self.registry().entries}
+        if unknown := sorted(set(ids) - known):
+            raise StrategyError(400, f"unknown strategy ids: {', '.join(unknown)}")
+        try:
+            self.auto_set_path.parent.mkdir(parents=True, exist_ok=True)
+            write_control(self.auto_set_path, {"ids": sorted(set(ids)), "updated_ms": int(self.clock() * 1000)})
+        except OSError as exc:
+            raise StrategyError(500, f"cannot save the header set: {exc.strerror or exc}") from exc
+        self._cache = None
+        return {"ok": True, "ids": sorted(set(ids))}
 
     # ----------------------------------------------------------------- reads
     def _read(self, e: Entry) -> dict[str, Any]:
@@ -520,6 +576,7 @@ class StrategyService:
                 doc["allocator"] = alloc
                 doc["strategies"] = [{**v, "control": control_view(self._control_by_id(v["id"]), v["status"])} for v in doc["strategies"]]
                 doc["auto_on"] = alloc["control"]["enabled"] if doc["mode"] == "llm" else any(v["control"]["enabled"] for v in doc["strategies"])
+                doc["auto_set"] = self.auto_set()
                 return doc
             reg = self.registry()
             units = {u: await unit_state(self.run, u) for u in reg.units}
@@ -532,7 +589,7 @@ class StrategyService:
                 u = units.get(e.unit) if e.unit else None
                 runner_active = bool(u and is_active(u))
                 views.append({
-                    "id": e.id, "label": e.label, "unit": e.unit, "account": e.account, "status": st,
+                    "id": e.id, "name": short_name(e.id, e.label), "label": e.label, "unit": e.unit, "account": e.account, "status": st,
                     "pill": pill(st, now * 1000, runner_active),
                     "control": control_view(ctl, st),
                     "trades": r["trades"], "equity_history": self._sample(e.id, now, st["equity_usdt"] if st else None),
@@ -541,7 +598,7 @@ class StrategyService:
             mode = self.mode(reg)
             doc = {"mode": mode, "error": reg.error, "root": str(self.root), "dashboard_account": self.dashboard_account, "generated_at": now,
                    "auto_on": alloc["control"]["enabled"] if mode == "llm" else any(v["control"]["enabled"] for v in views),
-                   "allocator": alloc, "runners": list(units.values()), "strategies": views}
+                   "allocator": alloc, "runners": list(units.values()), "strategies": views, "auto_set": self.auto_set()}
             self._cache = (now, doc)
             return doc
 
@@ -550,11 +607,13 @@ class StrategyService:
         """True when the live strategies (not the per-symbol bot) own the demo account: any mode but "bot"."""
         return self.mode(self.registry()) != "bot"
 
-    def kill_all(self) -> list[str]:
+    def kill_all(self, pause_allocator: bool = True) -> list[str]:
         """Dashboard kill switch while the strategies own the account: pause the allocator, then pause every strategy
-        (owner-locked) and ask the runner to flatten it. The runner closes positions through its own books."""
+        (owner-locked) and ask the runner to flatten it. The runner closes positions through its own books.
+        The caller checks that the runner is alive first (ctb.venues.VenueHub.kill): a flag nobody reads closes nothing."""
         reg = self.registry()
-        self._write_allocator(enabled=False)
+        if pause_allocator:
+            self._write_allocator(enabled=False)
         done = []
         for e in reg.entries:
             if not (self.root / e.id).is_dir():
@@ -567,6 +626,7 @@ class StrategyService:
 
     async def act(self, sid: str, action: str, *, llm_trading: bool, venue: str) -> dict[str, Any]:
         """Per-card actions: enable / pause (the Auto trade switch, owner-locked), unlock (back to the LLM), flatten, reset."""
+        action = "pause" if action == "disable" else action  # "disable" reads better in the venue routes; same switch
         reg = self.registry()
         e = reg.get(sid)
         if e is None or action not in ACTIONS:

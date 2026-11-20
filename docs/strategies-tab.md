@@ -74,6 +74,44 @@ the newest `allocator/decisions.jsonl` line that carries the `core` breakdown, `
   decider, the series the tilt skill is judged on). The chart needs a forecast archived on or after go-live plus the next
   day's returns, so it starts empty.
 
+## Venues (several exchanges)
+
+One runner per exchange account, each with its own root and systemd user unit. The list comes from configuration, never
+from a directory glob (a quarantined root next to a real one stays invisible):
+
+```
+CTB_LIVE_ROOTS=bybit-demo=<root>,okx-demo=<root>,deribit-test=<root>,bitget-demo=<root>
+```
+
+| Venue id | Label | Unit | Currency | Controlled by |
+| --- | --- | --- | --- | --- |
+| bybit-demo | BYBIT·DEMO | calibrain-live.service | USDT | the LLM allocator |
+| okx-demo | OKX·DEMO | calibrain-live-okx.service | USDT | the owner |
+| deribit-test | DERIBIT·TEST | calibrain-live-deribit.service | USDC | the owner |
+| bitget-demo | BITGET·DEMO | calibrain-live-bitget.service | USDT | the owner |
+
+bybit-demo must be listed: the allocator, the predictions panel and the per-symbol bot's guard stay bound to it, and
+`/api/strategies` (and its actions) are aliases of `/api/venues/bybit-demo/...`. Unset, the dashboard has one venue,
+bybit-demo at `CTB_LIVE_ROOT`, as before. Each venue has a presence: **live** (unit active, a status.json fresher than
+3 min), **stale** (unit active, every status.json older), **stopped** (unit not active), **absent** (no root or no
+strategies.json: "not started") and **error** (strategies.json unusable).
+
+Routes: `GET /api/venues` (every venue: presence, books, account, P&L today, strategies, netted positions, alerts),
+`GET /api/venues/{vid}/strategies`, `POST /api/venues/{vid}/strategies/{sid}/{enable|disable|pause|unlock|flatten|reset}`,
+`POST /api/venues/{vid}/runner/{start|stop}`, `POST /api/venues/{vid}/kill`, `POST /api/kill-all`.
+
+KILL pauses every strategy of the venue (owner-locked) and sets its flatten flag, and on bybit-demo pauses the allocator.
+It is refused with a 409 and the reason, writing nothing, unless the venue is live: a flatten flag that no running runner
+reads closes nothing. KILL ALL does every venue and reports each one (a venue that has not started is skipped).
+
+P&L today uses the harness's own 00:00 UTC baseline, one small JSON file per venue under the harness data directory
+(next to the database: `data/venues/baseline-<vid>.json`). A background task samples every minute, so the file is
+written within a minute of midnight while the dashboard runs and survives restarts; when the dashboard was down at
+midnight the page says "since HH:MM UTC" instead. On bybit-demo the account's USDT equity is sampled too, and the
+account's unrealised P&L minus the books' is shown as "unattributed". Other venues show sums over their books until the
+runner publishes `<root>/account.json` (read when it exists). The MANUAL header set is kept in the same directory
+(`auto-set-bybit-demo.json`), not in the browser.
+
 ## Files (the contract with the runner)
 
 Root: `CTB_LIVE_ROOT`, shared with `ctb.allocator` (default `data/live` in the repo; on aurora4 the unit sets `/home/lavx/Documents/calibrain-study/data/live`).

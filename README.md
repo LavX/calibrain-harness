@@ -390,6 +390,7 @@ imbalance, branching ratio, excitation against the fitted baseline), `order_book
 | `CTB_MAX_SPREAD_BP` / `CTB_MAX_TESTNET_SPREAD_BP` / `CTB_MIN_DEPTH_MULT` | 5 / 25 / 3 | Liquidity gates |
 | `CTB_REQUIRE_VALIDATED` / `CTB_DRIFT_ACTION` | 1 / base | Validation gate for strict trades; action on drift |
 | `CTB_DYNAMIC_SIZING` / `CTB_DD_THROTTLE_PCT` / `CTB_BE_TRIGGER_R` / `CTB_BE_OFFSET_BP` | 1 / 1.0 / 1.0 / 5 | Sizing and break-even |
+| `CTB_LIVE_ROOTS` | – (bybit-demo at `CTB_LIVE_ROOT`) | Live strategy runner roots per venue, `bybit-demo=<root>,okx-demo=<root>,deribit-test=<root>,bitget-demo=<root>` (see docs/strategies-tab.md) |
 
 ## Safety
 
