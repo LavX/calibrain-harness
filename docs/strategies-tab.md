@@ -219,6 +219,10 @@ cp docs/deploy/calibrain-harness.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now calibrain-harness.service
 systemctl --user status calibrain-harness.service
+# the nightly decision-log compaction (gzip after 2 days, delete after 90), outside the dashboard process:
+cp docs/deploy/calibrain-decision-log-compact.service docs/deploy/calibrain-decision-log-compact.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now calibrain-decision-log-compact.timer
 ```
 
 Open `http://100.96.108.128:8800/` (tailnet) or tunnel with `ssh -L 8800:127.0.0.1:8800 lavx@aurora4` and open

@@ -1,0 +1,23 @@
+# Nightly compaction of the allocator's decision log, as a systemd USER unit on aurora4 (next to calibrain-harness.service).
+# Template: copy it with the .timer, check the paths, then install it by hand (see docs/allocator.md). Nothing here is
+# installed for you.
+#
+# What it does: gzips allocator/decisions-<day>.jsonl archives older than 2 days (temp file, fsync, rename, then the plain
+# file is removed) and deletes dated archives older than 90 days. It never touches decisions.jsonl, decisions.day or a
+# decisions-legacy-*.jsonl archive, and it is safe to run again (a rerun finds nothing to do). The allocator itself only
+# renames the current file once a day; this runs outside it so compression can never delay a decision.
+[Unit]
+Description=Calibrain decision log compaction (gzip and 90-day retention)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/calibrain-harness
+# The allocator's directory is <CTB_LIVE_ROOT>/allocator: the same root as the dashboard's (bybit-demo's) live root.
+Environment=CTB_LIVE_ROOT=%h/Documents/calibrain-study/data/live
+ExecStart=%h/Documents/calibrain-harness/.venv/bin/python -m ctb.decision_log compact
+# Bounded: a stuck run is killed, the next night tries again.
+TimeoutStartSec=30min
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=256M
+NoNewPrivileges=yes
