@@ -414,7 +414,8 @@ class Calc:
                     p_window=max(1, s.allocator_p_window), p_max_age_h=s.allocator_p_max_age_h,
                     p_min_fresh=max(1, s.allocator_p_min_fresh), stale_h=s.allocator_stale_h, weights_utc=(hh, mm),
                     rules=M.RuleParams(vol_cap=s.allocator_vol_cap, buffer=s.allocator_buffer, step_up=s.allocator_step_up,
-                                       veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, explore_floor=floor),
+                                       veto_p=s.allocator_veto_p, veto_factor=s.allocator_veto_factor, veto_live=s.allocator_veto_live,
+                                       explore_floor=floor),
                     tilt=M.TiltParams(sr_full=s.allocator_tilt_sr_full, t_max=s.allocator_tilt_max),
                     start_weights=s.allocator_start_weights)
 
@@ -555,11 +556,21 @@ def compute_weights(ids: list[str], forecast: dict[str, Any], current: dict[str,
     final, steps = M.apply_rules(opt, w_target, {sid: w_prev[sid] for sid in opt}, cov, {sid: p.get(sid) for sid in opt}, calc.rules,
                                  floored=[sid for sid in opt if current[sid].drawdown_pct is not None and current[sid].drawdown_pct > dd_floor_pct], locked=[sid for sid in opt if current[sid].owner_lock])
     reasons = {sid: f"{sid}: held at {w_prev[sid]:.2f} ({why})" for sid, why in held.items()}
+    veto = next((st for st in steps if st["step"] == "veto"), {})
+    veto_shadow: dict[str, float] = {}
+    if not calc.rules.veto_live:  # the veto lives in the shadow only: the shadow tilted book takes it, the live one does not
+        for sid in veto.get("shadow_changed") or []:
+            cap = calc.rules.veto_factor * w_prev[sid]
+            veto_shadow[sid] = round(cap, 6)
+            shadow_w[sid] = min(shadow_w[sid], cap)
     for sid in opt:
         binding = [st["step"] for st in steps if sid in st["changed"]]
         reasons[sid] = M.reason_line(sid, core[sid], tau[sid], sr[sid], w_target[sid], final[sid], binding, regime, tilt.kappa, shadow_tau[sid])
+        if sid in veto_shadow:
+            reasons[sid] += f" [decider veto in shadow only: would cap at {veto_shadow[sid]:.2f}]"
     return {"opt": opt, "held": held, "mu": mu_log, "sigma_d": sigma_log, "clipped": clipped, "w_prev": w_prev, "core": core, "tau": tau,
             "sr": sr, "kappa": tilt.kappa, "t_eff": tilt.t_eff, "w_target": w_target, "shadow_tau": shadow_tau, "shadow_w_target": shadow_w,
+            "veto_live": calc.rules.veto_live, "veto_shadow": veto_shadow,
             "w_final": {**{sid: w_prev[sid] for sid in ids}, **final}, "steps": steps, "reasons": reasons}
 
 
@@ -1353,6 +1364,7 @@ class Allocator:
                     "shadow_w_target": {k: round(v, 6) for k, v in calc_out["shadow_w_target"].items()},
                     "w_target": {k: round(v, 6) for k, v in calc_out["w_target"].items()},
                     "w_final": plan.weights if plan else {}, "steps": calc_out["steps"], "reasons": reasons, "clipped": calc_out["clipped"],
+                    "veto_live": calc_out.get("veto_live", True), "veto_shadow": calc_out.get("veto_shadow", {}),
                     "no_forecast": calc_out["held"],
                 })
             for v in self.venues[1:]:  # the same forecasts and decider p, each venue's own books, anchor and rules

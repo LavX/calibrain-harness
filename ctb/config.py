@@ -140,6 +140,7 @@ class Settings:
     allocator_step_up: float = _f("CTB_ALLOCATOR_STEP_UP", 0.25)           # weight rises at most this much per day
     allocator_veto_p: float = _f("CTB_ALLOCATOR_VETO_P", 0.40)             # decider p below this caps the weight ...
     allocator_veto_factor: float = _f("CTB_ALLOCATOR_VETO_FACTOR", 0.5)    # ... at this fraction of the previous weight
+    allocator_veto_live: bool = _b("CTB_ALLOCATOR_VETO_LIVE", True)        # false: the veto only shows in the shadow (live weights ignore it)
     allocator_explore_floor: float = _f("CTB_ALLOCATOR_EXPLORE_FLOOR", 0.10)  # minimum weight so every strategy keeps trading (0 disables)
     allocator_explore_venues: list[str] = field(default_factory=lambda: [v.lower() for v in _list("CTB_ALLOCATOR_EXPLORE_VENUES", "demo,testnet")])
     allocator_stale_h: float = _f("CTB_ALLOCATOR_STALE_H", 36.0)           # a forecast older than this: hold weights, report the error

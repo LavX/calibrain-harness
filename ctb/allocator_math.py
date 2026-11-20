@@ -47,6 +47,7 @@ class RuleParams:
     step_up: float = 0.25           # weight may rise at most this much per day, down is unlimited
     veto_p: float = 0.40            # decider probability below this caps the weight ...
     veto_factor: float = 0.5        # ... at this fraction of the previous weight
+    veto_live: bool = True          # False: the veto changes no live weight, it is only logged as the shadow (veto_shadow)
     explore_floor: float = 0.10     # minimum weight so every strategy keeps producing fills (0 disables)
 
 
@@ -219,8 +220,14 @@ def apply_rules(ids: Sequence[str], w_target: Mapping[str, float], w_prev: Mappi
     record("buffer", {i: (w_prev[i] if abs(w[i] - w_prev[i]) < params.buffer - 1e-12 else w[i]) for i in ids})
     # 3. step: up at most step_up per day, down without limit
     record("step", {i: min(w[i], w_prev[i] + params.step_up) for i in ids})
-    # 4. decider veto: p below the threshold caps the weight at a fraction of the previous one
-    record("veto", {i: (min(w[i], params.veto_factor * w_prev[i]) if p.get(i) is not None and p[i] < params.veto_p else w[i]) for i in ids})
+    # 4. decider veto: p below the threshold caps the weight at a fraction of the previous one. Not live: the live weights
+    # pass unchanged and the step carries what the veto would have done (shadow_after, shadow_changed)
+    vetoed = {i: (min(w[i], params.veto_factor * w_prev[i]) if p.get(i) is not None and p[i] < params.veto_p else w[i]) for i in ids}
+    if params.veto_live:
+        record("veto", vetoed, {"live": True})
+    else:
+        record("veto", dict(w), {"live": False, "shadow_after": {i: round(vetoed[i], 6) for i in ids},
+                                 "shadow_changed": [i for i in ids if abs(vetoed[i] - w[i]) > 1e-9]})
     # 5. exploration floor
     record("explore_floor", {i: (max(w[i], params.explore_floor) if params.explore_floor > 0 else w[i]) for i in ids})
     # 6. the drawdown floor and owner_lock override everything; owner_lock wins over the floor

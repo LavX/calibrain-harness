@@ -126,7 +126,9 @@ Per strategy, a weights run does:
 5. The rules, in this order (each is logged with before and after):
    `vol_cap` (scale all so `sqrt(365 w'Sigma w) / N <= 10%/yr`, N the number of strategies), `buffer`
    (a change under 0.10 is not made), `step` (up at most 0.25 per run, down unlimited), `veto` (p below 0.40
-   caps w at half of `w_prev`), `explore_floor` (w at least 0.10, only on the venues in
+   caps w at half of `w_prev`; with `CTB_ALLOCATOR_VETO_LIVE=false` the live weights pass unchanged and the veto only caps
+   the shadow tilted book: the step logs `shadow_after` and `shadow_changed`, the decision line `veto_shadow` and
+   `veto_live`, the card's reason "decider veto in shadow only". The default `true` keeps it live), `explore_floor` (w at least 0.10, only on the venues in
    `CTB_ALLOCATOR_EXPLORE_VENUES`, default demo and testnet; 0 disables), then `floor_lock`: the 15%
    drawdown floor (weight 0, flatten) and `owner_lock` (weight untouched) override everything, the lock
    wins over the floor.

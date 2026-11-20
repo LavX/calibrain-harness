@@ -212,6 +212,35 @@ def test_enough_fresh_low_answers_still_veto(root):
     assert "trend" in next(st for st in rec["steps"] if st["step"] == "veto")["changed"] and rec["w_final"]["trend"] <= 0.1 + 1e-9
 
 
+@pytest.mark.parametrize("live", [True, False])
+def test_the_veto_live_switch_decides_whether_the_veto_moves_live_weights(root, monkeypatch, live):
+    """CTB_ALLOCATOR_VETO_LIVE: true (default, today's behaviour) the veto caps the live weight; false it only caps the shadow
+    tilted book and says what it would have done."""
+    from ctb import config as C
+
+    monkeypatch.setenv("CTB_ALLOCATOR_VETO_LIVE", "true" if live else "false")
+    assert C._b("CTB_ALLOCATOR_VETO_LIVE", True) is live  # the switch the owner sets
+    calc = A.Calc.from_settings(replace(Settings(), allocator_veto_live=C._b("CTB_ALLOCATOR_VETO_LIVE", True)))
+    assert calc.rules.veto_live is live
+    put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "p_hist": {"trend": _hist((23, 0.2, 3))}})
+    a = make(root, FakeDecider(answers({"carry": 0.5, "trend": 0.2, "xsmom": 0.5})), calc=calc)
+    rec = decide(a, trigger="decide_now")
+    veto = next(st for st in rec["steps"] if st["step"] == "veto")
+    assert rec["veto_live"] is live and veto["live"] is live
+    if live:
+        assert veto["changed"] == ["trend"] and ctl(root, "trend")["weight"] <= 0.1 + 1e-9 and rec["veto_shadow"] == {}
+    else:
+        assert veto["changed"] == [] and veto["shadow_changed"] == ["trend"] and ctl(root, "trend")["weight"] > 0.4
+        assert rec["veto_shadow"] == {"trend": pytest.approx(0.1)} and rec["shadow_w_target"]["trend"] <= 0.1 + 1e-9
+        assert "decider veto in shadow only: would cap at 0.10" in ctl(root, "trend")["reason"]
+
+
+def test_the_veto_switch_defaults_to_live():
+    assert Settings().allocator_veto_live is True and A.Calc.from_settings(Settings()).rules.veto_live is True
+    w, steps = M.apply_rules(["a"], {"a": 0.6}, {"a": 0.4}, [[0.0]], {"a": 0.2}, M.RuleParams(explore_floor=0.0, veto_live=False))
+    assert w == {"a": 0.6} and steps[3]["shadow_after"] == {"a": 0.2} and steps[3]["changed"] == []
+
+
 def test_hourly_tick_only_refreshes_the_decider(root):
     put(root / "allocator" / "state.json", {"peaks": {}, "history": {}, "last_weights_ms": int((SLOT - DAY + 60) * 1000)})
     before = {i: (root / i / "control.json").read_bytes() for i in IDS}
