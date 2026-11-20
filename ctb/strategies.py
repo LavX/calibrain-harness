@@ -202,12 +202,12 @@ def clean_status(doc: dict | None) -> dict | None:
     if doc is None:
         return None
     pos = []
-    for p in doc.get("positions") or []:
+    for p in doc.get("positions") if isinstance(doc.get("positions"), list) else []:
         if isinstance(p, dict):
             pos.append({"symbol": str(p.get("symbol", "")), "side": str(p.get("side", "")), "market": str(p.get("market", "")),
                         **{k: _num(p.get(k)) for k in ("qty", "entry_price", "mark_price", "upnl_usdt")}})
     tgt = [{"symbol": str(t.get("symbol", "")), "market": str(t.get("market", "")), "target_qty": _num(t.get("target_qty"))}
-           for t in doc.get("targets") or [] if isinstance(t, dict)]
+           for t in (doc.get("targets") if isinstance(doc.get("targets"), list) else []) if isinstance(t, dict)]
     return {"enabled": bool(doc.get("enabled")), "state": str(doc.get("state") or "error"),
             # what the runner applied (control.json is only the request): weight, who set it, why, and the owner lock
             "weight": _num(doc.get("weight")), "set_by": doc.get("set_by") if doc.get("set_by") in ("llm", "owner") else None,
@@ -638,7 +638,7 @@ class StrategyService:
         """Dashboard kill switch: pause the allocator, then pause every strategy (owner-locked) and ask the runner to
         flatten it. The runner closes positions through its own books. Always records the owner's intent, whether or not
         the runner is up (ctb.venues.VenueHub.kill says whether it is confirmed). A failed write does not stop the others.
-        Returns {"written": [ids], "failed": {id or "allocator": why}, "allocator_paused": bool}."""
+        Returns {"written": [ids], "failed": {id or "allocator": why}, "missing": [ids without a directory], "allocator_paused": bool}."""
         reg = self.registry()
         failed: dict[str, str] = {}
         if pause_allocator:
@@ -646,10 +646,12 @@ class StrategyService:
                 self._write_allocator(enabled=False)
             except StrategyError as exc:
                 failed[ALLOCATOR] = exc.message
-        done = []
+        done: list[str] = []
+        missing: list[str] = []
         for e in reg.entries:
             if not (self.root / e.id).is_dir():
-                continue  # the runner has not created it yet: it holds nothing
+                missing.append(e.id)  # no directory: nothing to write into; named so the answer can say so
+                continue
             try:
                 self._write_owner(e, False)
                 self._write(e, flatten=True, reason="kill switch from the dashboard")
@@ -657,7 +659,7 @@ class StrategyService:
             except StrategyError as exc:
                 failed[e.id] = exc.message
         self._cache = None
-        return {"written": done, "failed": failed, "allocator_paused": pause_allocator and ALLOCATOR not in failed}
+        return {"written": done, "failed": failed, "missing": missing, "allocator_paused": pause_allocator and ALLOCATOR not in failed}
 
     async def act(self, sid: str, action: str, *, llm_trading: bool, venue: str, cancel_kill: bool = False) -> dict[str, Any]:
         """Per-card actions: enable / pause (the Auto trade switch, owner-locked), unlock (back to the LLM), flatten, reset, and

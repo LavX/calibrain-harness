@@ -106,7 +106,10 @@ KILL always records the owner's intent: it pauses the allocator (bybit-demo), an
 (owner-locked) with its flatten flag set. It then answers 200 only when every written strategy's runner unit is active and
 its status.json is fresh (checked per strategy, since units can be per strategy). Otherwise it answers 409 "written, NOT
 confirmed" naming the strategies nobody may be acting for yet: a hung or restarting runner reads the flags when it comes
-back. A failed write answers 500 with what was and was not written. Only a venue that has not started, or whose
+back. A failed write answers 500 with what was and was not written. The flags are written before anything else is read
+(systemd, status files), and a strategy with no known runner unit is never reported confirmed. A strategy listed in
+strategies.json without a directory is named as not flagged. F1's KILL button applies the same per-strategy test, so its
+preview and the answer agree. Only a venue that has not started, or whose
 strategies.json is unusable, is refused with nothing written. KILL ALL does every venue and reports each one (a venue
 that has not started is skipped) and then switches the per-symbol bot's AUTO-TRADE off. In mode PER-SYMBOL BOT it also
 kills the bot (all its positions closed, orders cancelled) and skips the bybit-demo strategies, which that mode has

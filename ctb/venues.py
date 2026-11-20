@@ -144,11 +144,12 @@ def strategy_liveness(cfg: VenueConfig, view: dict, runners: list[dict], now_ms:
     """Is someone acting on this strategy's control.json right now: its own unit (or the venue's) active and its
     status.json fresh. Units may be per strategy (calibrain-live@<id>.service), so this is answered per strategy."""
     unit = view.get("unit") or cfg.unit or None
-    if unit:
-        u = next((r for r in runners if r.get("unit") == unit), None)
-        if u is None or not S.is_active(u):
-            state = "not installed" if u and u.get("load") == "not-found" else (u or {}).get("active") or "unknown"
-            return False, f"unit {unit} is {state}"
+    if not unit:  # a fresh status says the runner was alive minutes ago, not that it is alive now to read the flag
+        return False, "no runner unit is known for it, so no runner can be confirmed to read the flags"
+    u = next((r for r in runners if r.get("unit") == unit), None)
+    if u is None or not S.is_active(u):
+        state = "not installed" if u and u.get("load") == "not-found" else (u or {}).get("active") or "unknown"
+        return False, f"unit {unit} is {state}"
     st = view.get("status")
     if not st or st.get("updated_ms") is None:
         return False, "no status.json yet"
@@ -558,8 +559,7 @@ class VenueHub:
             "pnl_today_partial": partial, "pnl_today_since": since, "pnl_today_note": note,
             "account": account_block, "strategies": rows, "positions": positions, "positions_source": pos_source, "positions_note": pos_note,
             # available: KILL writes the flags (everything but absent/error); ok: and the runner would act on them now
-            "kill": {"ok": pres == "live", "available": pres not in ("absent", "error"),
-                     "why": None if pres == "live" else kill_refusal(cfg, pres, why)},
+            "kill": kill_preview(cfg, pres, why, doc, now_ms),
         }
 
     async def sample_all(self, account: dict | None = None) -> None:
@@ -575,15 +575,26 @@ class VenueHub:
         svc = self.services[vid]
         if not cfg.root.is_dir() or not (cfg.root / "strategies.json").is_file():
             raise S.StrategyError(409, kill_refusal(cfg, "absent", None))
-        doc = await svc.snapshot(force=True)
-        if doc.get("error"):
-            raise S.StrategyError(409, kill_refusal(cfg, "error", doc["error"]))
-        now_ms = self.clock() * 1000
-        live = {v["id"]: strategy_liveness(cfg, v, doc["runners"], now_ms) for v in doc["strategies"]}
+        reg = svc.registry()
+        if reg.error:
+            raise S.StrategyError(409, kill_refusal(cfg, "error", reg.error))
+        # the same "not started" test as presence(): no runner unit known and no strategy has written a status yet
+        if not (any(e.unit for e in reg.entries) or cfg.unit) and not any(S.read_json(cfg.root / e.id / "status.json") for e in reg.entries):
+            raise S.StrategyError(409, kill_refusal(cfg, "absent", None))
+        # write first: nothing (a slow systemctl, a broken status file) may delay or stop the flags
         res = svc.kill_all(pause_allocator=vid == self.primary_id)
         written, failed = res["written"], res["failed"]
+        try:
+            doc = await svc.snapshot(force=True)
+            now_ms = self.clock() * 1000
+            live = {v["id"]: strategy_liveness(cfg, v, doc["runners"], now_ms) for v in doc["strategies"]}
+            read_error = None
+        except Exception as exc:  # noqa: BLE001 - the flags are written; only the confirmation is lost
+            live, read_error = {}, f"could not read the runner's state ({type(exc).__name__}: {exc})"
         confirmed = [i for i in written if live.get(i, (False, ""))[0]]
-        unconfirmed = {i: live.get(i, (False, "unknown"))[1] for i in written if i not in confirmed}
+        unconfirmed = {i: live.get(i, (False, read_error or "unknown"))[1] for i in written if i not in confirmed}
+        for i in res["missing"]:  # listed in strategies.json but no directory: not flagged, so nothing confirms it is flat
+            unconfirmed[i] = "no directory under the root, so it was not flagged (the runner has not created it, or it was removed)"
         out = {"ok": not failed and not unconfirmed, "venue": vid, "label": cfg.label, "written": written, "flattening": written,
                "confirmed": confirmed, "unconfirmed": unconfirmed, "failed": failed,
                "allocator_paused": res["allocator_paused"] if vid == self.primary_id else None}
@@ -604,9 +615,27 @@ class VenueHub:
             try:
                 res.append(await self.kill(cfg.id))
             except S.StrategyError as exc:
-                absent = not cfg.root.is_dir() or not (cfg.root / "strategies.json").is_file()
+                absent = not exc.detail and exc.status == 409 and "has not started" in exc.message
                 res.append({**exc.detail, "ok": False, "venue": cfg.id, "label": cfg.label, "skipped": absent, "error": exc.message})
+            except Exception as exc:  # noqa: BLE001 - one broken venue must not stop KILL ALL for the others
+                res.append({"ok": False, "venue": cfg.id, "label": cfg.label, "skipped": False,
+                            "error": f"{cfg.label} KILL failed: {type(exc).__name__}: {exc}"})
         return {"ok": all(r["ok"] or r.get("skipped") for r in res), "venues": res}
+
+
+def kill_preview(cfg: VenueConfig, pres: str, why: str | None, doc: dict, now_ms: float) -> dict[str, Any]:
+    """What KILL would answer now, by the same per-strategy test hub.kill uses: ok only when every strategy's runner is
+    confirmed; available whenever there is something to write (not absent, not an unusable strategies.json)."""
+    available = pres not in ("absent", "error")
+    if not available:
+        return {"ok": False, "available": False, "why": kill_refusal(cfg, pres, why)}
+    if pres != "live":
+        return {"ok": False, "available": True, "why": kill_refusal(cfg, pres, why)}
+    bad = {v["id"]: w for v in doc["strategies"] for ok, w in [strategy_liveness(cfg, v, doc["runners"], now_ms)] if not ok}
+    bad.update({v["id"]: "no directory, it would not be flagged" for v in doc["strategies"] if not (cfg.root / v["id"]).is_dir()})
+    if not bad:
+        return {"ok": True, "available": True, "why": None}
+    return {"ok": False, "available": True, "why": "not confirmable for " + "; ".join(f"{k} ({w})" for k, w in bad.items())}
 
 
 def kill_message(cfg: VenueConfig, out: dict) -> str:
@@ -616,7 +645,7 @@ def kill_message(cfg: VenueConfig, out: dict) -> str:
         fails = "; ".join(f"{k}: {v}" for k, v in out["failed"].items())
         return (f"{cfg.label} KILL partially written: could not write {fails}. Written (paused, owner-locked, flatten "
                 f"requested{alloc}): {written}. Fix the file permissions and kill again.")
-    why = "; ".join(f"{k} ({v})" for k, v in out["unconfirmed"].items())
+    why = "; ".join(f"{k} ({v})" for k, v in out["unconfirmed"].items())  # includes strategies not flagged (no directory)
     return (f"{cfg.label} KILL written, NOT confirmed: {why}. The flags are on disk for {written} (paused, owner-locked, "
             f"flatten requested{alloc}); nothing closes until the runner reads them. Confirmed: {', '.join(out['confirmed']) or 'none'}.")
 

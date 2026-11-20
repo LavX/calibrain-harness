@@ -164,7 +164,47 @@ def test_unknown_venue_with_no_unit_and_no_status_is_not_started(tmp_path):
                    {"bybit-demo": st.StrategyService(tmp_path / "none", run=FakeSystemd(), clock=lambda: NOW, extra_units=()), "mynew-demo": svc},
                    state=tmp_path / "state", clock=lambda: NOW)
     v = run(h.summary())["venues"][1]
-    assert v["presence"] == "absent" and "not started" in v["presence_text"]
+    assert v["presence"] == "absent" and "not started" in v["presence_text"] and v["kill"]["available"] is False
+    with pytest.raises(st.StrategyError) as e:  # the kill agrees with the page: not started, nothing written
+        run(h.kill("mynew-demo"))
+    assert "has not started" in e.value.message and not (root / "trend" / "control.json").exists()
+
+
+def test_a_strategy_with_no_known_unit_is_never_confirmed(tmp_path):
+    root = tmp_path / "mynew"
+    (root / "trend").mkdir(parents=True)
+    (root / "strategies.json").write_text(json.dumps([{"id": "trend", "label": "Trend"}]))
+    (root / "trend" / "status.json").write_text(json.dumps({"enabled": True, "state": "running", "updated_ms": int(NOW * 1000) - 5000,
+                                                           "equity_usdt": 100.0, "positions": [], "targets": []}))
+    svc = st.StrategyService(root, run=FakeSystemd(), clock=lambda: NOW, extra_units=(), dashboard_account="", shares_bot_account=False)
+    h = V.VenueHub([V.venue_config("bybit-demo", tmp_path / "none", unit=""), V.venue_config("mynew-demo", root)],
+                   {"bybit-demo": st.StrategyService(tmp_path / "none", run=FakeSystemd(), clock=lambda: NOW, extra_units=()), "mynew-demo": svc},
+                   state=tmp_path / "state", clock=lambda: NOW)
+    v = run(h.summary())["venues"][1]
+    assert v["kill"]["ok"] is False and "no runner unit is known" in v["kill"]["why"]  # the preview says it too
+    with pytest.raises(st.StrategyError) as e:
+        run(h.kill("mynew-demo"))
+    assert e.value.status == 409 and "no runner unit is known" in e.value.detail["unconfirmed"]["trend"]
+    assert ctl(root, "trend")["flatten"] is True  # written all the same
+
+
+def test_a_listed_strategy_without_a_directory_is_named(roots, tmp_path):
+    okx = roots[1]
+    reg = json.loads((okx / "strategies.json").read_text()) + [{"id": "basis", "label": "basis", "unit": OKX_UNIT, "account": "okx-demo"}]
+    (okx / "strategies.json").write_text(json.dumps(reg))
+    h = hub(roots, FakeSystemd(active=[OKX_UNIT]), tmp_path)
+    assert "basis" in run(h.summary())["venues"][1]["kill"]["why"]
+    with pytest.raises(st.StrategyError) as e:
+        run(h.kill("okx-demo"))
+    assert e.value.detail["confirmed"] == ["trend", "longvol"] and "no directory" in e.value.detail["unconfirmed"]["basis"]
+
+
+def test_a_broken_status_file_does_not_stop_the_page_or_kill_all(roots, tmp_path):
+    set_status(roots[1], "trend", positions=1, targets="x")  # malformed: treated as no positions, never a crash
+    h = hub(roots, FakeSystemd(active=BYBIT_UNITS + [OKX_UNIT]), tmp_path)
+    assert run(h.summary())["venues"][1]["presence"] == "live"
+    out = run(h.kill_all())
+    assert {r["venue"]: r["ok"] for r in out["venues"]}["bybit-demo"] is True and ctl(roots[1], "trend")["flatten"] is True
 
 
 def test_a_stopped_unit_of_one_strategy_raises_an_alert(roots, tmp_path):
@@ -177,6 +217,8 @@ def test_a_stopped_unit_of_one_strategy_raises_an_alert(roots, tmp_path):
     assert out["venues"][0]["presence"] == "live"
     downs = {a["strategy"]: a for a in out["alerts"] if a["kind"] == "unit_down" and a["venue"] == "bybit-demo"}
     assert sorted(downs) == ["trend", "xsmom"] and "calibrain-live@trend.service" in downs["trend"]["text"]
+    k = out["venues"][0]["kill"]  # the preview agrees with what KILL would answer: not confirmable for trend and xsmom
+    assert k["available"] is True and k["ok"] is False and "trend" in k["why"] and "xsmom" in k["why"]
 
 
 def test_unit_times_come_as_unix_seconds_with_a_fallback():
